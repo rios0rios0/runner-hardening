@@ -1,0 +1,19 @@
+changesDir: .changes
+unreleasedDir: unreleased
+changelogPath: CHANGELOG.md
+versionFormat: '## [{{.Version}}] - {{.Time.Format "2006-01-02"}}'
+kindFormat: '### {{.Kind}}'
+changeFormat: '- {{.Body}}'
+kinds:
+  - label: Added
+    auto: minor
+  - label: Changed
+    auto: minor
+  - label: Deprecated
+    auto: minor
+  - label: Removed
+    auto: minor
+  - label: Fixed
+    auto: patch
+  - label: Security
+    auto: patch

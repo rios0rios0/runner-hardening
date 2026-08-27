@@ -1,0 +1,19 @@
+# The fleet definition names your hosts. Only the example is tracked.
+fleet.conf
+
+# Per-host run logs written by fleet.sh
+.fleet-logs/
+
+# SAST and quality reports
+build/
+reports/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
