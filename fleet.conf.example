@@ -1,0 +1,68 @@
+# fleet.conf - the machines fleet.sh drives, and the answers to give each one.
+#
+# Copy to fleet.conf and edit. fleet.conf is gitignored, because a fleet
+# definition names your hosts. No secret belongs in this file: the admin PAT is
+# prompted for, or read from --pat-file, and travels on the SSH connection's
+# stdin.
+#
+# FORMAT
+#   [defaults]        values inherited by every host
+#   [<name>]          one section per machine; the name is what --limit takes,
+#                     and doubles as the hostname when `host` is not given
+#   key = value       whitespace around either side is trimmed
+#   # comment         only a WHOLE line is a comment, so a '#' inside a label
+#                     list stays intact
+#
+# An unknown key is a startup error, not a silently ignored line.
+
+[defaults]
+
+# --- connection ------------------------------------------------------------
+user        = root                    # SSH login; needs root or passwordless sudo
+port        = 22
+ssh_key     = ~/.ssh/id_ed25519       # omit to use your ssh-agent / ssh_config
+become      = auto                    # auto | sudo | none. auto = sudo unless user is root
+#ssh_options = -o StrictHostKeyChecking=accept-new   # extra raw ssh flags
+
+# --- what the runners register to ------------------------------------------
+scope       = org                     # org | repo
+org         = your-org                # organisation login, or the owner when scope = repo
+#repo       = your-repo               # required only when scope = repo
+group_id    = 1                       # 1 is "Default"; use a dedicated group when you can
+
+# --- what the runners are --------------------------------------------------
+trust       = internal                # internal (warm layer cache) | untrusted (wiped every job)
+labels      = self-hosted,linux,x64,internal
+runners     = auto                    # auto = size from the box's own CPU and RAM
+old_user    = none                    # the over-privileged account to dismantle, or none
+
+# --- hosts -----------------------------------------------------------------
+# Everything above can be overridden per host.
+
+[build-01]
+host = 10.0.0.11
+
+[build-02]
+host = 10.0.0.12
+runners = 2
+
+[build-03]
+host = builder-03.internal.example
+port = 2222
+user = ubuntu                         # become = auto turns this into `sudo -n`
+old_user = actions                    # this box still has the old privileged runner user
+
+# A box that runs fork PRs: no shared cache, its own label, its own runner
+# group. Keep it out of the group your internal repositories can reach.
+[public-01]
+host      = 10.0.0.21
+trust     = untrusted
+labels    = self-hosted,linux,x64,untrusted
+group_id  = 4
+runners   = 1
+
+# Temporarily out of rotation. Still listed so it is not forgotten, and still
+# reachable with --limit.
+[build-04]
+host    = 10.0.0.14
+enabled = false
