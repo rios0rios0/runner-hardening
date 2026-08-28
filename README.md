@@ -64,7 +64,7 @@ cp fleet.conf.example fleet.conf   # edit: hosts, org, labels
 
 **On each runner host**
 
-- Ubuntu on `x86_64` (tested on 22.04 and 24.04)
+- Ubuntu on `x86_64` (tested on 22.04, 24.04 and 26.04)
 - kernel 5.11+ and cgroup v2 — both needed for rootless overlayfs
 - root access
 - a GitHub PAT that can administer runners: a classic PAT with `admin:org` (or
@@ -78,6 +78,19 @@ Everything else — `curl`, `jq`, `unzip`, Docker CE and the rootless extras,
 
 - `bash`, `ssh` and `base64`
 - key-based SSH to every host, and either root or passwordless sudo there
+
+> **If your agent holds many keys**, `sshd`'s `MaxAuthTries` (6 by default) can
+> be exhausted before the right one is offered, and every host fails with
+> `Too many authentication failures` — even when the key is installed. Pin the
+> identity per host, or in `[defaults]`:
+>
+> ```ini
+> ssh_options = -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519.pub
+> ```
+>
+> A machine with no key yet cannot be reached this way at all: install one
+> first (`ssh-copy-id`), because `fleet.sh` runs with `BatchMode=yes` and will
+> never prompt for a password.
 
 ## Usage
 
@@ -133,6 +146,7 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 ./fleet.sh --dry-run install          # validate the config, connect to nothing
 ./fleet.sh -p 10 updates              # ten at a time
 ./fleet.sh rotate-pat                 # replace the admin PAT fleet-wide
+./fleet.sh --no-pat install           # re-deploy; each host reuses its own PAT
 ```
 
 Any mode the installer accepts is accepted here and fanned out unchanged.
@@ -169,7 +183,10 @@ group_id = 4
 No secret belongs in `fleet.conf` — and `fleet.conf` is gitignored, because it
 names your hosts. The admin PAT is prompted for once, or read from
 `--pat-file`, and is sent over the SSH connection's stdin along with the
-installer. Nothing secret is ever an argument to `ssh`, `sudo` or the
+installer. On a **re-deploy** of hosts that are already registered, pass
+`--no-pat` instead: each host reuses the credential it already stores at
+`/etc/github-runner/pat`, so no copy of the admin token is needed on the
+machine driving the fleet. Nothing secret is ever an argument to `ssh`, `sudo` or the
 installer, so no credential appears in any process list on either side.
 
 ## Using the runners in a workflow

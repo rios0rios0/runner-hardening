@@ -67,6 +67,7 @@ DRY_RUN=0
 ASSUME_YES=0
 PAT_FILE=""
 NEW_PAT_FILE=""
+NO_PAT=0
 MODE=""
 ADMIN_PAT=""
 NEW_PAT=""
@@ -84,6 +85,9 @@ OPTIONS
   -n, --dry-run           print the plan and exit without connecting
   -y, --yes               do not ask for confirmation
       --pat-file FILE     read the admin PAT from FILE instead of prompting
+      --no-pat            send no PAT; each host reuses the one already stored
+                          at /etc/github-runner/pat. Only affects install and
+                          reconfigure -- no other mode ever sends one.
       --new-pat-file FILE read the replacement PAT from FILE (rotate-pat)
   -h, --help              this text
   -V, --version           print the fleet driver version
@@ -188,6 +192,7 @@ parse_args() {
       -p|--parallel)      PARALLEL="${2:?--parallel needs a number}"; shift 2 ;;
       -L|--log-dir)       LOG_DIR="${2:?--log-dir needs a path}"; shift 2 ;;
       --pat-file)         PAT_FILE="${2:?--pat-file needs a path}"; shift 2 ;;
+      --no-pat)           NO_PAT=1; shift ;;
       --new-pat-file)     NEW_PAT_FILE="${2:?--new-pat-file needs a path}"; shift 2 ;;
       -n|--dry-run)       DRY_RUN=1; shift ;;
       -y|--yes)           ASSUME_YES=1; shift ;;
@@ -207,6 +212,15 @@ parse_args() {
 
   [[ "$PARALLEL" =~ ^[0-9]+$ ]] && (( PARALLEL >= 1 )) \
     || die "--parallel must be a positive integer, got '${PARALLEL}'"
+
+  if (( NO_PAT )); then
+    [[ -z "$PAT_FILE" ]] || die "--no-pat and --pat-file contradict each other"
+    [[ -z "${GHA_PAT:-}" ]] || warn "--no-pat given: ignoring the GHA_PAT in your environment"
+    case "$MODE" in
+      install|reconfigure) ;;
+      *) warn "--no-pat has no effect on '${MODE}': that mode never sends a PAT anyway" ;;
+    esac
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -281,7 +295,12 @@ build_env() { # build_env <host-section>
     printf 'export GHA_COUNT=%s\n'    "$(shq "$runners")"
     printf 'export GHA_OLD_USER=%s\n' "$(shq "$old_user")"
     [[ -n "$force" ]] && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
-    printf 'export GHA_PAT=%s\n'      "$(shq "$ADMIN_PAT")"
+    # With --no-pat we deliberately send nothing. GHA_YES makes the installer
+    # answer "yes" to its own "Reuse the PAT already stored in
+    # /etc/github-runner/pat?", so a box that is already registered re-installs
+    # on the credential it holds -- which is the right answer for a re-deploy,
+    # and keeps a second copy of the admin token off this workstation.
+    (( NO_PAT )) || printf 'export GHA_PAT=%s\n' "$(shq "$ADMIN_PAT")"
   fi
 
   [[ "$MODE" == "rotate-pat" ]] && printf 'export GHA_NEW_PAT=%s\n' "$(shq "$NEW_PAT")"
@@ -409,7 +428,7 @@ main() {
   fi
 
   # --- secrets, read once and reused for every host ------------------------
-  if [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]]; then
+  if [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]] && (( ! NO_PAT )); then
     if [[ -n "$PAT_FILE" ]]; then
       [[ -r "$PAT_FILE" ]] || die "cannot read ${PAT_FILE}"
       ADMIN_PAT="$(< "$PAT_FILE")"
@@ -496,6 +515,11 @@ main() {
     echo "  ${C_DIM}Most failures are one of: SSH key not authorised, sudo needs a"
     echo "  password (become = sudo requires NOPASSWD), or the admin PAT lacks"
     echo "  runner-admin permission. The installer prints which one.${C_R}"
+    if (( NO_PAT )); then
+      echo "  ${C_DIM}With --no-pat, 'no terminal available' means that host has no PAT at"
+      echo "  /etc/github-runner/pat yet -- it has never been installed. Give it one"
+      echo "  with --pat-file on its first run.${C_R}"
+    fi
     return 1
   fi
   ok "${C_B}all ${#SELECTED[@]} host(s) completed '${MODE}'${C_R}"

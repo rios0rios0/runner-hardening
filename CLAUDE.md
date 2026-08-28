@@ -54,6 +54,11 @@ targets load the shared configuration first.
 - **Tests are hand-rolled**, in BDD `# given / # when / # then` form, with
   no mocking library. The bootstrap tests run the real bootstrap through a real
   `bash -s` against a stand-in installer; only the SSH hop is substituted.
+- **A re-deploy needs no PAT.** `GHA_YES` makes the installer answer "yes" to
+  its own "Reuse the PAT already stored in `/etc/github-runner/pat`?", so
+  `fleet.sh --no-pat install` converges an already-registered host on the
+  credential it holds. Do not add a code path that requires the caller to hold
+  the admin token for a machine that already has one.
 - **Anything that changes system state is untestable here.** It has to be
   exercised on a disposable Ubuntu VM — say so rather than claiming a change is
   verified when only `make test` has run.

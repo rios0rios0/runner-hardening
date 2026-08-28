@@ -270,6 +270,39 @@ it_cleans_up_the_staging_directory() {
 }
 it_cleans_up_the_staging_directory
 
+it_omits_the_pat_when_no_pat_is_given() {
+  # given --no-pat on an install, and a box that already stores its own PAT
+  reset_config
+  # shellcheck disable=SC2034  # read by build_bootstrap, which lives in fleet.sh
+  NO_PAT=1
+
+  # when the bootstrap runs
+  local out; out="$(run_bootstrap "${WORK}/basic.conf" install 'fixture-pat-placeholder')"
+  NO_PAT=0
+
+  # then every other answer still arrives, but no credential is sent -- the
+  # installer falls back to /etc/github-runner/pat on the host
+  assert_contains "should still send the install answers with --no-pat" "$out" "ORG=your-org"
+  assert_contains "should still answer confirmations with --no-pat"     "$out" "YES=1"
+  assert_contains "should send no PAT at all with --no-pat"             "$out" "PAT=<unset>"
+}
+it_omits_the_pat_when_no_pat_is_given
+
+it_rejects_no_pat_with_pat_file() {
+  # given both --no-pat and --pat-file, which say opposite things
+  # when the arguments are parsed
+  # Reset in a subshell so the guard sees a clean slate; all three are read by
+  # parse_args, which lives in fleet.sh.
+  local out
+  # shellcheck disable=SC2034
+  out=$( MODE=""; NO_PAT=0; PAT_FILE=""; parse_args --no-pat --pat-file /tmp/x install 2>&1 )
+
+  # then it fails at startup rather than silently picking one
+  assert_contains "should reject --no-pat together with --pat-file" \
+    "$out" "contradict each other"
+}
+it_rejects_no_pat_with_pat_file
+
 it_sends_no_answers_for_a_read_only_mode() {
   # given a mode that reads the configuration already on the box
   # when the bootstrap runs
