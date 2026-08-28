@@ -160,9 +160,10 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 and the hosts converge on the new values. A key `fleet.conf` omits is **not**
 sent at all, so each host keeps the answer it already has stored — which is
 also what lets `--no-pat` work, the machine authenticating with the PAT it
-holds. The corollary is that a host being installed for the **first** time
-needs `fleet.conf` to answer everything: it has no stored file to fall back to
-and no terminal to be asked on. `fleet.conf.example` spells out that full set.
+holds. On a host with nothing stored yet, an omitted key falls through to the
+installer's own default, which it reports as it goes. Two answers have no safe
+default and must be given: the PAT, and `old_user` when a box has more than one
+over-privileged account.
 
 Any mode the installer accepts is accepted here and fanned out unchanged.
 Each host gets its own log under `.fleet-logs/<timestamp>-<mode>/`, and the
@@ -177,9 +178,11 @@ user     = root
 ssh_key  = ~/.ssh/id_ed25519
 scope    = org
 org      = your-org
+group_id = 1
 trust    = internal
 labels   = self-hosted,linux,x64,internal
 runners  = auto
+old_user = none
 
 [build-01]
 host = 10.0.0.11

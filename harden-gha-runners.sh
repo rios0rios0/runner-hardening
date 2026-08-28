@@ -97,6 +97,15 @@ ensure_tty() {
 ask() { # ask VARNAME "question" ["default"]
   local __v="$1" __q="$2" __d="${3:-}" __in=""
   [[ -n "${!__v:-}" ]] && { ok "${__q}: ${!__v}  ${C_DIM}(from environment)${C_R}"; return; }
+  # A default nobody can reach is not a default. Unattended, take it rather
+  # than reaching for a terminal an SSH-driven run does not have -- this is
+  # only ever hit on a host with no stored answer, so there is nothing here to
+  # override; a configured box gets its value from load_config long before.
+  if [[ -n "${GHA_YES:-}" && -n "$__d" ]]; then
+    printf -v "$__v" '%s' "$__d"
+    ok "${__q}: ${__d}  ${C_DIM}(default, unattended)${C_R}"
+    return
+  fi
   ensure_tty
   if [[ -n "$__d" ]]; then
     read -rp "${C_CYN}?${C_R} ${__q} ${C_DIM}[${__d}]${C_R}: " __in || true
@@ -134,6 +143,15 @@ ask_menu() {
   for o in "${opts[@]}"; do vals+=("${o%%:*}"); labels+=("${o#*:}"); done
   if [[ -n "${!__v:-}" ]]; then
     ok "${__q}: ${!__v}  ${C_DIM}(from environment)${C_R}"; return
+  fi
+  # Unattended: take option 1, which is what the interactive prompt defaults to
+  # ([1]). warn rather than ok -- an alternative was chosen on the operator's
+  # behalf, and for GHA_TRUST that choice decides whether state is wiped
+  # between jobs, so it belongs in the log.
+  if [[ -n "${GHA_YES:-}" ]]; then
+    printf -v "$__v" '%s' "${vals[0]}"
+    warn "${__q}: ${vals[0]}  (first option, unattended -- set ${__v} to choose)"
+    return
   fi
   ensure_tty
   echo "${C_CYN}?${C_R} ${__q}"
@@ -439,9 +457,12 @@ wizard() {
   echo
   echo "  ${CPU_COUNT} vCPU and ${MEM_MB} MB RAM. Reserving ~1500 MB for the OS and"
   echo "  the rootless daemons leaves room for about ${C_B}${suggested}${C_R} concurrent jobs."
-  # `auto` is what fleet.sh sends for a host that does not pin `runners`. Every
-  # other unattended answer is a literal the caller already knows; this one
-  # depends on the box, so the box has to be the one to answer it.
+  # `runners = auto` in fleet.conf, or GHA_COUNT=auto directly, is how a caller
+  # says "size this from the machine". Every other unattended answer is a
+  # literal the caller already knows; this one depends on the box, so the box
+  # has to be the one to answer it. Left unset entirely, the suggestion below
+  # is taken as the unattended default anyway -- `auto` is the way to ask for
+  # that explicitly, and to keep asking for it if the default ever changes.
   if [[ "${GHA_COUNT:-}" == "auto" ]]; then
     GHA_COUNT="$suggested"
     ok "Runners on this machine: ${GHA_COUNT}  ${C_DIM}(sized from this box's capacity)${C_R}"
@@ -458,6 +479,10 @@ wizard() {
     if (( ${#DETECTED_OLD_USERS[@]} == 1 )); then
       GHA_OLD_USER="${DETECTED_OLD_USERS[0]}"
       ok "old runner user: ${GHA_OLD_USER}  ${C_DIM}(detected)${C_R}"
+    elif (( ${#DETECTED_OLD_USERS[@]} > 1 )) && [[ -n "${GHA_YES:-}" ]]; then
+      # Option 1 here would be an arbitrary account to lock out and kill the
+      # processes of. There is no safe guess; make the operator name it.
+      die "several over-privileged users found (${DETECTED_OLD_USERS[*]}) - set GHA_OLD_USER to the one that runs the jobs, or to 'none'"
     elif (( ${#DETECTED_OLD_USERS[@]} > 1 )); then
       local -a menu=(); local u
       for u in "${DETECTED_OLD_USERS[@]}"; do menu+=("${u}:${u}"); done
@@ -538,6 +563,15 @@ choose_runner_group() {
     warn "Falling back to group 1 (Default). Separate your trusted and untrusted"
     warn "fleets with distinct labels instead, and keep public repos off self-hosted."
     GHA_GROUP_ID=1; return
+  fi
+
+  # Unattended and nothing pinned: group 1 (Default) is where a runner lands if
+  # nobody says otherwise, and it is already the fallback for a Free-plan org
+  # above. Picking it from the menu instead would depend on API ordering.
+  if [[ -n "${GHA_YES:-}" ]]; then
+    GHA_GROUP_ID=1
+    warn "no runner group pinned; using group 1 (Default). Set 'group_id' to choose."
+    return
   fi
 
   local -a menu=()

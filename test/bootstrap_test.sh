@@ -10,6 +10,16 @@
 #
 # Run from the repository root:  bash test/bootstrap_test.sh   (or: make test)
 #
+# This file wires globals that functions in fleet.sh and harden-gha-runners.sh
+# read (MODE, ADMIN_PAT, NO_PAT, ENV_FILE, ...). ShellCheck cannot follow the
+# interpolated `source` below, so it sees every one of them assigned and never
+# used. Disabling SC2034 for the file is the honest trade here -- a test file
+# that only sets up state for a sourced library has no other use for the check,
+# and the alternative was six near-identical inline directives that had to be
+# re-added with every new case. The directive must sit BEFORE the first command
+# to apply file-wide.
+# shellcheck disable=SC2034
+
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -40,7 +50,6 @@ assert_not_contains() {
 # Resets the parser's state between cases. Every name below is read by a
 # function that lives in fleet.sh, which ShellCheck does not follow through the
 # interpolated `source` above - so it sees the assignment and not the use.
-# shellcheck disable=SC2034
 reset_config() { CFG=(); HOSTS=(); SELECTED=(); }
 
 # A stand-in installer: prints what the elevated shell handed it, then exits 7
@@ -293,14 +302,31 @@ it_rejects_no_pat_with_pat_file() {
   # Reset in a subshell so the guard sees a clean slate; all three are read by
   # parse_args, which lives in fleet.sh.
   local out
-  # shellcheck disable=SC2034
   out=$( MODE=""; NO_PAT=0; PAT_FILE=""; parse_args --no-pat --pat-file /tmp/x install 2>&1 )
 
   # then it fails at startup rather than silently picking one
+  local rc=$?
   assert_contains "should reject --no-pat together with --pat-file" \
     "$out" "contradict each other"
+  assert_eq "should exit non-zero, making it a startup error not a warning" \
+    "1" "$rc"
 }
 it_rejects_no_pat_with_pat_file
+
+it_warns_rather_than_failing_on_modes_that_send_no_pat() {
+  # given --no-pat on modes where it cannot apply
+  # when the arguments are parsed
+  local out_rotate out_verify
+  out_rotate=$( MODE=""; NO_PAT=0; PAT_FILE=""; parse_args --no-pat rotate-pat 2>&1 )
+  out_verify=$( MODE=""; NO_PAT=0; PAT_FILE=""; parse_args --no-pat verify 2>&1 )
+
+  # then each says something true for that mode rather than one generic line
+  assert_contains "should say --no-pat does not govern rotate-pat's new token" \
+    "$out_rotate" "still needs --new-pat-file"
+  assert_contains "should say --no-pat is inert on a read-only mode" \
+    "$out_verify" "never sends a PAT anyway"
+}
+it_warns_rather_than_failing_on_modes_that_send_no_pat
 
 it_sends_no_answers_for_a_read_only_mode() {
   # given a mode that reads the configuration already on the box
@@ -318,16 +344,11 @@ it_sends_no_answers_for_a_read_only_mode
 it_ships_the_installer_byte_for_byte() {
   # given the real installer rather than the stand-in
   reset_config
-  # A directive covers only the next command, and `a=1; b=2` is two commands.
-  # shellcheck disable=SC2034  # all three are read by build_bootstrap, in fleet.sh
   MODE=version
-  # shellcheck disable=SC2034
   ADMIN_PAT=""
-  # shellcheck disable=SC2034
   NEW_PAT=""
   INSTALLER="${ROOT}/harden-gha-runners.sh"
   parse_config "${WORK}/basic.conf"
-  # shellcheck disable=SC2034  # read by build_bootstrap, which lives in fleet.sh
   INSTALLER_B64="$(base64 < "$INSTALLER")"
 
   # when it is transferred and asked to identify itself
@@ -345,16 +366,12 @@ it_sends_only_what_the_config_specifies() {
   reset_config
   printf '[defaults]\nbecome = none\norg = some-org\n\n[h1]\nhost = 10.0.0.1\n' \
     > "${WORK}/minimal.conf"
-  # shellcheck disable=SC2034  # all three are read by build_env, in fleet.sh
-  MODE=install
-  # shellcheck disable=SC2034
-  ADMIN_PAT="fixture-pat-placeholder"
-  # shellcheck disable=SC2034
-  NEW_PAT=""
   parse_config "${WORK}/minimal.conf"
 
-  # when the environment for that host is built
-  local out; out="$(build_env h1)"
+  # when the environment for that host is built (globals scoped to the subshell
+  # so the suite cannot become order-dependent on what is left behind)
+  local out
+  out="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env h1 )"
 
   # then nothing is invented. The installer keeps a caller's answers over its
   # stored ones, so an invented default is not a fallback -- it is a silent
@@ -373,16 +390,11 @@ it_sends_only_what_the_config_specifies
 it_still_sends_everything_the_config_does_specify() {
   # given a fleet entry that spells every answer out
   reset_config
-  # shellcheck disable=SC2034  # all three are read by build_env, in fleet.sh
-  MODE=install
-  # shellcheck disable=SC2034
-  ADMIN_PAT="fixture-pat-placeholder"
-  # shellcheck disable=SC2034
-  NEW_PAT=""
   parse_config "${WORK}/basic.conf"
 
   # when the environment is built
-  local out; out="$(build_env host1)"
+  local out
+  out="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env host1 )"
 
   # then each one is sent, so a deliberate change still reaches the host
   assert_contains "should send a configured trust level"  "$out" "GHA_TRUST='internal'"
@@ -424,10 +436,7 @@ load_config_probe() {
     # survive it. Production runs under `set -Eeuo pipefail`; a probe that
     # relaxed -u would pass while every real host died with "unbound variable".
     set +e
-    # Both are read by load_config, which lives in harden-gha-runners.sh.
-    # shellcheck disable=SC2034
     ENV_FILE="${WORK}/inst_env"
-    # shellcheck disable=SC2034
     PAT_FILE="${WORK}/inst_pat"
     eval "$1"
     load_config >/dev/null 2>&1
@@ -469,6 +478,51 @@ it_prefers_an_explicitly_supplied_pat() {
     "caller-pat" "$(cut -d'|' -f3 <<<"$got")"
 }
 it_prefers_an_explicitly_supplied_pat
+
+it_takes_an_unattended_default_instead_of_reaching_for_a_terminal() {
+  # given a first install: nothing stored, and an answer the config omitted
+  # when the wizard asks for it with GHA_YES set and no terminal anywhere
+  local got
+  got=$(
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +e
+    export GHA_YES=1
+    unset GHA_COUNT GHA_TRUST
+    ask GHA_COUNT "Runners on this machine" "4" >/dev/null 2>&1
+    ask_menu GHA_TRUST "trust?" "internal:Internal" "untrusted:Untrusted" >/dev/null 2>&1
+    printf '%s|%s' "${GHA_COUNT:-DIED}" "${GHA_TRUST:-DIED}"
+  ) </dev/null
+
+  # then the supplied default is taken. A default that can only be reached
+  # through a tty is unusable to fleet.sh, which has no pty -- and the values
+  # cannot override anything, because this path is only reached when the host
+  # has no stored answer at all.
+  assert_eq "should take a plain default unattended rather than needing a tty" \
+    "4" "${got%%|*}"
+  assert_eq "should take a menu's first option unattended rather than needing a tty" \
+    "internal" "${got##*|}"
+}
+it_takes_an_unattended_default_instead_of_reaching_for_a_terminal
+
+it_still_refuses_to_invent_an_answer_that_has_no_safe_default() {
+  # given a required answer with no default (the admin PAT)
+  # when it is asked for unattended
+  local out
+  out=$(
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +e
+    export GHA_YES=1
+    unset GHA_ORG
+    ask GHA_ORG "GitHub organisation login" 2>&1
+  ) </dev/null
+
+  # then it fails loudly instead of guessing
+  assert_contains "should refuse to invent an answer that has no default" \
+    "$out" "no terminal available"
+}
+it_still_refuses_to_invent_an_answer_that_has_no_safe_default
 
 it_survives_nounset_with_nothing_supplied() {
   # given a caller that exports no GHA_* at all, so the saved-values array is

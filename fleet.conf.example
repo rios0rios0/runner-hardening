@@ -37,7 +37,10 @@ group_id    = 1                       # 1 is "Default"; use a dedicated group wh
 # --- what the runners are --------------------------------------------------
 trust       = internal                # internal (warm layer cache) | untrusted (wiped every job)
 labels      = self-hosted,linux,x64,internal
-runners     = auto                    # auto = size from the box's own CPU and RAM
+runners     = auto                    # auto = size from the box's own CPU and RAM.
+                                      # Omitting the key entirely leaves an
+                                      # installed host on its current count;
+                                      # `auto` asks for re-sizing every run.
 old_user    = none                    # the over-privileged account to dismantle, or none
 
 # --- hosts -----------------------------------------------------------------

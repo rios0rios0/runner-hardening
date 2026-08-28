@@ -537,9 +537,10 @@ main() {
     echo "  password (become = sudo requires NOPASSWD), or the admin PAT lacks"
     echo "  runner-admin permission. The installer prints which one.${C_R}"
     if (( NO_PAT )); then
-      echo "  ${C_DIM}With --no-pat, 'no terminal available' means that host has no PAT at"
-      echo "  /etc/github-runner/pat yet -- it has never been installed. Give it one"
-      echo "  with --pat-file on its first run.${C_R}"
+      echo "  ${C_DIM}With --no-pat, 'no terminal available' means that host had no stored"
+      echo "  answer for something the installer needed -- most often no PAT yet"
+      echo "  (give it one with --pat-file on its first run), or several"
+      echo "  over-privileged users, which needs old_user set explicitly.${C_R}"
     fi
     return 1
   fi
