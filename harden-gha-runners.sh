@@ -805,10 +805,102 @@ phase_audit() {
 }
 
 # ===========================================================================
+# DRAINING THE RUNNERS THIS SCRIPT ALREADY INSTALLED
+#
+# A re-install is not a fresh install: the box is usually executing jobs right
+# now, out of the very directories phase_wipe and phase_runners are about to
+# delete. Left running, a job writing into _work races rm's own recursion,
+# rm exits "Directory not empty", and errexit aborts the install on a
+# half-converged box. So the runners come down first, and they come down
+# gracefully - a job that is already running is finished, not killed.
+# ===========================================================================
+DRAIN_TIMEOUT="${GHA_DRAIN_TIMEOUT:-1800}"
+DRAINED_UNITS=()
+
+# Instance numbers of every gha-runner@ unit systemd currently knows about.
+# Enumerated rather than counted off GHA_COUNT: a re-install that LOWERS the
+# count still has to drain the runners the box is actually running, and those
+# are the ones GHA_COUNT no longer mentions.
+existing_runner_instances() {
+  systemctl list-units --all --plain --no-legend 'gha-runner@*' 2>/dev/null \
+    | awk '{print $1}' \
+    | sed -n 's/^gha-runner@\([0-9][0-9]*\)\.service$/\1/p' \
+    | sort -n
+}
+
+# Is this runner executing a job? Runner.Listener runs the whole time a unit is
+# up, so its presence proves nothing; Runner.Worker exists only while a job is
+# actually running. Each runner owns its own UNIX user, which is what makes
+# this answerable per instance without asking GitHub.
+runner_busy() { # runner_busy <n>
+  pgrep -u "${USER_PREFIX}$1" -f 'Runner\.Worker' >/dev/null 2>&1
+}
+
+# Undo a drain. Registered as an EXIT trap the moment the first drop-in lands:
+# without it, any later failure - a lost apt lock, a bad token, a full disk -
+# would leave every unit with Restart=no and the whole box permanently out of
+# the pool, which is a far worse outcome than the failure itself.
+undrain_runners() {
+  (( ${#DRAINED_UNITS[@]} )) || return 0
+  warn "restoring the runners drained earlier"
+  rm -f /etc/systemd/system/gha-runner@*.service.d/40-drain.conf 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  local n
+  for n in "${DRAINED_UNITS[@]}"; do
+    systemctl start "gha-runner@${n}.service" 2>/dev/null || true
+  done
+  DRAINED_UNITS=()
+  return 0
+}
+
+drain_runners() {
+  local -a inst=()
+  mapfile -t inst < <(existing_runner_instances)
+  (( ${#inst[@]} )) || { ok "no runners of ours to drain"; return 0; }
+
+  # Restart=always would bring a unit straight back the moment its job ends, so
+  # taking the restart away is the only way to let a job finish and then STAY
+  # finished. 40- sorts after every other drop-in this script writes, which is
+  # what makes it the one systemd reads last and therefore the one that wins.
+  local n
+  for n in "${inst[@]}"; do
+    install -d -m 0755 "/etc/systemd/system/gha-runner@${n}.service.d"
+    printf '[Service]\nRestart=no\n' \
+      > "/etc/systemd/system/gha-runner@${n}.service.d/40-drain.conf"
+    chmod 0644 "/etc/systemd/system/gha-runner@${n}.service.d/40-drain.conf"
+  done
+  systemctl daemon-reload
+  DRAINED_UNITS=("${inst[@]}")
+  trap undrain_runners EXIT
+
+  log "draining ${#inst[@]} runner(s): letting each finish the job it is on"
+  log "  budget ${DRAIN_TIMEOUT}s in total - raise it with GHA_DRAIN_TIMEOUT"
+  local deadline=$(( $(date +%s) + DRAIN_TIMEOUT ))
+  for n in "${inst[@]}"; do
+    if runner_busy "$n"; then
+      log "runner ${n} is mid-job, waiting"
+      while runner_busy "$n"; do
+        if (( $(date +%s) >= deadline )); then
+          warn "drain budget spent and runner ${n} is still working - stopping it anyway"
+          warn "  that job will fail; re-run it once this finishes"
+          break
+        fi
+        sleep 5
+      done
+    fi
+    # Idle now (or out of budget): stopping is instant and takes nothing with it.
+    systemctl stop "gha-runner@${n}.service" 2>/dev/null || true
+    ok "runner ${n} drained"
+  done
+  ok "all ${#inst[@]} runner(s) down - nothing is writing to the trees below"
+}
+
+# ===========================================================================
 # TEARDOWN OF THE OLD SETUP
 # ===========================================================================
 phase_stop_existing() {
   head1 "Removing the old runner setup"
+  drain_runners
   local u
   while read -r u; do
       [[ -n "$u" ]] || continue
@@ -915,7 +1007,14 @@ phase_wipe() {
   local d
   while read -r d; do
     [[ -n "$d" ]] || continue
-    log "rm -rf ${d}"; rm -rf "${d:?}"
+    log "rm -rf ${d}"
+    # drain_runners should have stopped everything writing here, but a stray
+    # process still creating files makes rm race its own recursion and exit
+    # "Directory not empty". Under errexit that aborted the install midway
+    # through the wipe, which is strictly worse than saying so and carrying
+    # on: phase_runners deletes these trees again anyway.
+    rm -rf "${d:?}" 2>/dev/null || { sleep 2; rm -rf "${d:?}" 2>/dev/null \
+      || warn "could not fully remove ${d} - something is still writing to it"; }
   done < <(find /opt /home -maxdepth 4 -type d -name '_work' 2>/dev/null)
   rm -rf /opt/hostedtoolcache 2>/dev/null || true
   ok "build state destroyed"
@@ -1599,10 +1698,21 @@ EOF
   log "one busy runner may use all ${CPU_COUNT} cores and up to ${RP_CEILING} MB"
   log "all ${GHA_COUNT} together are capped at ${RP_AGGREGATE} MB by ${GHA_SLICE}"
 
+  # The drain override outranks the unit file just rewritten above, so it has
+  # to go before the reload or every runner would come back with Restart=no
+  # and serve exactly one more job. Globbed rather than looped over GHA_COUNT:
+  # a re-install that lowered the count still has to clear the instances the
+  # new count no longer names.
+  rm -f /etc/systemd/system/gha-runner@*.service.d/40-drain.conf
+
   systemctl daemon-reload
   for n in $(seq 1 "$GHA_COUNT"); do
     systemctl enable --now "gha-runner@${n}.service"
   done
+  # The runners are up on the new configuration, so there is no drain left to
+  # undo and the EXIT trap has nothing to restore.
+  DRAINED_UNITS=()
+  trap - EXIT
   ok "${GHA_COUNT} runner unit(s) enabled and started"
 }
 
