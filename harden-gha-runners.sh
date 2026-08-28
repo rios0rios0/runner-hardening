@@ -29,9 +29,9 @@
 #   sudo ./harden-gha-runners.sh reconfigure  # redo the wizard, reinstall
 #   sudo ./harden-gha-runners.sh uninstall    # remove everything this created
 #
-# GHA_COUNT=auto sizes the runner count from the box's own CPU and RAM instead
-# of prompting, which is what makes an unattended install possible on a machine
-# whose capacity the caller does not know.
+# GHA_COUNT=auto sizes the runner count from the box's own CPU and RAM. Leaving
+# GHA_COUNT unset does the same on a machine with nothing stored; `auto` is how
+# you ask for re-sizing on one that already has a count saved.
 #
 # NON-INTERACTIVE (handy for every machine after the first - the installer
 # prints the exact line to use, prefilled, when it finishes):
@@ -78,6 +78,12 @@ else
 fi
 log()  { printf '%s==>%s %s\n' "$C_BLU" "$C_R" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$C_GRN" "$C_R" "$*"; }
+# Deliberately stdout, unlike fleet.sh's warn. This script's stdout IS the
+# per-host log that fleet.sh captures; splitting warnings onto stderr would
+# interleave them out of order with the steps they belong to. Nothing here
+# builds a payload on stdout the way fleet.sh's build_env does, so there is no
+# equivalent hazard -- every caller invokes warn as a statement, never inside a
+# command substitution. Do not "sync" this with fleet.sh.
 warn() { printf '%s [!]%s %s\n' "$C_YEL" "$C_R" "$*"; }
 err()  { printf '%s [x]%s %s\n' "$C_RED" "$C_R" "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -97,6 +103,16 @@ ensure_tty() {
 ask() { # ask VARNAME "question" ["default"]
   local __v="$1" __q="$2" __d="${3:-}" __in=""
   [[ -n "${!__v:-}" ]] && { ok "${__q}: ${!__v}  ${C_DIM}(from environment)${C_R}"; return; }
+  # A default nobody can reach is not a default. Unattended, take it rather
+  # than reaching for a terminal an SSH-driven run does not have. This cannot
+  # overwrite a configured host: every unattended path loads the stored answers
+  # as a baseline first (see the dispatch in main), so a value that reaches
+  # here is one no caller sent and no host had.
+  if [[ -n "${GHA_YES:-}" && -n "$__d" ]]; then
+    printf -v "$__v" '%s' "$__d"
+    ok "${__q}: ${__d}  ${C_DIM}(default, unattended)${C_R}"
+    return
+  fi
   ensure_tty
   if [[ -n "$__d" ]]; then
     read -rp "${C_CYN}?${C_R} ${__q} ${C_DIM}[${__d}]${C_R}: " __in || true
@@ -134,6 +150,15 @@ ask_menu() {
   for o in "${opts[@]}"; do vals+=("${o%%:*}"); labels+=("${o#*:}"); done
   if [[ -n "${!__v:-}" ]]; then
     ok "${__q}: ${!__v}  ${C_DIM}(from environment)${C_R}"; return
+  fi
+  # Unattended: take option 1, which is what the interactive prompt defaults to
+  # ([1]). warn rather than ok -- an alternative was chosen on the operator's
+  # behalf, and for GHA_TRUST that choice decides whether state is wiped
+  # between jobs, so it belongs in the log.
+  if [[ -n "${GHA_YES:-}" ]]; then
+    printf -v "$__v" '%s' "${vals[0]}"
+    warn "${__q}: ${vals[0]}  (first option, unattended -- set ${__v} to choose)"
+    return
   fi
   ensure_tty
   echo "${C_CYN}?${C_R} ${__q}"
@@ -369,6 +394,11 @@ wizard() {
 
   if [[ "$GHA_SCOPE" == "org" ]]; then
     ask GHA_ORG "GitHub organisation login"
+    # Clear any repository left over from a previous repo-scoped install.
+    # Nothing reads it while the scope is org, but save_config would carry it
+    # forward and the reproduce line printed at the end would then show a
+    # GHA_REPO that contradicts the scope beside it.
+    GHA_REPO=""
   else
     local slug=""
     [[ -n "${GHA_ORG:-}" && -n "${GHA_REPO:-}" ]] && slug="${GHA_ORG}/${GHA_REPO}" || true
@@ -434,9 +464,12 @@ wizard() {
   echo
   echo "  ${CPU_COUNT} vCPU and ${MEM_MB} MB RAM. Reserving ~1500 MB for the OS and"
   echo "  the rootless daemons leaves room for about ${C_B}${suggested}${C_R} concurrent jobs."
-  # `auto` is what fleet.sh sends for a host that does not pin `runners`. Every
-  # other unattended answer is a literal the caller already knows; this one
-  # depends on the box, so the box has to be the one to answer it.
+  # `runners = auto` in fleet.conf, or GHA_COUNT=auto directly, is how a caller
+  # says "size this from the machine". Every other unattended answer is a
+  # literal the caller already knows; this one depends on the box, so the box
+  # has to be the one to answer it. Left unset entirely, the suggestion below
+  # is taken as the unattended default anyway -- `auto` is the way to ask for
+  # that explicitly, and to keep asking for it if the default ever changes.
   if [[ "${GHA_COUNT:-}" == "auto" ]]; then
     GHA_COUNT="$suggested"
     ok "Runners on this machine: ${GHA_COUNT}  ${C_DIM}(sized from this box's capacity)${C_R}"
@@ -453,6 +486,10 @@ wizard() {
     if (( ${#DETECTED_OLD_USERS[@]} == 1 )); then
       GHA_OLD_USER="${DETECTED_OLD_USERS[0]}"
       ok "old runner user: ${GHA_OLD_USER}  ${C_DIM}(detected)${C_R}"
+    elif (( ${#DETECTED_OLD_USERS[@]} > 1 )) && [[ -n "${GHA_YES:-}" ]]; then
+      # Option 1 here would be an arbitrary account to lock out and kill the
+      # processes of. There is no safe guess; make the operator name it.
+      die "several over-privileged users found (${DETECTED_OLD_USERS[*]}) - set GHA_OLD_USER to the one that runs the jobs, or to 'none'"
     elif (( ${#DETECTED_OLD_USERS[@]} > 1 )); then
       local -a menu=(); local u
       for u in "${DETECTED_OLD_USERS[@]}"; do menu+=("${u}:${u}"); done
@@ -535,6 +572,15 @@ choose_runner_group() {
     GHA_GROUP_ID=1; return
   fi
 
+  # Unattended and nothing pinned: group 1 (Default) is where a runner lands if
+  # nobody says otherwise, and it is already the fallback for a Free-plan org
+  # above. Picking it from the menu instead would depend on API ordering.
+  if [[ -n "${GHA_YES:-}" ]]; then
+    GHA_GROUP_ID=1
+    warn "no runner group pinned; using group 1 (Default). Set 'group_id' to choose."
+    return
+  fi
+
   local -a menu=()
   while IFS=$'\t' read -r id name vis; do
     [[ -n "$id" ]] && menu+=("${id}:${name}  ${C_DIM}(id ${id}, visibility: ${vis})${C_R}") || true
@@ -580,11 +626,60 @@ EOF
   ok "configuration saved to ${ENV_FILE}"
 }
 
+# The answers save_config writes. Sourcing the env file would assign all of
+# them unconditionally, so these are the ones a caller has to be protected from.
+CONFIG_ANSWERS=(GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT
+                GHA_TRUST GHA_OLD_USER)
+
+# Set by load_config: 1 when the caller supplied any answer or a PAT, so the
+# stored file was a fallback rather than the whole truth.
+CONFIG_OVERRIDDEN=0
+
+# Whether the stored answers should be loaded as a baseline before the wizard
+# runs. Extracted from the dispatch so the rule can be tested: getting it wrong
+# is silent, and the consequence is a host coming back configured differently
+# from how it went in.
+should_preload_config() { # should_preload_config <mode>
+  # Unattended, whichever mode: nothing can be asked, so a key the caller did
+  # not send must keep this host's stored value rather than fall to a default.
+  [[ -n "${GHA_YES:-}" ]] && return 0
+  # Interactive install offers to reuse the stored configuration, so it needs
+  # it loaded to have something to offer.
+  [[ "$1" == "install" ]] && return 0
+  # Interactive reconfigure re-asks every question from nothing. That is the
+  # entire point of the mode.
+  return 1
+}
+
 load_config() {
   [[ -s "$ENV_FILE" ]] || return 1
+
+  # The stored file is a DEFAULT, not an override. Whatever the caller put in
+  # the environment is what this box is being asked to become, and a plain
+  # `. "$ENV_FILE"` would silently overwrite exactly that -- which made
+  # `GHA_LABELS=... ./harden-gha-runners.sh` (and every fleet.sh install)
+  # report success while changing nothing, because the install dispatch runs
+  # this function inside an && chain for its side effect.
+  local -A supplied=()
+  local v
+  CONFIG_OVERRIDDEN=0
+  for v in "${CONFIG_ANSWERS[@]}"; do
+    [[ -n "${!v+set}" && -n "${!v}" ]] && { supplied["$v"]="${!v}"; CONFIG_OVERRIDDEN=1; } || true
+  done
+  # A supplied credential counts as an override too, and this has to be read
+  # before the fallback below sets it from $PAT_FILE.
+  [[ -n "${GHA_PAT:-}" ]] && CONFIG_OVERRIDDEN=1 || true
+
   # shellcheck disable=SC1090
   . "$ENV_FILE"
-  [[ -s "$PAT_FILE" ]] && GHA_PAT="$(< "$PAT_FILE")" || true
+
+  for v in "${!supplied[@]}"; do printf -v "$v" '%s' "${supplied[$v]}"; done
+
+  # Same rule for the credential: an explicitly supplied PAT wins, so a token
+  # can be replaced by an install. Only fall back to the stored one when the
+  # caller sent none -- which is what makes an unattended re-deploy possible
+  # without handing the admin token to whatever is driving it.
+  [[ -z "${GHA_PAT:-}" && -s "$PAT_FILE" ]] && GHA_PAT="$(< "$PAT_FILE")" || true
   return 0
 }
 
@@ -2555,11 +2650,50 @@ main() {
     install|reconfigure)
       preflight
       discover
-      if [[ "$mode" == "install" ]] && load_config && [[ -z "${GHA_YES:-}" ]]; then
+      # The stored answers are the BASELINE for any unattended run, whichever
+      # mode. load_config treats them as defaults, so whatever the caller sent
+      # still wins -- but a key the caller omitted keeps this host's current
+      # value instead of being answered by a wizard default further down.
+      # Without this, `reconfigure` (which is not gated on a stored file) would
+      # answer every unnamed key from scratch: a box stored as `untrusted`
+      # would come back `internal` and stop wiping Docker state between jobs.
+      # Interactive `reconfigure` deliberately skips it -- re-asking every
+      # question from nothing is the entire point of the mode.
+      local have_stored=0
+      if should_preload_config "$mode"; then
+        load_config && have_stored=1 || true
+      fi
+
+      if [[ "$mode" == "install" && $have_stored -eq 1 && -z "${GHA_YES:-}" ]]; then
         log "existing configuration found at ${ENV_FILE}"
-        ask_yn "Reuse it?" y || { unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID \
-                                        GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER; wizard; }
-        [[ -n "${GHA_SCOPE:-}" ]] && confirm_plan || true
+        if (( CONFIG_OVERRIDDEN )); then
+          # "Reuse the stored configuration" would be a lie: the run would use
+          # the caller's values and leave the old ones on disk. That matters
+          # most for the PAT -- save_config is only reached from wizard, so a
+          # replacement token would register the runners and then never be
+          # written to /etc/github-runner/pat, which gha-jitconfig reads on
+          # every job start. The box would mint runners on a token it no longer
+          # has. Going through the wizard also re-derives the values that
+          # depend on GHA_TRUST, which reusing would have left stale.
+          log "answers supplied in the environment override the stored ones"
+          wizard
+        elif ask_yn "Reuse it?" y; then
+          # Reusing the stored answers: the wizard never runs, so this is the
+          # only chance to show the plan and get it confirmed.
+          confirm_plan
+        else
+          # GHA_PAT as well as the answers: load_config already read it from
+          # $PAT_FILE, so leaving it set would skip the wizard's own "reuse the
+          # stored PAT?" question and silently keep the credential of the
+          # configuration the operator just declined.
+          #
+          # No confirm_plan here: wizard ends in one. Calling it again asked
+          # "Proceed?" a second time, defaulting to n -- so a reflexive Enter
+          # aborted a run that had just been confirmed, with the env file
+          # already written.
+          unset "${CONFIG_ANSWERS[@]}" GHA_PAT
+          wizard
+        fi
       else
         wizard
       fi

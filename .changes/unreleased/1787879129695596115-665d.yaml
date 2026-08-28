@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed an unattended install dying on any answer the caller did not supply. `ask` and `ask_menu` called `ensure_tty` even when a default was passed, so once `fleet.sh` stopped inventing values a first-time `install` failed with `no terminal available` for every key `fleet.conf` omits -- `group_id` among them. Both now take their default when `GHA_YES` is set, and `choose_runner_group` falls back to group 1 with a warning. This cannot overwrite anything: it is reached only on a host with no stored answer'
+time: '2026-08-28T01:05:29.695549585Z'

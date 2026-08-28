@@ -64,7 +64,7 @@ cp fleet.conf.example fleet.conf   # edit: hosts, org, labels
 
 **On each runner host**
 
-- Ubuntu on `x86_64` (tested on 22.04 and 24.04)
+- Ubuntu on `x86_64` (tested on 22.04, 24.04 and 26.04)
 - kernel 5.11+ and cgroup v2 — both needed for rootless overlayfs
 - root access
 - a GitHub PAT that can administer runners: a classic PAT with `admin:org` (or
@@ -78,6 +78,25 @@ Everything else — `curl`, `jq`, `unzip`, Docker CE and the rootless extras,
 
 - `bash`, `ssh` and `base64`
 - key-based SSH to every host, and either root or passwordless sudo there
+
+> **If your agent holds many keys**, `sshd`'s `MaxAuthTries` (6 by default) can
+> be exhausted before the right one is offered, and every host fails with
+> `Too many authentication failures` — even when the key is installed. Pin the
+> identity per host, or in `[defaults]`:
+>
+> ```ini
+> ssh_key     = ~/.ssh/id_ed25519
+> ssh_options = -o IdentitiesOnly=yes
+> ```
+>
+> `ssh_key` already becomes `-i`, so do not add a second one in `ssh_options`.
+> If the private key exists only inside an agent, point `ssh_key` at the
+> **public** half instead — `ssh` matches it against the agent and asks the
+> agent to sign.
+>
+> A machine with no key yet cannot be reached this way at all: install one
+> first (`ssh-copy-id`), because `fleet.sh` runs with `BatchMode=yes` and will
+> never prompt for a password.
 
 ## Usage
 
@@ -133,7 +152,22 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 ./fleet.sh --dry-run install          # validate the config, connect to nothing
 ./fleet.sh -p 10 updates              # ten at a time
 ./fleet.sh rotate-pat                 # replace the admin PAT fleet-wide
+./fleet.sh --no-pat install           # re-deploy; each host reuses its own PAT
+./fleet.sh reconfigure                # identical to install when driven here
 ```
+
+`install` applies what `fleet.conf` says: edit `labels` or `runners`, re-run,
+and the hosts converge on the new values. `reconfigure` does the same thing
+over the fleet — the two differ only for someone running the installer by hand
+on a box, where `reconfigure` re-asks every question from scratch. A key
+`fleet.conf` omits is **not** sent at all, so each host keeps the answer it
+already has stored — which is also what lets `--no-pat` work, the machine
+authenticating with the PAT it holds. On a host with nothing stored yet, an
+omitted key falls through to the installer's own default, which it reports as
+it goes. Three answers have no safe default and must be given: `org`, the PAT,
+and `old_user` when a box has more than one over-privileged account. `org` is
+the one key an already-registered host cannot fall back to — it is the fleet's
+identity, and a run that does not name it stops before contacting anything.
 
 Any mode the installer accepts is accepted here and fanned out unchanged.
 Each host gets its own log under `.fleet-logs/<timestamp>-<mode>/`, and the
@@ -148,9 +182,11 @@ user     = root
 ssh_key  = ~/.ssh/id_ed25519
 scope    = org
 org      = your-org
+group_id = 1
 trust    = internal
 labels   = self-hosted,linux,x64,internal
 runners  = auto
+old_user = none
 
 [build-01]
 host = 10.0.0.11
@@ -169,8 +205,11 @@ group_id = 4
 No secret belongs in `fleet.conf` — and `fleet.conf` is gitignored, because it
 names your hosts. The admin PAT is prompted for once, or read from
 `--pat-file`, and is sent over the SSH connection's stdin along with the
-installer. Nothing secret is ever an argument to `ssh`, `sudo` or the
-installer, so no credential appears in any process list on either side.
+installer. On a **re-deploy** of hosts that are already registered, pass
+`--no-pat` instead: each host reuses the credential it already stores at
+`/etc/github-runner/pat`, so no copy of the admin token is needed on the
+machine driving the fleet. Nothing secret is ever an argument to `ssh`, `sudo`
+or the installer, so no credential appears in any process list on either side.
 
 ## Using the runners in a workflow
 

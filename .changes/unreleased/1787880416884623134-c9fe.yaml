@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed `fleet.sh` writing diagnostics into the environment file it ships to each host. `warn` printed to stdout, and `build_env`''s stdout is that file -- so a `fleet.conf` setting `repo` without `scope` put the warning text where the remote shell sourced it, producing `command not found` in the host''s log while the operator saw nothing. `warn` now goes to stderr like `err`, and a test pins that the file contains nothing but `export` lines'
+time: '2026-08-28T01:26:56.884581442Z'

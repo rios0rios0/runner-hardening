@@ -42,15 +42,27 @@ FLEET_VERSION="1.0.0"
 # output helpers
 # ---------------------------------------------------------------------------
 if [[ -t 1 ]]; then
-  C_B=$'\033[1m'; C_R=$'\033[0m'; C_BLU=$'\033[1;34m'; C_YEL=$'\033[1;33m'
+  C_B=$'\033[1m'; C_R=$'\033[0m'; C_BLU=$'\033[1;34m'
   C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_CYN=$'\033[1;36m'; C_DIM=$'\033[2m'
 else
-  C_B=""; C_R=""; C_BLU=""; C_YEL=""; C_RED=""; C_GRN=""; C_CYN=""; C_DIM=""
+  C_B=""; C_R=""; C_BLU=""; C_RED=""; C_GRN=""; C_CYN=""; C_DIM=""
+fi
+# warn and err write to fd 2, so their colour has to follow fd 2. Gating them
+# on the fd 1 palette put escape sequences into `2> warn.log` and stripped them
+# from a run whose stdout was redirected but whose stderr was still a terminal.
+if [[ -t 2 ]]; then
+  E_YEL=$'\033[1;33m'; E_RED=$'\033[1;31m'; E_R=$'\033[0m'
+else
+  E_YEL=""; E_RED=""; E_R=""
 fi
 log()  { printf '%s==>%s %s\n' "$C_BLU" "$C_R" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$C_GRN" "$C_R" "$*"; }
-warn() { printf '%s [!]%s %s\n' "$C_YEL" "$C_R" "$*"; }
-err()  { printf '%s [x]%s %s\n' "$C_RED" "$C_R" "$*" >&2; }
+# stderr, not stdout. build_env's STDOUT is the environment file that gets
+# base64'd into the remote host and sourced there, so a diagnostic printed to
+# stdout from anywhere inside it becomes a line the remote shell executes --
+# and never reaches the operator it was written for.
+warn() { printf '%s [!]%s %s\n' "$E_YEL" "$E_R" "$*" >&2; }
+err()  { printf '%s [x]%s %s\n' "$E_RED" "$E_R" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 hr()   { printf '%s%s%s\n' "$C_DIM" "$(printf '%.0s-' {1..72})" "$C_R"; }
 head1(){ echo; hr; printf '%s%s%s\n' "$C_B" "$*" "$C_R"; hr; }
@@ -67,6 +79,7 @@ DRY_RUN=0
 ASSUME_YES=0
 PAT_FILE=""
 NEW_PAT_FILE=""
+NO_PAT=0
 MODE=""
 ADMIN_PAT=""
 NEW_PAT=""
@@ -84,6 +97,10 @@ OPTIONS
   -n, --dry-run           print the plan and exit without connecting
   -y, --yes               do not ask for confirmation
       --pat-file FILE     read the admin PAT from FILE instead of prompting
+      --no-pat            send no admin PAT; each host reuses the one already
+                          stored at /etc/github-runner/pat. Affects install and
+                          reconfigure only. It does not govern rotate-pat's
+                          replacement token, which still needs --new-pat-file.
       --new-pat-file FILE read the replacement PAT from FILE (rotate-pat)
   -h, --help              this text
   -V, --version           print the fleet driver version
@@ -165,6 +182,22 @@ parse_config() {
   (( ${#HOSTS[@]} )) || die "${file}: no host sections found (a '[name]' block per machine)"
 }
 
+# Config smells worth one line before anything is contacted. Deliberately NOT
+# in build_env: that runs twice per host -- once to validate, once to build the
+# bootstrap that is actually sent -- so a warning there would either double up
+# or land on the stream that becomes the host's environment file.
+warn_config_smells() { # warn_config_smells <host-section>
+  local h="$1" repo scope
+  repo="$(cfg "$h" repo)"; scope="$(cfg "$h" scope)"
+  # Not fatal: a host already stored as scope = repo is legitimately changing
+  # only its repository. Anywhere else the key does nothing -- a host stored as
+  # org ignores it, and one with nothing stored falls to the default of org,
+  # where the wizard actively clears it.
+  [[ -n "$repo" && -z "$scope" ]] \
+    && warn "${h}: 'repo' is set but 'scope' is not; it is ignored unless this host is already stored as scope = repo"
+  return 0
+}
+
 # cfg <host> <key> [default] - host value, else [defaults] value, else default
 cfg() {
   local name="$1" key="$2" def="${3-}"
@@ -188,6 +221,7 @@ parse_args() {
       -p|--parallel)      PARALLEL="${2:?--parallel needs a number}"; shift 2 ;;
       -L|--log-dir)       LOG_DIR="${2:?--log-dir needs a path}"; shift 2 ;;
       --pat-file)         PAT_FILE="${2:?--pat-file needs a path}"; shift 2 ;;
+      --no-pat)           NO_PAT=1; shift ;;
       --new-pat-file)     NEW_PAT_FILE="${2:?--new-pat-file needs a path}"; shift 2 ;;
       -n|--dry-run)       DRY_RUN=1; shift ;;
       -y|--yes)           ASSUME_YES=1; shift ;;
@@ -207,6 +241,21 @@ parse_args() {
 
   [[ "$PARALLEL" =~ ^[0-9]+$ ]] && (( PARALLEL >= 1 )) \
     || die "--parallel must be a positive integer, got '${PARALLEL}'"
+
+  if (( NO_PAT )); then
+    [[ -z "$PAT_FILE" ]] || die "--no-pat and --pat-file contradict each other"
+    case "$MODE" in
+      install|reconfigure)
+        [[ -z "${GHA_PAT:-}" ]] \
+          || warn "--no-pat given: ignoring the GHA_PAT in your environment" ;;
+      rotate-pat)
+        # Inert here, but saying "never sends a PAT" would read as "you will not
+        # be asked for a credential" -- and rotate-pat still needs the NEW one.
+        warn "--no-pat governs the admin PAT only; rotate-pat still needs --new-pat-file" ;;
+      *)
+        warn "--no-pat has no effect on '${MODE}': that mode never sends a PAT anyway" ;;
+    esac
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -248,40 +297,62 @@ shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }   # single-quote for a shell litera
 build_env() { # build_env <host-section>
   local h="$1" scope org repo group labels trust runners old_user force
 
-  scope="$(cfg "$h" scope org)"
+  # No invented defaults. Since the installer treats its stored answers as
+  # defaults rather than overrides, anything emitted here WINS over what the
+  # host already has -- so substituting a value fleet.conf never mentioned
+  # would silently rewrite that host's configuration. The worst case is
+  # `trust`: defaulting it to `internal` would take a box that runs fork PRs
+  # and stop it wiping Docker state between jobs, with GHA_YES suppressing
+  # every confirmation on the way. An omitted key must therefore mean "leave
+  # this alone", which it can only mean by not being sent at all.
+  #
+  # The corollary: a host that has never been installed needs fleet.conf to
+  # answer everything, because the installer has no stored file to fall back
+  # to and no terminal to ask on. fleet.conf.example spells out that full set.
+  scope="$(cfg "$h" scope)"
   org="$(cfg "$h" org)"
   repo="$(cfg "$h" repo)"
-  group="$(cfg "$h" group_id 1)"
+  group="$(cfg "$h" group_id)"
   labels="$(cfg "$h" labels)"
-  trust="$(cfg "$h" trust internal)"
-  runners="$(cfg "$h" runners auto)"
-  old_user="$(cfg "$h" old_user none)"
+  trust="$(cfg "$h" trust)"
+  runners="$(cfg "$h" runners)"
+  old_user="$(cfg "$h" old_user)"
   force="$(cfg "$h" force_deprivilege)"
 
-  case "$scope" in org|repo) ;; *) die "${h}: scope must be 'org' or 'repo', got '${scope}'" ;; esac
-  case "$trust" in internal|untrusted) ;; *) die "${h}: trust must be 'internal' or 'untrusted', got '${trust}'" ;; esac
-  [[ "$runners" == "auto" || "$runners" =~ ^[0-9]+$ ]] \
+  # Validate what IS set. An unset key is not an error here; it is a decision.
+  [[ -z "$scope" ]] || case "$scope" in org|repo) ;;
+    *) die "${h}: scope must be 'org' or 'repo', got '${scope}'" ;; esac
+  [[ -z "$trust" ]] || case "$trust" in internal|untrusted) ;;
+    *) die "${h}: trust must be 'internal' or 'untrusted', got '${trust}'" ;; esac
+  [[ -z "$runners" || "$runners" == "auto" || "$runners" =~ ^[0-9]+$ ]] \
     || die "${h}: runners must be a positive integer or 'auto', got '${runners}'"
-  [[ "$group" =~ ^[0-9]+$ ]] || die "${h}: group_id must be a number, got '${group}'"
+  [[ -z "$group" || "$group" =~ ^[0-9]+$ ]] \
+    || die "${h}: group_id must be a number, got '${group}'"
 
   # Only `install` and `reconfigure` build a configuration. Every other mode
   # reads the one already on the box, and sending answers would be a lie about
   # what that box is actually configured for.
   if [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]]; then
+    # `org` is the one key with no fallback: it is the fleet's identity, and a
+    # host cannot be re-registered somewhere the config does not name.
     [[ -n "$org" ]] || die "${h}: 'org' is required for ${MODE}"
     [[ "$scope" == "repo" && -z "$repo" ]] && die "${h}: scope = repo also needs 'repo'"
-    : "${labels:=self-hosted,linux,x64,${trust}}"
 
-    printf 'export GHA_SCOPE=%s\n'    "$(shq "$scope")"
-    printf 'export GHA_ORG=%s\n'      "$(shq "$org")"
-    [[ -n "$repo" ]] && printf 'export GHA_REPO=%s\n' "$(shq "$repo")"
-    printf 'export GHA_GROUP_ID=%s\n' "$(shq "$group")"
-    printf 'export GHA_LABELS=%s\n'   "$(shq "$labels")"
-    printf 'export GHA_TRUST=%s\n'    "$(shq "$trust")"
-    printf 'export GHA_COUNT=%s\n'    "$(shq "$runners")"
-    printf 'export GHA_OLD_USER=%s\n' "$(shq "$old_user")"
-    [[ -n "$force" ]] && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
-    printf 'export GHA_PAT=%s\n'      "$(shq "$ADMIN_PAT")"
+    printf 'export GHA_ORG=%s\n' "$(shq "$org")"
+    [[ -n "$scope" ]]    && printf 'export GHA_SCOPE=%s\n'    "$(shq "$scope")"
+    [[ -n "$repo" ]]     && printf 'export GHA_REPO=%s\n'     "$(shq "$repo")"
+    [[ -n "$group" ]]    && printf 'export GHA_GROUP_ID=%s\n' "$(shq "$group")"
+    [[ -n "$labels" ]]   && printf 'export GHA_LABELS=%s\n'   "$(shq "$labels")"
+    [[ -n "$trust" ]]    && printf 'export GHA_TRUST=%s\n'    "$(shq "$trust")"
+    [[ -n "$runners" ]]  && printf 'export GHA_COUNT=%s\n'    "$(shq "$runners")"
+    [[ -n "$old_user" ]] && printf 'export GHA_OLD_USER=%s\n' "$(shq "$old_user")"
+    [[ -n "$force" ]]    && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
+    # With --no-pat we send no credential and the host uses the one it stores.
+    # Every unattended run reaches it the same way -- should_preload_config
+    # returns true for both modes, so load_config reads /etc/github-runner/pat.
+    # The wizard's own "Reuse the PAT already stored?" prompt only matters to
+    # someone running the installer by hand on the box.
+    (( NO_PAT )) || printf 'export GHA_PAT=%s\n' "$(shq "$ADMIN_PAT")"
   fi
 
   [[ "$MODE" == "rotate-pat" ]] && printf 'export GHA_NEW_PAT=%s\n' "$(shq "$NEW_PAT")"
@@ -300,7 +371,7 @@ build_env() { # build_env <host-section>
 # elevated command free of nested quoting.
 # ---------------------------------------------------------------------------
 build_bootstrap() { # build_bootstrap <host-section>
-  local h="$1" become elevate
+  local h="$1" become elevate env_b64
   become="$(cfg "$h" become auto)"
   case "$become" in
     auto)  [[ "$(cfg "$h" user root)" == "root" ]] && elevate="" || elevate="sudo -n" ;;
@@ -309,13 +380,21 @@ build_bootstrap() { # build_bootstrap <host-section>
     *)     die "${h}: become must be 'auto', 'sudo' or 'none', got '${become}'" ;;
   esac
 
+  # Assigned, not inlined into the heredoc below. `die` is `err; exit 1`, and
+  # an exit inside $( ) ends only that subshell -- so every validation in
+  # build_env used to print its message and then let the run continue, with the
+  # offending host receiving an EMPTY environment file. An assignment does
+  # propagate the substitution's status under errexit, which is what turns
+  # those messages back into a stop.
+  env_b64="$(build_env "$h" | base64)"
+
   cat <<BOOTSTRAP_HEAD
 set -eu
 umask 077
 d=\$(mktemp -d /tmp/.runner-hardening.XXXXXXXX) || exit 1
 trap 'rm -rf "\$d"' EXIT INT TERM HUP
 base64 -d > "\$d/env" <<'__RH_ENV__'
-$(build_env "$h" | base64)
+${env_b64}
 __RH_ENV__
 base64 -d > "\$d/harden-gha-runners.sh" <<'__RH_INSTALLER__'
 ${INSTALLER_B64}
@@ -356,6 +435,11 @@ run_host() { # run_host <host-section>; writes <log> and <status>
   local -a ssh_args=()
   mapfile -t ssh_args < <(ssh_args_for "$h")
 
+  # Built before the redirection, for the same reason as env_b64 above: a
+  # failure inside $( ) in the here-string would otherwise be swallowed.
+  local bootstrap
+  bootstrap="$(build_bootstrap "$h")"
+
   started=$(date +%s)
   {
     echo "=== ${h} (${user}@${host}) mode=${MODE} at $(date -Is) ==="
@@ -363,7 +447,7 @@ run_host() { # run_host <host-section>; writes <log> and <status>
   } > "$log"
 
   ssh "${ssh_args[@]}" "${user}@${host}" bash -s >> "$log" 2>&1 \
-    <<<"$(build_bootstrap "$h")" || rc=$?
+    <<<"$bootstrap" || rc=$?
 
   ended=$(date +%s)
   printf '%s %s\n' "$rc" "$(( ended - started ))" > "$st"
@@ -394,12 +478,16 @@ main() {
       "$(cfg "$h" user root)" "$(cfg "$h" host "$h")" "$(cfg "$h" port 22)"
   done
 
-  # Validate every host up front. build_bootstrap dies on a bad scope, trust,
-  # runner count, group id or become mode - and doing that here means a typo in
-  # host 40 is caught before host 1 is touched, instead of half way through a
-  # fleet-wide install.
+  # Validate every host up front: a typo in host 40 stops the run before host 1
+  # is touched, rather than half way through a fleet-wide install. This only
+  # works because build_bootstrap assigns build_env's output rather than
+  # inlining it -- see the note there.
   INSTALLER_B64="$(base64 < "$INSTALLER")"
-  for h in "${SELECTED[@]}"; do build_bootstrap "$h" >/dev/null; done
+  for h in "${SELECTED[@]}"; do
+    build_bootstrap "$h" >/dev/null
+    # Only install/reconfigure send answers, so only they can act on a scope.
+    [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]] && warn_config_smells "$h"
+  done
   ok "configuration valid for all ${#SELECTED[@]} host(s)"
 
   if (( DRY_RUN )); then
@@ -409,7 +497,7 @@ main() {
   fi
 
   # --- secrets, read once and reused for every host ------------------------
-  if [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]]; then
+  if [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]] && (( ! NO_PAT )); then
     if [[ -n "$PAT_FILE" ]]; then
       [[ -r "$PAT_FILE" ]] || die "cannot read ${PAT_FILE}"
       ADMIN_PAT="$(< "$PAT_FILE")"
@@ -496,6 +584,12 @@ main() {
     echo "  ${C_DIM}Most failures are one of: SSH key not authorised, sudo needs a"
     echo "  password (become = sudo requires NOPASSWD), or the admin PAT lacks"
     echo "  runner-admin permission. The installer prints which one.${C_R}"
+    if (( NO_PAT )); then
+      echo "  ${C_DIM}With --no-pat, 'no terminal available' means that host has no PAT at"
+      echo "  /etc/github-runner/pat yet -- it has never been installed. Give it one"
+      echo "  with --pat-file on its first run. Every other unattended answer now"
+      echo "  has a default or its own error message.${C_R}"
+    fi
     return 1
   fi
   ok "${C_B}all ${#SELECTED[@]} host(s) completed '${MODE}'${C_R}"

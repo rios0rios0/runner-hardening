@@ -10,6 +10,16 @@
 #
 # Run from the repository root:  bash test/bootstrap_test.sh   (or: make test)
 #
+# This file wires globals that functions in fleet.sh and harden-gha-runners.sh
+# read (MODE, ADMIN_PAT, NO_PAT, ENV_FILE, ...). ShellCheck cannot follow the
+# interpolated `source` below, so it sees every one of them assigned and never
+# used. Disabling SC2034 for the file is the honest trade here -- a test file
+# that only sets up state for a sourced library has no other use for the check,
+# and the alternative was six near-identical inline directives that had to be
+# re-added with every new case. The directive must sit BEFORE the first command
+# to apply file-wide.
+# shellcheck disable=SC2034
+
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -40,7 +50,6 @@ assert_not_contains() {
 # Resets the parser's state between cases. Every name below is read by a
 # function that lives in fleet.sh, which ShellCheck does not follow through the
 # interpolated `source` above - so it sees the assignment and not the use.
-# shellcheck disable=SC2034
 reset_config() { CFG=(); HOSTS=(); SELECTED=(); }
 
 # A stand-in installer: prints what the elevated shell handed it, then exits 7
@@ -270,6 +279,55 @@ it_cleans_up_the_staging_directory() {
 }
 it_cleans_up_the_staging_directory
 
+it_omits_the_pat_when_no_pat_is_given() {
+  # given --no-pat on an install, and a box that already stores its own PAT
+  reset_config
+
+  # when the bootstrap runs -- NO_PAT set inside the subshell, so the suite
+  # cannot become order-dependent on a global left behind here
+  local out
+  out="$( NO_PAT=1; run_bootstrap "${WORK}/basic.conf" install 'fixture-pat-placeholder' )"
+
+  # then every other answer still arrives, but no credential is sent -- the
+  # installer falls back to /etc/github-runner/pat on the host
+  assert_contains "should still send the install answers with --no-pat" "$out" "ORG=your-org"
+  assert_contains "should still answer confirmations with --no-pat"     "$out" "YES=1"
+  assert_contains "should send no PAT at all with --no-pat"             "$out" "PAT=<unset>"
+}
+it_omits_the_pat_when_no_pat_is_given
+
+it_rejects_no_pat_with_pat_file() {
+  # given both --no-pat and --pat-file, which say opposite things
+  # when the arguments are parsed
+  # Reset in a subshell so the guard sees a clean slate; all three are read by
+  # parse_args, which lives in fleet.sh.
+  local out
+  out=$( MODE=""; NO_PAT=0; PAT_FILE=""; parse_args --no-pat --pat-file /tmp/x install 2>&1 )
+
+  # then it fails at startup rather than silently picking one
+  local rc=$?
+  assert_contains "should reject --no-pat together with --pat-file" \
+    "$out" "contradict each other"
+  assert_eq "should exit non-zero, making it a startup error not a warning" \
+    "1" "$rc"
+}
+it_rejects_no_pat_with_pat_file
+
+it_warns_rather_than_failing_on_modes_that_send_no_pat() {
+  # given --no-pat on modes where it cannot apply
+  # when the arguments are parsed
+  local out_rotate out_verify
+  out_rotate=$( MODE=""; NO_PAT=0; PAT_FILE=""; parse_args --no-pat rotate-pat 2>&1 )
+  out_verify=$( MODE=""; NO_PAT=0; PAT_FILE=""; parse_args --no-pat verify 2>&1 )
+
+  # then each says something true for that mode rather than one generic line
+  assert_contains "should say --no-pat does not govern rotate-pat's new token" \
+    "$out_rotate" "still needs --new-pat-file"
+  assert_contains "should say --no-pat is inert on a read-only mode" \
+    "$out_verify" "never sends a PAT anyway"
+}
+it_warns_rather_than_failing_on_modes_that_send_no_pat
+
 it_sends_no_answers_for_a_read_only_mode() {
   # given a mode that reads the configuration already on the box
   # when the bootstrap runs
@@ -286,16 +344,11 @@ it_sends_no_answers_for_a_read_only_mode
 it_ships_the_installer_byte_for_byte() {
   # given the real installer rather than the stand-in
   reset_config
-  # A directive covers only the next command, and `a=1; b=2` is two commands.
-  # shellcheck disable=SC2034  # all three are read by build_bootstrap, in fleet.sh
   MODE=version
-  # shellcheck disable=SC2034
   ADMIN_PAT=""
-  # shellcheck disable=SC2034
   NEW_PAT=""
   INSTALLER="${ROOT}/harden-gha-runners.sh"
   parse_config "${WORK}/basic.conf"
-  # shellcheck disable=SC2034  # read by build_bootstrap, which lives in fleet.sh
   INSTALLER_B64="$(base64 < "$INSTALLER")"
 
   # when it is transferred and asked to identify itself
@@ -307,6 +360,372 @@ it_ships_the_installer_byte_for_byte() {
   assert_contains "should transfer the installer without altering a byte" "$out" "sha256:${expected}"
 }
 it_ships_the_installer_byte_for_byte
+
+it_sends_only_what_the_config_specifies() {
+  # given a fleet entry that names nothing but the org and the host
+  reset_config
+  printf '[defaults]\nbecome = none\norg = some-org\n\n[h1]\nhost = 10.0.0.1\n' \
+    > "${WORK}/minimal.conf"
+  parse_config "${WORK}/minimal.conf"
+
+  # when the environment for that host is built (globals scoped to the subshell
+  # so the suite cannot become order-dependent on what is left behind)
+  local out
+  out="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env h1 )"
+
+  # then nothing is invented. The installer keeps a caller's answers over its
+  # stored ones, so an invented default is not a fallback -- it is a silent
+  # rewrite of that host's configuration, and for `trust` it would disable the
+  # per-job Docker wipe on a box that runs fork PRs.
+  assert_contains "should send the org it was given" "$out" "GHA_ORG='some-org'"
+  assert_not_contains "should not invent a trust level"  "$out" "GHA_TRUST"
+  assert_not_contains "should not invent a runner count" "$out" "GHA_COUNT"
+  assert_not_contains "should not invent a runner group" "$out" "GHA_GROUP_ID"
+  assert_not_contains "should not invent a label set"    "$out" "GHA_LABELS"
+  assert_not_contains "should not invent an old user"    "$out" "GHA_OLD_USER"
+  assert_not_contains "should not invent a scope"        "$out" "GHA_SCOPE"
+}
+it_sends_only_what_the_config_specifies
+
+# parse_config calls die on a missing file, and these tests call it directly
+# rather than in a subshell -- so a fixture written by a sibling test would exit
+# the whole suite mid-run if that sibling were ever reordered or removed, with
+# the pass/fail summary never printed.
+setup_repo_noscope_config() {
+  printf '[defaults]\nbecome = none\norg = some-org\nrepo = some-repo\n\n[h1]\nhost = 10.0.0.1\n' \
+    > "${WORK}/repo_noscope.conf"
+}
+
+it_writes_nothing_but_exports_to_the_environment_file() {
+  # given a config that sets `repo` without `scope`
+  reset_config
+  setup_repo_noscope_config
+  parse_config "${WORK}/repo_noscope.conf"
+
+  # when the environment is built, capturing stdout only
+  local out stray
+  out="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env h1 2>/dev/null )"
+  stray="$(grep -cv '^export ' <<<"$out" || true)"
+
+  # then every line is an assignment. build_env's stdout IS the file the remote
+  # host sources, so a diagnostic printed here becomes a line that shell tries
+  # to execute -- and the operator it was meant for never sees it.
+  assert_eq "should emit only export lines, never diagnostics" "0" "$stray"
+  assert_contains "should still emit the answers themselves" "$out" "GHA_ORG='some-org'"
+}
+it_writes_nothing_but_exports_to_the_environment_file
+
+it_warns_on_stderr_when_repo_has_no_scope() {
+  # given a config that sets `repo` without `scope`
+  reset_config
+  setup_repo_noscope_config
+  parse_config "${WORK}/repo_noscope.conf"
+
+  # when the config is checked, capturing stderr only
+  local errout
+  errout="$( warn_config_smells h1 2>&1 >/dev/null )"
+
+  # then the operator gets the warning, on the stream that reaches them
+  assert_contains "should warn about a repo with no scope, on stderr" \
+    "$errout" "'repo' is set but 'scope' is not"
+}
+
+it_stops_the_run_when_a_host_fails_validation() {
+  # given a fleet where one host has an invalid trust level
+  reset_config
+  printf '[defaults]\nbecome = none\nscope = org\norg = some-org\n\n[good]\nhost = 10.0.0.1\ntrust = internal\n\n[bad]\nhost = 10.0.0.2\ntrust = kinda\n' \
+    > "${WORK}/badtrust.conf"
+
+  # when the run is planned
+  # Executed, not sourced: this suite runs with `set +e`, and the abort under
+  # test is an errexit abort. Only the real script carries its own options.
+  local out rc=0
+  out=$("${ROOT}/fleet.sh" -c "${WORK}/badtrust.conf" -f "${WORK}/stub-installer.sh" \
+        -n -y --no-pat install 2>&1) || rc=$?
+
+  # then it stops. `die` inside build_env runs in a command substitution, so
+  # without an assignment to propagate its status the run printed the error and
+  # then announced the configuration valid, shipping an EMPTY environment file
+  # to the offending host while installing every other one.
+  assert_contains "should report which host and key failed" "$out" "trust must be 'internal' or 'untrusted'"
+  assert_not_contains "should not announce the configuration valid" "$out" "configuration valid"
+  assert_not_contains "should not reach the dry-run summary" "$out" "nothing was contacted"
+  assert_eq "should exit non-zero so a caller can stop" "1" "$rc"
+}
+it_stops_the_run_when_a_host_fails_validation
+
+it_only_warns_about_smells_on_modes_that_can_act_on_them() {
+  # given a config that sets `repo` without `scope`
+  reset_config
+  setup_repo_noscope_config
+
+  # when a read-only mode is planned against it
+  local out
+  out=$("${ROOT}/fleet.sh" -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" \
+        -n -y verify 2>&1)
+  assert_contains "the verify plan should have been reached at all" "$out" "dry run"
+
+  # then it stays quiet: that mode sends no answers, so there is no scope
+  # decision for the warning to be about
+  assert_not_contains "should not warn about a scope a read-only mode never sets" \
+    "$out" "'repo' is set but 'scope' is not"
+}
+it_only_warns_about_smells_on_modes_that_can_act_on_them
+
+it_warns_about_smells_on_a_mode_that_does_set_a_scope() {
+  # given the same config, planned for install
+  reset_config
+  setup_repo_noscope_config
+
+  # when the run is planned
+  local out
+  out=$("${ROOT}/fleet.sh" -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" \
+        -n -y --no-pat install 2>&1)
+  assert_contains "the install plan should have been reached at all" "$out" "dry run"
+
+  # then the operator is told, before anything is contacted
+  assert_contains "should warn about a repo with no scope when installing" \
+    "$out" "'repo' is set but 'scope' is not"
+}
+it_warns_about_smells_on_a_mode_that_does_set_a_scope
+
+it_says_nothing_when_the_config_has_no_smells() {
+  # given a fully specified config
+  reset_config
+  parse_config "${WORK}/basic.conf"
+
+  # when it is checked
+  local errout
+  errout="$( warn_config_smells host1 2>&1 >/dev/null )"
+
+  # then it is silent, so the warning stays worth reading
+  assert_eq "should say nothing about a config with no smells" "" "$errout"
+}
+it_says_nothing_when_the_config_has_no_smells
+it_warns_on_stderr_when_repo_has_no_scope
+
+it_still_sends_everything_the_config_does_specify() {
+  # given a fleet entry that spells every answer out
+  reset_config
+  parse_config "${WORK}/basic.conf"
+
+  # when the environment is built
+  local out
+  out="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env host1 )"
+
+  # then each one is sent, so a deliberate change still reaches the host
+  assert_contains "should send a configured trust level"  "$out" "GHA_TRUST='internal'"
+  assert_contains "should send a configured runner count" "$out" "GHA_COUNT='2'"
+  assert_contains "should send a configured runner group" "$out" "GHA_GROUP_ID='3'"
+}
+it_still_sends_everything_the_config_does_specify
+
+echo
+echo "installer configuration precedence"
+
+# The installer sets its own shell options and cds to /, so it is sourced in a
+# subshell. These exercise load_config directly: it is the one function whose
+# failure mode is silence -- an unattended run reports success and changes
+# nothing.
+setup_stored_config() {
+  cat > "${WORK}/inst_env" <<'ENV'
+GHA_SCOPE="org"
+GHA_ORG="stored-org"
+GHA_REPO=""
+GHA_GROUP_ID="1"
+GHA_LABELS="self-hosted,linux,x64,internal"
+GHA_COUNT="3"
+GHA_TRUST="internal"
+GHA_OLD_USER="none"
+RUNNER_NAME_PREFIX="storedbox"
+ENV
+  printf 'stored-pat' > "${WORK}/inst_pat"
+}
+
+# load_config_probe <exported assignments...> -> "labels|count|pat|name_prefix"
+load_config_probe() {
+  (
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    # Only -e is dropped. `nounset` stays ON, because the two constructs this
+    # rewrite added -- the ${!v+set} guard before the indirect expansion, and
+    # iterating a possibly-empty associative array -- exist precisely to
+    # survive it. Production runs under `set -Eeuo pipefail`; a probe that
+    # relaxed -u would pass while every real host died with "unbound variable".
+    set +e
+    ENV_FILE="${WORK}/inst_env"
+    PAT_FILE="${WORK}/inst_pat"
+    eval "$1"
+    load_config >/dev/null 2>&1
+    printf '%s|%s|%s|%s|%s' "${GHA_LABELS:-}" "${GHA_COUNT:-}" "${GHA_PAT:-}" \
+                            "${RUNNER_NAME_PREFIX:-}" "${CONFIG_OVERRIDDEN:-}"
+  )
+}
+
+it_keeps_caller_answers_over_the_stored_file() {
+  # given a host with stored answers and a caller asking for different ones
+  setup_stored_config
+
+  # when the configuration is loaded during an unattended install
+  local got
+  got=$(load_config_probe 'GHA_LABELS="self-hosted,linux,x64,internal,gpu"; GHA_COUNT=9; unset GHA_PAT')
+
+  # then the caller wins, the unsent value still comes from the file, and the
+  # credential the caller did not supply is the one the host already stores
+  assert_eq "should keep a caller's labels over the stored ones" \
+    "self-hosted,linux,x64,internal,gpu" "${got%%|*}"
+  assert_eq "should keep a caller's runner count over the stored one" \
+    "9" "$(cut -d'|' -f2 <<<"$got")"
+  assert_eq "should fall back to the stored PAT when the caller sends none" \
+    "stored-pat" "$(cut -d'|' -f3 <<<"$got")"
+  assert_eq "should still load a value the caller did not send" \
+    "storedbox" "$(cut -d'|' -f4 <<<"$got")"
+}
+it_keeps_caller_answers_over_the_stored_file
+
+it_records_whether_the_caller_overrode_the_stored_config() {
+  # given the three shapes an install can take
+  setup_stored_config
+  local none labels pat
+  none=$(load_config_probe   'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_PAT')
+  labels=$(load_config_probe 'unset GHA_PAT; GHA_LABELS="self-hosted,linux,x64,internal,gpu"')
+  pat=$(load_config_probe    'unset GHA_LABELS; GHA_PAT="caller-pat"')
+
+  # then the flag distinguishes "the stored file is the whole truth" from "the
+  # caller supplied something". The dispatch offers its "Reuse it?" shortcut
+  # only in the first case: taking it in the others would run on the caller's
+  # values and leave the old ones on disk, including the PAT that gha-jitconfig
+  # reads on every job start.
+  assert_eq "should not flag an override when the caller supplied nothing" \
+    "0" "${none##*|}"
+  assert_eq "should flag an override when the caller supplied an answer" \
+    "1" "${labels##*|}"
+  assert_eq "should flag an override when the caller supplied only a PAT" \
+    "1" "${pat##*|}"
+}
+it_records_whether_the_caller_overrode_the_stored_config
+
+it_prefers_an_explicitly_supplied_pat() {
+  # given a host that stores a PAT and a caller supplying a different one
+  setup_stored_config
+
+  # when the configuration is loaded
+  local got
+  got=$(load_config_probe 'GHA_PAT="caller-pat"')
+
+  # then the supplied token wins, so an install can replace a stored credential
+  assert_eq "should prefer an explicitly supplied PAT over the stored one" \
+    "caller-pat" "$(cut -d'|' -f3 <<<"$got")"
+}
+it_prefers_an_explicitly_supplied_pat
+
+it_preloads_the_stored_answers_for_every_unattended_run() {
+  # given each combination of mode and attendedness
+  # when the preload rule is consulted
+  local got
+  got=$(
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +e
+    r() { GHA_YES="$1" should_preload_config "$2" && printf 'yes' || printf 'no'; }
+    printf '%s|%s|%s|%s' "$(r 1 install)" "$(r 1 reconfigure)" "$(r '' install)" "$(r '' reconfigure)"
+  ) </dev/null
+
+  # then both unattended modes take the host's stored answers as a baseline.
+  # `reconfigure` is the one that matters: it is not gated on a stored file, so
+  # without this an omitted key falls to a wizard default and a box stored as
+  # `untrusted` comes back `internal`, no longer wiping Docker between jobs.
+  assert_eq "should preload for an unattended install"     "yes" "$(cut -d'|' -f1 <<<"$got")"
+  assert_eq "should preload for an unattended reconfigure" "yes" "$(cut -d'|' -f2 <<<"$got")"
+  assert_eq "should preload for an interactive install, which offers to reuse it" \
+    "yes" "$(cut -d'|' -f3 <<<"$got")"
+  assert_eq "should NOT preload for an interactive reconfigure, which re-asks everything" \
+    "no" "$(cut -d'|' -f4 <<<"$got")"
+}
+it_preloads_the_stored_answers_for_every_unattended_run
+
+it_takes_an_unattended_default_instead_of_reaching_for_a_terminal() {
+  # given a first install: nothing stored, and an answer the config omitted
+  # when the wizard asks for it with GHA_YES set and no terminal anywhere
+  # setsid for the same reason as the case below: if the GHA_YES branch this
+  # test guards is ever removed, ask falls to ensure_tty, opens the controlling
+  # terminal a command substitution inherits, and blocks on `read` forever with
+  # the prompt discarded. A regression here must be red, not a silent hang.
+  local got
+  got=$(setsid bash -c '
+    source "$1/harden-gha-runners.sh"
+    set +e
+    export GHA_YES=1
+    unset GHA_COUNT GHA_TRUST
+    ask GHA_COUNT "Runners on this machine" "4" >/dev/null 2>&1
+    ask_menu GHA_TRUST "trust?" "internal:Internal" "untrusted:Untrusted" >/dev/null 2>&1
+    printf "%s|%s" "${GHA_COUNT:-DIED}" "${GHA_TRUST:-DIED}"
+  ' _ "$ROOT" 2>/dev/null </dev/null)
+
+  # then the supplied default is taken. A default that can only be reached
+  # through a tty is unusable to fleet.sh, which has no pty -- and the values
+  # cannot override anything, because this path is only reached when the host
+  # has no stored answer at all.
+  assert_eq "should take a plain default unattended rather than needing a tty" \
+    "4" "${got%%|*}"
+  assert_eq "should take a menu's first option unattended rather than needing a tty" \
+    "internal" "${got##*|}"
+}
+it_takes_an_unattended_default_instead_of_reaching_for_a_terminal
+
+it_still_refuses_to_invent_an_answer_that_has_no_safe_default() {
+  # given a required answer with no default (the admin PAT)
+  # when it is asked for unattended
+  # `setsid`, not just </dev/null: ensure_tty's second branch opens /dev/tty,
+  # the CONTROLLING terminal, which a command substitution inherits whatever
+  # stdin is. Without detaching, this passes in CI (no controlling terminal)
+  # and blocks forever on `read` when the suite is run from a real shell --
+  # with the prompt swallowed by the surrounding 2>&1, so it hangs silently.
+  local out
+  out=$(setsid bash -c '
+    source "$1/harden-gha-runners.sh"
+    set +e
+    export GHA_YES=1
+    unset GHA_ORG
+    ask GHA_ORG "GitHub organisation login" 2>&1
+  ' _ "$ROOT" 2>&1 </dev/null)
+
+  # then it fails loudly instead of guessing
+  assert_contains "should refuse to invent an answer that has no default" \
+    "$out" "no terminal available"
+}
+it_still_refuses_to_invent_an_answer_that_has_no_safe_default
+
+it_survives_nounset_with_nothing_supplied() {
+  # given a caller that exports no GHA_* at all, so the saved-values array is
+  # empty -- the case that would blow up under `set -u` without the guards
+  setup_stored_config
+
+  # when the configuration is loaded with nounset in force
+  local got
+  got=$(load_config_probe 'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_PAT')
+
+  # then it completes rather than dying on an unbound variable
+  assert_eq "should load under nounset when the caller supplied nothing" \
+    "self-hosted,linux,x64,internal" "${got%%|*}"
+}
+it_survives_nounset_with_nothing_supplied
+
+it_uses_the_stored_answers_when_the_caller_sends_nothing() {
+  # given a mode that supplies no answers at all (verify, reap, diagnose...)
+  setup_stored_config
+
+  # when the configuration is loaded
+  local got
+  got=$(load_config_probe 'unset GHA_LABELS GHA_COUNT GHA_PAT')
+
+  # then every value comes from the host, exactly as before
+  assert_eq "should use the stored labels when the caller sends none" \
+    "self-hosted,linux,x64,internal" "${got%%|*}"
+  assert_eq "should use the stored runner count when the caller sends none" \
+    "3" "$(cut -d'|' -f2 <<<"$got")"
+}
+it_uses_the_stored_answers_when_the_caller_sends_nothing
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"

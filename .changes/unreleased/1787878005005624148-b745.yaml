@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed `GHA_PAT` being overwritten by `/etc/github-runner/pat`, which made it impossible to replace a stored credential with an install. A supplied token now wins, and the stored one is used only when the caller sends none -- which is what `fleet.sh --no-pat` relies on'
+time: '2026-08-28T00:46:45.005596396Z'
