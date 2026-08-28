@@ -340,6 +340,57 @@ it_ships_the_installer_byte_for_byte() {
 }
 it_ships_the_installer_byte_for_byte
 
+it_sends_only_what_the_config_specifies() {
+  # given a fleet entry that names nothing but the org and the host
+  reset_config
+  printf '[defaults]\nbecome = none\norg = some-org\n\n[h1]\nhost = 10.0.0.1\n' \
+    > "${WORK}/minimal.conf"
+  # shellcheck disable=SC2034  # all three are read by build_env, in fleet.sh
+  MODE=install
+  # shellcheck disable=SC2034
+  ADMIN_PAT="fixture-pat-placeholder"
+  # shellcheck disable=SC2034
+  NEW_PAT=""
+  parse_config "${WORK}/minimal.conf"
+
+  # when the environment for that host is built
+  local out; out="$(build_env h1)"
+
+  # then nothing is invented. The installer keeps a caller's answers over its
+  # stored ones, so an invented default is not a fallback -- it is a silent
+  # rewrite of that host's configuration, and for `trust` it would disable the
+  # per-job Docker wipe on a box that runs fork PRs.
+  assert_contains "should send the org it was given" "$out" "GHA_ORG='some-org'"
+  assert_not_contains "should not invent a trust level"  "$out" "GHA_TRUST"
+  assert_not_contains "should not invent a runner count" "$out" "GHA_COUNT"
+  assert_not_contains "should not invent a runner group" "$out" "GHA_GROUP_ID"
+  assert_not_contains "should not invent a label set"    "$out" "GHA_LABELS"
+  assert_not_contains "should not invent an old user"    "$out" "GHA_OLD_USER"
+  assert_not_contains "should not invent a scope"        "$out" "GHA_SCOPE"
+}
+it_sends_only_what_the_config_specifies
+
+it_still_sends_everything_the_config_does_specify() {
+  # given a fleet entry that spells every answer out
+  reset_config
+  # shellcheck disable=SC2034  # all three are read by build_env, in fleet.sh
+  MODE=install
+  # shellcheck disable=SC2034
+  ADMIN_PAT="fixture-pat-placeholder"
+  # shellcheck disable=SC2034
+  NEW_PAT=""
+  parse_config "${WORK}/basic.conf"
+
+  # when the environment is built
+  local out; out="$(build_env host1)"
+
+  # then each one is sent, so a deliberate change still reaches the host
+  assert_contains "should send a configured trust level"  "$out" "GHA_TRUST='internal'"
+  assert_contains "should send a configured runner count" "$out" "GHA_COUNT='2'"
+  assert_contains "should send a configured runner group" "$out" "GHA_GROUP_ID='3'"
+}
+it_still_sends_everything_the_config_does_specify
+
 echo
 echo "installer configuration precedence"
 
@@ -367,7 +418,12 @@ load_config_probe() {
   (
     # shellcheck source=/dev/null
     source "${ROOT}/harden-gha-runners.sh"
-    set +eu
+    # Only -e is dropped. `nounset` stays ON, because the two constructs this
+    # rewrite added -- the ${!v+set} guard before the indirect expansion, and
+    # iterating a possibly-empty associative array -- exist precisely to
+    # survive it. Production runs under `set -Eeuo pipefail`; a probe that
+    # relaxed -u would pass while every real host died with "unbound variable".
+    set +e
     # Both are read by load_config, which lives in harden-gha-runners.sh.
     # shellcheck disable=SC2034
     ENV_FILE="${WORK}/inst_env"
@@ -375,7 +431,7 @@ load_config_probe() {
     PAT_FILE="${WORK}/inst_pat"
     eval "$1"
     load_config >/dev/null 2>&1
-    printf '%s|%s|%s|%s' "${GHA_LABELS}" "${GHA_COUNT}" "${GHA_PAT}" "${RUNNER_NAME_PREFIX}"
+    printf '%s|%s|%s|%s' "${GHA_LABELS:-}" "${GHA_COUNT:-}" "${GHA_PAT:-}" "${RUNNER_NAME_PREFIX:-}"
   )
 }
 
@@ -413,6 +469,21 @@ it_prefers_an_explicitly_supplied_pat() {
     "caller-pat" "$(cut -d'|' -f3 <<<"$got")"
 }
 it_prefers_an_explicitly_supplied_pat
+
+it_survives_nounset_with_nothing_supplied() {
+  # given a caller that exports no GHA_* at all, so the saved-values array is
+  # empty -- the case that would blow up under `set -u` without the guards
+  setup_stored_config
+
+  # when the configuration is loaded with nounset in force
+  local got
+  got=$(load_config_probe 'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_PAT')
+
+  # then it completes rather than dying on an unbound variable
+  assert_eq "should load under nounset when the caller supplied nothing" \
+    "self-hosted,linux,x64,internal" "${got%%|*}"
+}
+it_survives_nounset_with_nothing_supplied
 
 it_uses_the_stored_answers_when_the_caller_sends_nothing() {
   # given a mode that supplies no answers at all (verify, reap, diagnose...)

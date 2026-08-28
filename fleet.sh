@@ -269,21 +269,37 @@ shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }   # single-quote for a shell litera
 build_env() { # build_env <host-section>
   local h="$1" scope org repo group labels trust runners old_user force
 
-  scope="$(cfg "$h" scope org)"
+  # No invented defaults. Since the installer treats its stored answers as
+  # defaults rather than overrides, anything emitted here WINS over what the
+  # host already has -- so substituting a value fleet.conf never mentioned
+  # would silently rewrite that host's configuration. The worst case is
+  # `trust`: defaulting it to `internal` would take a box that runs fork PRs
+  # and stop it wiping Docker state between jobs, with GHA_YES suppressing
+  # every confirmation on the way. An omitted key must therefore mean "leave
+  # this alone", which it can only mean by not being sent at all.
+  #
+  # The corollary: a host that has never been installed needs fleet.conf to
+  # answer everything, because the installer has no stored file to fall back
+  # to and no terminal to ask on. fleet.conf.example spells out that full set.
+  scope="$(cfg "$h" scope)"
   org="$(cfg "$h" org)"
   repo="$(cfg "$h" repo)"
-  group="$(cfg "$h" group_id 1)"
+  group="$(cfg "$h" group_id)"
   labels="$(cfg "$h" labels)"
-  trust="$(cfg "$h" trust internal)"
-  runners="$(cfg "$h" runners auto)"
-  old_user="$(cfg "$h" old_user none)"
+  trust="$(cfg "$h" trust)"
+  runners="$(cfg "$h" runners)"
+  old_user="$(cfg "$h" old_user)"
   force="$(cfg "$h" force_deprivilege)"
 
-  case "$scope" in org|repo) ;; *) die "${h}: scope must be 'org' or 'repo', got '${scope}'" ;; esac
-  case "$trust" in internal|untrusted) ;; *) die "${h}: trust must be 'internal' or 'untrusted', got '${trust}'" ;; esac
-  [[ "$runners" == "auto" || "$runners" =~ ^[0-9]+$ ]] \
+  # Validate what IS set. An unset key is not an error here; it is a decision.
+  [[ -z "$scope" ]] || case "$scope" in org|repo) ;;
+    *) die "${h}: scope must be 'org' or 'repo', got '${scope}'" ;; esac
+  [[ -z "$trust" ]] || case "$trust" in internal|untrusted) ;;
+    *) die "${h}: trust must be 'internal' or 'untrusted', got '${trust}'" ;; esac
+  [[ -z "$runners" || "$runners" == "auto" || "$runners" =~ ^[0-9]+$ ]] \
     || die "${h}: runners must be a positive integer or 'auto', got '${runners}'"
-  [[ "$group" =~ ^[0-9]+$ ]] || die "${h}: group_id must be a number, got '${group}'"
+  [[ -z "$group" || "$group" =~ ^[0-9]+$ ]] \
+    || die "${h}: group_id must be a number, got '${group}'"
 
   # Only `install` and `reconfigure` build a configuration. Every other mode
   # reads the one already on the box, and sending answers would be a lie about
@@ -291,21 +307,20 @@ build_env() { # build_env <host-section>
   if [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]]; then
     [[ -n "$org" ]] || die "${h}: 'org' is required for ${MODE}"
     [[ "$scope" == "repo" && -z "$repo" ]] && die "${h}: scope = repo also needs 'repo'"
-    : "${labels:=self-hosted,linux,x64,${trust}}"
 
-    printf 'export GHA_SCOPE=%s\n'    "$(shq "$scope")"
-    printf 'export GHA_ORG=%s\n'      "$(shq "$org")"
-    [[ -n "$repo" ]] && printf 'export GHA_REPO=%s\n' "$(shq "$repo")"
-    printf 'export GHA_GROUP_ID=%s\n' "$(shq "$group")"
-    printf 'export GHA_LABELS=%s\n'   "$(shq "$labels")"
-    printf 'export GHA_TRUST=%s\n'    "$(shq "$trust")"
-    printf 'export GHA_COUNT=%s\n'    "$(shq "$runners")"
-    printf 'export GHA_OLD_USER=%s\n' "$(shq "$old_user")"
-    [[ -n "$force" ]] && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
-    # With --no-pat we deliberately send nothing and the host falls back to the
-    # credential it already stores. The installer treats its saved answers as
-    # defaults rather than overrides, so everything above still applies -- the
-    # PAT is simply the one value we are choosing not to supply.
+    printf 'export GHA_ORG=%s\n' "$(shq "$org")"
+    [[ -n "$scope" ]]    && printf 'export GHA_SCOPE=%s\n'    "$(shq "$scope")"
+    [[ -n "$repo" ]]     && printf 'export GHA_REPO=%s\n'     "$(shq "$repo")"
+    [[ -n "$group" ]]    && printf 'export GHA_GROUP_ID=%s\n' "$(shq "$group")"
+    [[ -n "$labels" ]]   && printf 'export GHA_LABELS=%s\n'   "$(shq "$labels")"
+    [[ -n "$trust" ]]    && printf 'export GHA_TRUST=%s\n'    "$(shq "$trust")"
+    [[ -n "$runners" ]]  && printf 'export GHA_COUNT=%s\n'    "$(shq "$runners")"
+    [[ -n "$old_user" ]] && printf 'export GHA_OLD_USER=%s\n' "$(shq "$old_user")"
+    [[ -n "$force" ]]    && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
+    # With --no-pat we send no credential and the host uses the one it stores.
+    # `install` picks it up in load_config; `reconfigure` never calls that, and
+    # reaches it through the wizard's own "Reuse the PAT already stored?"
+    # prompt, which GHA_YES answers.
     (( NO_PAT )) || printf 'export GHA_PAT=%s\n' "$(shq "$ADMIN_PAT")"
   fi
 

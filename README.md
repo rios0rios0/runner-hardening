@@ -157,9 +157,12 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 ```
 
 `install` applies what `fleet.conf` says: edit `labels` or `runners`, re-run,
-and the hosts converge on the new values. Anything `fleet.conf` does **not**
-specify falls back to the answer each host already has stored, which is what
-lets `--no-pat` work — the machine authenticates with the PAT it holds.
+and the hosts converge on the new values. A key `fleet.conf` omits is **not**
+sent at all, so each host keeps the answer it already has stored — which is
+also what lets `--no-pat` work, the machine authenticating with the PAT it
+holds. The corollary is that a host being installed for the **first** time
+needs `fleet.conf` to answer everything: it has no stored file to fall back to
+and no terminal to be asked on. `fleet.conf.example` spells out that full set.
 
 Any mode the installer accepts is accepted here and fanned out unchanged.
 Each host gets its own log under `.fleet-logs/<timestamp>-<mode>/`, and the
@@ -198,8 +201,8 @@ names your hosts. The admin PAT is prompted for once, or read from
 installer. On a **re-deploy** of hosts that are already registered, pass
 `--no-pat` instead: each host reuses the credential it already stores at
 `/etc/github-runner/pat`, so no copy of the admin token is needed on the
-machine driving the fleet. Nothing secret is ever an argument to `ssh`, `sudo` or the
-installer, so no credential appears in any process list on either side.
+machine driving the fleet. Nothing secret is ever an argument to `ssh`, `sudo`
+or the installer, so no credential appears in any process list on either side.
 
 ## Using the runners in a workflow
 

@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed `fleet.sh` inventing answers for keys `fleet.conf` never mentions. It substituted `scope=org`, `group_id=1`, `trust=internal`, `runners=auto`, `old_user=none` and a derived label set, then sent them -- harmless while the installer discarded them, but an override once it stopped. An omitted key is now not sent at all, so the host keeps what it has; most importantly a box registered as `untrusted` can no longer be silently flipped to `internal`, which would stop it wiping Docker state between fork-PR jobs'
+time: '2026-08-28T00:57:08.356674172Z'

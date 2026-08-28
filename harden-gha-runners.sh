@@ -369,6 +369,11 @@ wizard() {
 
   if [[ "$GHA_SCOPE" == "org" ]]; then
     ask GHA_ORG "GitHub organisation login"
+    # Clear any repository left over from a previous repo-scoped install.
+    # Nothing reads it while the scope is org, but save_config would carry it
+    # forward and the reproduce line printed at the end would then show a
+    # GHA_REPO that contradicts the scope beside it.
+    GHA_REPO=""
   else
     local slug=""
     [[ -n "${GHA_ORG:-}" && -n "${GHA_REPO:-}" ]] && slug="${GHA_ORG}/${GHA_REPO}" || true
@@ -594,16 +599,16 @@ load_config() {
   # `GHA_LABELS=... ./harden-gha-runners.sh` (and every fleet.sh install)
   # report success while changing nothing, because the install dispatch runs
   # this function inside an && chain for its side effect.
-  local -A caller=()
+  local -A supplied=()
   local v
   for v in "${CONFIG_ANSWERS[@]}"; do
-    [[ -n "${!v+set}" && -n "${!v}" ]] && caller["$v"]="${!v}" || true
+    [[ -n "${!v+set}" && -n "${!v}" ]] && supplied["$v"]="${!v}" || true
   done
 
   # shellcheck disable=SC1090
   . "$ENV_FILE"
 
-  for v in "${!caller[@]}"; do printf -v "$v" '%s' "${caller[$v]}"; done
+  for v in "${!supplied[@]}"; do printf -v "$v" '%s' "${supplied[$v]}"; done
 
   # Same rule for the credential: an explicitly supplied PAT wins, so a token
   # can be replaced by an install. Only fall back to the stored one when the
