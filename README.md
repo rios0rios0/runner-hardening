@@ -121,6 +121,13 @@ sudo ./harden-gha-runners.sh uninstall      # remove everything this created
 Every mode is idempotent: re-running converges the box to the desired state
 instead of rebuilding it.
 
+Re-installing a box that is already serving jobs **drains it first**: each
+runner is allowed to finish the job it is on, and only then is it stopped, so a
+re-install costs you no builds. Runners that are idle stop immediately. The
+wait is bounded by `GHA_DRAIN_TIMEOUT` (default 30 minutes); past that the
+remaining jobs are cut off and the install proceeds. If the install fails at
+any point after the drain, the runners are put back automatically.
+
 Unattended, when you already know the answers:
 
 ```bash
@@ -142,6 +149,7 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 | `GHA_OLD_USER`           | the over-privileged account to dismantle, or `none`                       |
 | `GHA_YES`                | answer every confirmation with yes                                        |
 | `GHA_FORCE_DEPRIVILEGE`  | de-privilege an account the installer protects — read the warning first   |
+| `GHA_DRAIN_TIMEOUT`      | seconds to let running jobs finish before a re-install stops the runners (default `1800`) |
 
 ### `fleet.sh` — every machine at once
 
