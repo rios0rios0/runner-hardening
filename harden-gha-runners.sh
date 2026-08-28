@@ -1378,9 +1378,21 @@ if [[ -s /etc/github-runner/pat ]]; then
 fi
 
 # ---- health ----
+# An ephemeral runner exits after every job and systemd restarts it, so a unit
+# caught in auto-restart after a clean run is between jobs, not down. Counting
+# it as dead put a daily "RUNNERS DOWN" line in the journal naming healthy
+# runners and blaming an expired PAT. This repeats the installer's
+# runner_unit_healthy on purpose: this file is written standalone and has
+# nothing to source it from.
 dead=()
 for n in $(seq 1 "${GHA_COUNT}"); do
-  systemctl is-active --quiet "gha-runner@${n}.service" || dead+=("${n}")
+  U="gha-runner@${n}.service"
+  systemctl is-active --quiet "$U" && continue
+  ST=$(systemctl show -p ActiveState     --value "$U" 2>/dev/null || echo "?")
+  RES=$(systemctl show -p Result         --value "$U" 2>/dev/null || echo "?")
+  CODE=$(systemctl show -p ExecMainStatus --value "$U" 2>/dev/null || echo "?")
+  [ "$ST" = "activating" ] && [ "$RES" = "success" ] && [ "$CODE" = "0" ] && continue
+  dead+=("${n}")
 done
 if (( ${#dead[@]} )); then
   log "RUNNERS DOWN: ${dead[*]} - check 'journalctl -u gha-runner@${dead[0]}'."
@@ -1597,6 +1609,31 @@ EOF
 # ===========================================================================
 # VERIFY
 # ===========================================================================
+
+# Does what systemd reports describe a runner between jobs, rather than a
+# broken one? Pure - it asks nothing - so the decision itself is testable
+# without a systemd to ask.
+runner_state_between_jobs() { # <ActiveState> <Result> <ExecMainStatus>
+  [[ "$1" == "activating" && "$2" == "success" && "$3" == "0" ]]
+}
+
+# "active" is the obvious yes. "activating" is the surprising one, and it is
+# why this function exists instead of a bare `systemctl is-active`: these
+# runners are ephemeral, so the unit exits after every single job and
+# Restart=always brings it back RestartSec later with a fresh registration.
+# activating/auto-restart with a clean result is therefore where a healthy
+# runner spends the seconds between jobs - a window `verify` lands in
+# constantly on a busy box. A restart that follows a *failed* run (Result is
+# not success, or a non-zero exit) is a genuine restart loop and still fails.
+runner_unit_healthy() { # runner_unit_healthy <n>
+  local n="$1" st res code
+  systemctl is-active --quiet "gha-runner@${n}" && return 0
+  st=$(systemctl show -p ActiveState     --value "gha-runner@${n}" 2>/dev/null || echo "?")
+  res=$(systemctl show -p Result         --value "gha-runner@${n}" 2>/dev/null || echo "?")
+  code=$(systemctl show -p ExecMainStatus --value "gha-runner@${n}" 2>/dev/null || echo "?")
+  runner_state_between_jobs "$st" "$res" "$code"
+}
+
 phase_verify() {
   head1 "Verification"
   local fail=0 n u uid
@@ -1630,9 +1667,14 @@ phase_verify() {
       || { err "${u}: no rootless docker socket"; fail=1; }
     if systemctl is-active --quiet "gha-runner@${n}"; then
       ok "gha-runner@${n}: active"
+    elif runner_unit_healthy "$n"; then
+      local sub
+      sub=$(systemctl show -p SubState --value "gha-runner@${n}" 2>/dev/null || echo "?")
+      ok "gha-runner@${n}: restarting between jobs (activating/${sub}, last exit 0)"
     else
-      # Report what systemd actually says. "inactive", "failed" and
-      # "activating (auto-restart)" are three different diagnoses.
+      # Report what systemd actually says. "inactive", "failed" and a restart
+      # that followed a failing run are three different diagnoses, and only
+      # these numbers tell them apart.
       local st sub res code
       st=$(systemctl show -p ActiveState   --value "gha-runner@${n}" 2>/dev/null || echo "?")
       sub=$(systemctl show -p SubState     --value "gha-runner@${n}" 2>/dev/null || echo "?")
@@ -1674,10 +1716,13 @@ phase_verify() {
 
       # How many units are actually up? Extra registrations mean completely
       # different things depending on this. The previous version ignored it and
-      # announced "run.sh is dying" while every unit was active.
+      # announced "run.sh is dying" while every unit was active. Counted
+      # through runner_unit_healthy for the same reason the check above uses
+      # it: a runner waiting out RestartSec between jobs is up, and calling it
+      # down here is what made the restart-loop test below fire on a busy box.
       up=0
       for n2 in $(seq 1 "${GHA_COUNT}"); do
-        systemctl is-active --quiet "gha-runner@${n2}" && up=$(( up + 1 )) || true
+        runner_unit_healthy "$n2" && up=$(( up + 1 )) || true
       done
 
       if (( cnt == 0 )); then
@@ -2116,7 +2161,7 @@ EOF
   sleep 6
   local up=0
   for n in $(seq 1 "${GHA_COUNT}"); do
-    systemctl is-active --quiet "gha-runner@${n}" && up=$(( up + 1 )) || true
+    runner_unit_healthy "$n" && up=$(( up + 1 )) || true
   done
   ok "${up}/${GHA_COUNT} runners back up"
 
@@ -2189,7 +2234,7 @@ EOF
   sleep 6
   local up=0
   for n in $(seq 1 "${GHA_COUNT}"); do
-    systemctl is-active --quiet "gha-runner@${n}" && up=$(( up + 1 )) || true
+    runner_unit_healthy "$n" && up=$(( up + 1 )) || true
   done
   ok "${up}/${GHA_COUNT} runners up with the sandbox disabled"
   echo
@@ -2398,7 +2443,11 @@ phase_rotate_pat() {
     sleep 8
     local up=0
     for n in $(seq 1 "${GHA_COUNT}"); do
-      systemctl is-active --quiet "gha-runner@${n}" && up=$(( up + 1 )) || true
+      # Unlike the two sandbox counters, this one gates a `return 1`. A runner
+      # that picked up and finished a job inside the 8s window sits in
+      # auto-restart, and counting that as down failed the rotation on a fleet
+      # whose new PAT had just worked.
+      runner_unit_healthy "$n" && up=$(( up + 1 )) || true
     done
     (( up == GHA_COUNT )) && ok "${up}/${GHA_COUNT} runners back up on the new PAT" \
       || { err "${up}/${GHA_COUNT} up - check: ${0##*/} diagnose"; return 1; }

@@ -728,5 +728,65 @@ it_uses_the_stored_answers_when_the_caller_sends_nothing() {
 it_uses_the_stored_answers_when_the_caller_sends_nothing
 
 echo
+echo "runner unit health"
+
+# Everything else in phase_verify talks to systemd and cannot be exercised
+# here; runner_state_between_jobs is the one part that is pure, and it is the
+# part that decides whether a `verify` run passes.
+# between_jobs_probe <ActiveState> <Result> <ExecMainStatus> -> "yes" | "no"
+between_jobs_probe() {
+  (
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +e
+    if runner_state_between_jobs "$1" "$2" "$3"; then echo yes; else echo no; fi
+  )
+}
+
+it_treats_a_clean_auto_restart_as_a_runner_between_jobs() {
+  # given the state systemd reports for the ten seconds after a job finishes
+  # cleanly: the unit exited 0 and Restart=always is waiting out RestartSec
+  local state=(activating success 0)
+
+  # when the state is judged
+  local got
+  got=$(between_jobs_probe "${state[@]}")
+
+  # then it is healthy - this is the normal state of an ephemeral runner, and
+  # failing on it made verify unusable as a fleet health gate
+  assert_eq "should treat a clean auto-restart as a runner between jobs" "yes" "$got"
+}
+it_treats_a_clean_auto_restart_as_a_runner_between_jobs
+
+it_still_reports_a_restart_that_followed_a_failed_run() {
+  # given the two shapes a genuine restart loop takes
+  local bad_result bad_exit
+
+  # when each is judged
+  bad_result=$(between_jobs_probe activating exit-code 2)
+  bad_exit=$(between_jobs_probe activating success 1)
+
+  # then neither is excused: an auto-restart is only healthy when the run it
+  # follows succeeded
+  assert_eq "should still report a restart after a non-success result" "no" "$bad_result"
+  assert_eq "should still report a restart after a non-zero exit" "no" "$bad_exit"
+}
+it_still_reports_a_restart_that_followed_a_failed_run
+
+it_still_reports_a_unit_that_is_not_coming_back() {
+  # given a stopped unit and a failed one
+  local stopped failed
+
+  # when each is judged
+  stopped=$(between_jobs_probe inactive success 0)
+  failed=$(between_jobs_probe failed exit-code 1)
+
+  # then both keep the old behaviour - only "activating" is ever excused
+  assert_eq "should still report an inactive unit" "no" "$stopped"
+  assert_eq "should still report a failed unit" "no" "$failed"
+}
+it_still_reports_a_unit_that_is_not_coming_back
+
+echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

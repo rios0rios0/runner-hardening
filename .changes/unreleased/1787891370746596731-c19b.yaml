@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed four more health checks that counted a runner between jobs as down. `rotate-pat` was the one that mattered: it restarts the units, waits 8 seconds and then requires every one to be active, so a runner that picked up and finished a job inside that window failed the rotation on a fleet whose new token had just worked. The daily janitor logged `RUNNERS DOWN` naming healthy runners and blaming an expired PAT, and `sandbox-relax` / `sandbox-off` under-reported how many runners came back'
+time: '2026-08-28T04:29:30.746551863Z'
