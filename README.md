@@ -153,7 +153,7 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 ./fleet.sh -p 10 updates              # ten at a time
 ./fleet.sh rotate-pat                 # replace the admin PAT fleet-wide
 ./fleet.sh --no-pat install           # re-deploy; each host reuses its own PAT
-./fleet.sh reconfigure                # redo the wizard from scratch on every host
+./fleet.sh reconfigure                # same as install over the fleet (see below)
 ```
 
 `install` applies what `fleet.conf` says: edit `labels` or `runners`, re-run,

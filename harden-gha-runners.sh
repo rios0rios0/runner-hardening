@@ -2652,8 +2652,11 @@ main() {
 
       if [[ "$mode" == "install" && $have_stored -eq 1 && -z "${GHA_YES:-}" ]]; then
         log "existing configuration found at ${ENV_FILE}"
-        ask_yn "Reuse it?" y || { unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID \
-                                        GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER; wizard; }
+        # GHA_PAT as well as the answers: load_config already read it from
+        # $PAT_FILE, so leaving it set would skip the wizard's own "reuse the
+        # stored PAT?" question and silently keep the credential of the
+        # configuration the operator just declined.
+        ask_yn "Reuse it?" y || { unset "${CONFIG_ANSWERS[@]}" GHA_PAT; wizard; }
         [[ -n "${GHA_SCOPE:-}" ]] && confirm_plan || true
       else
         wizard

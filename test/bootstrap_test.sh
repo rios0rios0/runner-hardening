@@ -387,6 +387,41 @@ it_sends_only_what_the_config_specifies() {
 }
 it_sends_only_what_the_config_specifies
 
+it_writes_nothing_but_exports_to_the_environment_file() {
+  # given a config that trips build_env's `repo` without `scope` warning
+  reset_config
+  printf '[defaults]\nbecome = none\norg = some-org\nrepo = some-repo\n\n[h1]\nhost = 10.0.0.1\n' \
+    > "${WORK}/repo_noscope.conf"
+  parse_config "${WORK}/repo_noscope.conf"
+
+  # when the environment is built, capturing stdout only
+  local out stray
+  out="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env h1 2>/dev/null )"
+  stray="$(grep -cv '^export ' <<<"$out" || true)"
+
+  # then every line is an assignment. build_env's stdout IS the file the remote
+  # host sources, so a diagnostic printed here becomes a line that shell tries
+  # to execute -- and the operator it was meant for never sees it.
+  assert_eq "should emit only export lines, never diagnostics" "0" "$stray"
+  assert_contains "should still emit the answers themselves" "$out" "GHA_ORG='some-org'"
+}
+it_writes_nothing_but_exports_to_the_environment_file
+
+it_warns_on_stderr_when_repo_has_no_scope() {
+  # given the same config
+  reset_config
+  parse_config "${WORK}/repo_noscope.conf"
+
+  # when the environment is built, capturing stderr only
+  local errout
+  errout="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env h1 2>&1 >/dev/null )"
+
+  # then the operator gets the warning, on the stream that reaches them
+  assert_contains "should warn about a repo with no scope, on stderr" \
+    "$errout" "'repo' is set but 'scope' is not"
+}
+it_warns_on_stderr_when_repo_has_no_scope
+
 it_still_sends_everything_the_config_does_specify() {
   # given a fleet entry that spells every answer out
   reset_config
@@ -507,17 +542,20 @@ it_preloads_the_stored_answers_for_every_unattended_run
 it_takes_an_unattended_default_instead_of_reaching_for_a_terminal() {
   # given a first install: nothing stored, and an answer the config omitted
   # when the wizard asks for it with GHA_YES set and no terminal anywhere
+  # setsid for the same reason as the case below: if the GHA_YES branch this
+  # test guards is ever removed, ask falls to ensure_tty, opens the controlling
+  # terminal a command substitution inherits, and blocks on `read` forever with
+  # the prompt discarded. A regression here must be red, not a silent hang.
   local got
-  got=$(
-    # shellcheck source=/dev/null
-    source "${ROOT}/harden-gha-runners.sh"
+  got=$(setsid bash -c '
+    source "$1/harden-gha-runners.sh"
     set +e
     export GHA_YES=1
     unset GHA_COUNT GHA_TRUST
     ask GHA_COUNT "Runners on this machine" "4" >/dev/null 2>&1
     ask_menu GHA_TRUST "trust?" "internal:Internal" "untrusted:Untrusted" >/dev/null 2>&1
-    printf '%s|%s' "${GHA_COUNT:-DIED}" "${GHA_TRUST:-DIED}"
-  ) </dev/null
+    printf "%s|%s" "${GHA_COUNT:-DIED}" "${GHA_TRUST:-DIED}"
+  ' _ "$ROOT" 2>/dev/null </dev/null)
 
   # then the supplied default is taken. A default that can only be reached
   # through a tty is unusable to fleet.sh, which has no pty -- and the values

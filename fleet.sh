@@ -49,7 +49,11 @@ else
 fi
 log()  { printf '%s==>%s %s\n' "$C_BLU" "$C_R" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$C_GRN" "$C_R" "$*"; }
-warn() { printf '%s [!]%s %s\n' "$C_YEL" "$C_R" "$*"; }
+# stderr, not stdout. build_env's STDOUT is the environment file that gets
+# base64'd into the remote host and sourced there, so a diagnostic printed to
+# stdout from anywhere inside it becomes a line the remote shell executes --
+# and never reaches the operator it was written for.
+warn() { printf '%s [!]%s %s\n' "$C_YEL" "$C_R" "$*" >&2; }
 err()  { printf '%s [x]%s %s\n' "$C_RED" "$C_R" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 hr()   { printf '%s%s%s\n' "$C_DIM" "$(printf '%.0s-' {1..72})" "$C_R"; }
@@ -325,9 +329,10 @@ build_env() { # build_env <host-section>
     [[ -n "$old_user" ]] && printf 'export GHA_OLD_USER=%s\n' "$(shq "$old_user")"
     [[ -n "$force" ]]    && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
     # With --no-pat we send no credential and the host uses the one it stores.
-    # `install` picks it up in load_config; `reconfigure` never calls that, and
-    # reaches it through the wizard's own "Reuse the PAT already stored?"
-    # prompt, which GHA_YES answers.
+    # Every unattended run reaches it the same way -- should_preload_config
+    # returns true for both modes, so load_config reads /etc/github-runner/pat.
+    # The wizard's own "Reuse the PAT already stored?" prompt only matters to
+    # someone running the installer by hand on the box.
     (( NO_PAT )) || printf 'export GHA_PAT=%s\n' "$(shq "$ADMIN_PAT")"
   fi
 
