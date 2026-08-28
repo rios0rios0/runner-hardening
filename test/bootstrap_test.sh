@@ -430,6 +430,30 @@ it_warns_on_stderr_when_repo_has_no_scope() {
     "$errout" "'repo' is set but 'scope' is not"
 }
 
+it_stops_the_run_when_a_host_fails_validation() {
+  # given a fleet where one host has an invalid trust level
+  reset_config
+  printf '[defaults]\nbecome = none\nscope = org\norg = some-org\n\n[good]\nhost = 10.0.0.1\ntrust = internal\n\n[bad]\nhost = 10.0.0.2\ntrust = kinda\n' \
+    > "${WORK}/badtrust.conf"
+
+  # when the run is planned
+  # Executed, not sourced: this suite runs with `set +e`, and the abort under
+  # test is an errexit abort. Only the real script carries its own options.
+  local out rc=0
+  out=$("${ROOT}/fleet.sh" -c "${WORK}/badtrust.conf" -f "${WORK}/stub-installer.sh" \
+        -n -y --no-pat install 2>&1) || rc=$?
+
+  # then it stops. `die` inside build_env runs in a command substitution, so
+  # without an assignment to propagate its status the run printed the error and
+  # then announced the configuration valid, shipping an EMPTY environment file
+  # to the offending host while installing every other one.
+  assert_contains "should report which host and key failed" "$out" "trust must be 'internal' or 'untrusted'"
+  assert_not_contains "should not announce the configuration valid" "$out" "configuration valid"
+  assert_not_contains "should not reach the dry-run summary" "$out" "nothing was contacted"
+  assert_eq "should exit non-zero so a caller can stop" "1" "$rc"
+}
+it_stops_the_run_when_a_host_fails_validation
+
 it_only_warns_about_smells_on_modes_that_can_act_on_them() {
   # given a config that sets `repo` without `scope`
   reset_config
@@ -437,8 +461,8 @@ it_only_warns_about_smells_on_modes_that_can_act_on_them() {
 
   # when a read-only mode is planned against it
   local out
-  out=$( MODE=""; NO_PAT=0; PAT_FILE=""
-         main -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" -n -y verify 2>&1 )
+  out=$("${ROOT}/fleet.sh" -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" \
+        -n -y verify 2>&1)
   assert_contains "the verify plan should have been reached at all" "$out" "dry run"
 
   # then it stays quiet: that mode sends no answers, so there is no scope
@@ -455,8 +479,8 @@ it_warns_about_smells_on_a_mode_that_does_set_a_scope() {
 
   # when the run is planned
   local out
-  out=$( MODE=""; NO_PAT=0; PAT_FILE=""
-         main -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" -n -y --no-pat install 2>&1 )
+  out=$("${ROOT}/fleet.sh" -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" \
+        -n -y --no-pat install 2>&1)
   assert_contains "the install plan should have been reached at all" "$out" "dry run"
 
   # then the operator is told, before anything is contacted
@@ -533,7 +557,8 @@ load_config_probe() {
     PAT_FILE="${WORK}/inst_pat"
     eval "$1"
     load_config >/dev/null 2>&1
-    printf '%s|%s|%s|%s' "${GHA_LABELS:-}" "${GHA_COUNT:-}" "${GHA_PAT:-}" "${RUNNER_NAME_PREFIX:-}"
+    printf '%s|%s|%s|%s|%s' "${GHA_LABELS:-}" "${GHA_COUNT:-}" "${GHA_PAT:-}" \
+                            "${RUNNER_NAME_PREFIX:-}" "${CONFIG_OVERRIDDEN:-}"
   )
 }
 
@@ -557,6 +582,28 @@ it_keeps_caller_answers_over_the_stored_file() {
     "storedbox" "$(cut -d'|' -f4 <<<"$got")"
 }
 it_keeps_caller_answers_over_the_stored_file
+
+it_records_whether_the_caller_overrode_the_stored_config() {
+  # given the three shapes an install can take
+  setup_stored_config
+  local none labels pat
+  none=$(load_config_probe   'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_PAT')
+  labels=$(load_config_probe 'unset GHA_PAT; GHA_LABELS="self-hosted,linux,x64,internal,gpu"')
+  pat=$(load_config_probe    'unset GHA_LABELS; GHA_PAT="caller-pat"')
+
+  # then the flag distinguishes "the stored file is the whole truth" from "the
+  # caller supplied something". The dispatch offers its "Reuse it?" shortcut
+  # only in the first case: taking it in the others would run on the caller's
+  # values and leave the old ones on disk, including the PAT that gha-jitconfig
+  # reads on every job start.
+  assert_eq "should not flag an override when the caller supplied nothing" \
+    "0" "${none##*|}"
+  assert_eq "should flag an override when the caller supplied an answer" \
+    "1" "${labels##*|}"
+  assert_eq "should flag an override when the caller supplied only a PAT" \
+    "1" "${pat##*|}"
+}
+it_records_whether_the_caller_overrode_the_stored_config
 
 it_prefers_an_explicitly_supplied_pat() {
   # given a host that stores a PAT and a caller supplying a different one

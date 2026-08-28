@@ -160,12 +160,14 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 and the hosts converge on the new values. `reconfigure` does the same thing
 over the fleet — the two differ only for someone running the installer by hand
 on a box, where `reconfigure` re-asks every question from scratch. A key
-`fleet.conf` omits is **not** sent at all, so each host keeps the answer it already has stored — which is
-also what lets `--no-pat` work, the machine authenticating with the PAT it
-holds. On a host with nothing stored yet, an omitted key falls through to the
-installer's own default, which it reports as it goes. Two answers have no safe
-default and must be given: the PAT, and `old_user` when a box has more than one
-over-privileged account.
+`fleet.conf` omits is **not** sent at all, so each host keeps the answer it
+already has stored — which is also what lets `--no-pat` work, the machine
+authenticating with the PAT it holds. On a host with nothing stored yet, an
+omitted key falls through to the installer's own default, which it reports as
+it goes. Three answers have no safe default and must be given: `org`, the PAT,
+and `old_user` when a box has more than one over-privileged account. `org` is
+the one key an already-registered host cannot fall back to — it is the fleet's
+identity, and a run that does not name it stops before contacting anything.
 
 Any mode the installer accepts is accepted here and fanned out unchanged.
 Each host gets its own log under `.fleet-logs/<timestamp>-<mode>/`, and the

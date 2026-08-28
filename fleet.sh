@@ -371,7 +371,7 @@ build_env() { # build_env <host-section>
 # elevated command free of nested quoting.
 # ---------------------------------------------------------------------------
 build_bootstrap() { # build_bootstrap <host-section>
-  local h="$1" become elevate
+  local h="$1" become elevate env_b64
   become="$(cfg "$h" become auto)"
   case "$become" in
     auto)  [[ "$(cfg "$h" user root)" == "root" ]] && elevate="" || elevate="sudo -n" ;;
@@ -380,13 +380,21 @@ build_bootstrap() { # build_bootstrap <host-section>
     *)     die "${h}: become must be 'auto', 'sudo' or 'none', got '${become}'" ;;
   esac
 
+  # Assigned, not inlined into the heredoc below. `die` is `err; exit 1`, and
+  # an exit inside $( ) ends only that subshell -- so every validation in
+  # build_env used to print its message and then let the run continue, with the
+  # offending host receiving an EMPTY environment file. An assignment does
+  # propagate the substitution's status under errexit, which is what turns
+  # those messages back into a stop.
+  env_b64="$(build_env "$h" | base64)"
+
   cat <<BOOTSTRAP_HEAD
 set -eu
 umask 077
 d=\$(mktemp -d /tmp/.runner-hardening.XXXXXXXX) || exit 1
 trap 'rm -rf "\$d"' EXIT INT TERM HUP
 base64 -d > "\$d/env" <<'__RH_ENV__'
-$(build_env "$h" | base64)
+${env_b64}
 __RH_ENV__
 base64 -d > "\$d/harden-gha-runners.sh" <<'__RH_INSTALLER__'
 ${INSTALLER_B64}
@@ -427,6 +435,11 @@ run_host() { # run_host <host-section>; writes <log> and <status>
   local -a ssh_args=()
   mapfile -t ssh_args < <(ssh_args_for "$h")
 
+  # Built before the redirection, for the same reason as env_b64 above: a
+  # failure inside $( ) in the here-string would otherwise be swallowed.
+  local bootstrap
+  bootstrap="$(build_bootstrap "$h")"
+
   started=$(date +%s)
   {
     echo "=== ${h} (${user}@${host}) mode=${MODE} at $(date -Is) ==="
@@ -434,7 +447,7 @@ run_host() { # run_host <host-section>; writes <log> and <status>
   } > "$log"
 
   ssh "${ssh_args[@]}" "${user}@${host}" bash -s >> "$log" 2>&1 \
-    <<<"$(build_bootstrap "$h")" || rc=$?
+    <<<"$bootstrap" || rc=$?
 
   ended=$(date +%s)
   printf '%s %s\n' "$rc" "$(( ended - started ))" > "$st"
@@ -465,10 +478,10 @@ main() {
       "$(cfg "$h" user root)" "$(cfg "$h" host "$h")" "$(cfg "$h" port 22)"
   done
 
-  # Validate every host up front. build_bootstrap dies on a bad scope, trust,
-  # runner count, group id or become mode - and doing that here means a typo in
-  # host 40 is caught before host 1 is touched, instead of half way through a
-  # fleet-wide install.
+  # Validate every host up front: a typo in host 40 stops the run before host 1
+  # is touched, rather than half way through a fleet-wide install. This only
+  # works because build_bootstrap assigns build_env's output rather than
+  # inlining it -- see the note there.
   INSTALLER_B64="$(base64 < "$INSTALLER")"
   for h in "${SELECTED[@]}"; do
     build_bootstrap "$h" >/dev/null
