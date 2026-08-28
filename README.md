@@ -85,8 +85,14 @@ Everything else — `curl`, `jq`, `unzip`, Docker CE and the rootless extras,
 > identity per host, or in `[defaults]`:
 >
 > ```ini
-> ssh_options = -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519.pub
+> ssh_key     = ~/.ssh/id_ed25519
+> ssh_options = -o IdentitiesOnly=yes
 > ```
+>
+> `ssh_key` already becomes `-i`, so do not add a second one in `ssh_options`.
+> If the private key exists only inside an agent, point `ssh_key` at the
+> **public** half instead — `ssh` matches it against the agent and asks the
+> agent to sign.
 >
 > A machine with no key yet cannot be reached this way at all: install one
 > first (`ssh-copy-id`), because `fleet.sh` runs with `BatchMode=yes` and will
@@ -147,7 +153,13 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 ./fleet.sh -p 10 updates              # ten at a time
 ./fleet.sh rotate-pat                 # replace the admin PAT fleet-wide
 ./fleet.sh --no-pat install           # re-deploy; each host reuses its own PAT
+./fleet.sh reconfigure                # redo the wizard from scratch on every host
 ```
+
+`install` applies what `fleet.conf` says: edit `labels` or `runners`, re-run,
+and the hosts converge on the new values. Anything `fleet.conf` does **not**
+specify falls back to the answer each host already has stored, which is what
+lets `--no-pat` work — the machine authenticates with the PAT it holds.
 
 Any mode the installer accepts is accepted here and fanned out unchanged.
 Each host gets its own log under `.fleet-logs/<timestamp>-<mode>/`, and the

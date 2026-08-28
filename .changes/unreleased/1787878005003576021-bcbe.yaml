@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed the installer silently ignoring every answer it was given. `load_config` sourced `/etc/github-runner/env` over the caller''s environment, and the install dispatch runs it inside an `&&` chain for its side effect -- so an already-configured host reported success while keeping its old labels, runner count and group. The stored file is now a default: caller-supplied `GHA_*` values win, anything not supplied still falls back to the file'
+time: '2026-08-28T00:46:45.003536846Z'

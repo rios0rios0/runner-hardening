@@ -580,11 +580,36 @@ EOF
   ok "configuration saved to ${ENV_FILE}"
 }
 
+# The answers save_config writes. Sourcing the env file would assign all of
+# them unconditionally, so these are the ones a caller has to be protected from.
+CONFIG_ANSWERS=(GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT
+                GHA_TRUST GHA_OLD_USER)
+
 load_config() {
   [[ -s "$ENV_FILE" ]] || return 1
+
+  # The stored file is a DEFAULT, not an override. Whatever the caller put in
+  # the environment is what this box is being asked to become, and a plain
+  # `. "$ENV_FILE"` would silently overwrite exactly that -- which made
+  # `GHA_LABELS=... ./harden-gha-runners.sh` (and every fleet.sh install)
+  # report success while changing nothing, because the install dispatch runs
+  # this function inside an && chain for its side effect.
+  local -A caller=()
+  local v
+  for v in "${CONFIG_ANSWERS[@]}"; do
+    [[ -n "${!v+set}" && -n "${!v}" ]] && caller["$v"]="${!v}" || true
+  done
+
   # shellcheck disable=SC1090
   . "$ENV_FILE"
-  [[ -s "$PAT_FILE" ]] && GHA_PAT="$(< "$PAT_FILE")" || true
+
+  for v in "${!caller[@]}"; do printf -v "$v" '%s' "${caller[$v]}"; done
+
+  # Same rule for the credential: an explicitly supplied PAT wins, so a token
+  # can be replaced by an install. Only fall back to the stored one when the
+  # caller sent none -- which is what makes an unattended re-deploy possible
+  # without handing the admin token to whatever is driving it.
+  [[ -z "${GHA_PAT:-}" && -s "$PAT_FILE" ]] && GHA_PAT="$(< "$PAT_FILE")" || true
   return 0
 }
 

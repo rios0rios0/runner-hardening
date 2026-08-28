@@ -273,12 +273,11 @@ it_cleans_up_the_staging_directory
 it_omits_the_pat_when_no_pat_is_given() {
   # given --no-pat on an install, and a box that already stores its own PAT
   reset_config
-  # shellcheck disable=SC2034  # read by build_bootstrap, which lives in fleet.sh
-  NO_PAT=1
 
-  # when the bootstrap runs
-  local out; out="$(run_bootstrap "${WORK}/basic.conf" install 'fixture-pat-placeholder')"
-  NO_PAT=0
+  # when the bootstrap runs -- NO_PAT set inside the subshell, so the suite
+  # cannot become order-dependent on a global left behind here
+  local out
+  out="$( NO_PAT=1; run_bootstrap "${WORK}/basic.conf" install 'fixture-pat-placeholder' )"
 
   # then every other answer still arrives, but no credential is sent -- the
   # installer falls back to /etc/github-runner/pat on the host
@@ -340,6 +339,96 @@ it_ships_the_installer_byte_for_byte() {
   assert_contains "should transfer the installer without altering a byte" "$out" "sha256:${expected}"
 }
 it_ships_the_installer_byte_for_byte
+
+echo
+echo "installer configuration precedence"
+
+# The installer sets its own shell options and cds to /, so it is sourced in a
+# subshell. These exercise load_config directly: it is the one function whose
+# failure mode is silence -- an unattended run reports success and changes
+# nothing.
+setup_stored_config() {
+  cat > "${WORK}/inst_env" <<'ENV'
+GHA_SCOPE="org"
+GHA_ORG="stored-org"
+GHA_REPO=""
+GHA_GROUP_ID="1"
+GHA_LABELS="self-hosted,linux,x64,internal"
+GHA_COUNT="3"
+GHA_TRUST="internal"
+GHA_OLD_USER="none"
+RUNNER_NAME_PREFIX="storedbox"
+ENV
+  printf 'stored-pat' > "${WORK}/inst_pat"
+}
+
+# load_config_probe <exported assignments...> -> "labels|count|pat|name_prefix"
+load_config_probe() {
+  (
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +eu
+    # Both are read by load_config, which lives in harden-gha-runners.sh.
+    # shellcheck disable=SC2034
+    ENV_FILE="${WORK}/inst_env"
+    # shellcheck disable=SC2034
+    PAT_FILE="${WORK}/inst_pat"
+    eval "$1"
+    load_config >/dev/null 2>&1
+    printf '%s|%s|%s|%s' "${GHA_LABELS}" "${GHA_COUNT}" "${GHA_PAT}" "${RUNNER_NAME_PREFIX}"
+  )
+}
+
+it_keeps_caller_answers_over_the_stored_file() {
+  # given a host with stored answers and a caller asking for different ones
+  setup_stored_config
+
+  # when the configuration is loaded during an unattended install
+  local got
+  got=$(load_config_probe 'GHA_LABELS="self-hosted,linux,x64,internal,gpu"; GHA_COUNT=9; unset GHA_PAT')
+
+  # then the caller wins, the unsent value still comes from the file, and the
+  # credential the caller did not supply is the one the host already stores
+  assert_eq "should keep a caller's labels over the stored ones" \
+    "self-hosted,linux,x64,internal,gpu" "${got%%|*}"
+  assert_eq "should keep a caller's runner count over the stored one" \
+    "9" "$(cut -d'|' -f2 <<<"$got")"
+  assert_eq "should fall back to the stored PAT when the caller sends none" \
+    "stored-pat" "$(cut -d'|' -f3 <<<"$got")"
+  assert_eq "should still load a value the caller did not send" \
+    "storedbox" "$(cut -d'|' -f4 <<<"$got")"
+}
+it_keeps_caller_answers_over_the_stored_file
+
+it_prefers_an_explicitly_supplied_pat() {
+  # given a host that stores a PAT and a caller supplying a different one
+  setup_stored_config
+
+  # when the configuration is loaded
+  local got
+  got=$(load_config_probe 'GHA_PAT="caller-pat"')
+
+  # then the supplied token wins, so an install can replace a stored credential
+  assert_eq "should prefer an explicitly supplied PAT over the stored one" \
+    "caller-pat" "$(cut -d'|' -f3 <<<"$got")"
+}
+it_prefers_an_explicitly_supplied_pat
+
+it_uses_the_stored_answers_when_the_caller_sends_nothing() {
+  # given a mode that supplies no answers at all (verify, reap, diagnose...)
+  setup_stored_config
+
+  # when the configuration is loaded
+  local got
+  got=$(load_config_probe 'unset GHA_LABELS GHA_COUNT GHA_PAT')
+
+  # then every value comes from the host, exactly as before
+  assert_eq "should use the stored labels when the caller sends none" \
+    "self-hosted,linux,x64,internal" "${got%%|*}"
+  assert_eq "should use the stored runner count when the caller sends none" \
+    "3" "$(cut -d'|' -f2 <<<"$got")"
+}
+it_uses_the_stored_answers_when_the_caller_sends_nothing
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -85,9 +85,10 @@ OPTIONS
   -n, --dry-run           print the plan and exit without connecting
   -y, --yes               do not ask for confirmation
       --pat-file FILE     read the admin PAT from FILE instead of prompting
-      --no-pat            send no PAT; each host reuses the one already stored
-                          at /etc/github-runner/pat. Only affects install and
-                          reconfigure -- no other mode ever sends one.
+      --no-pat            send no admin PAT; each host reuses the one already
+                          stored at /etc/github-runner/pat. Affects install and
+                          reconfigure only. It does not govern rotate-pat's
+                          replacement token, which still needs --new-pat-file.
       --new-pat-file FILE read the replacement PAT from FILE (rotate-pat)
   -h, --help              this text
   -V, --version           print the fleet driver version
@@ -215,10 +216,16 @@ parse_args() {
 
   if (( NO_PAT )); then
     [[ -z "$PAT_FILE" ]] || die "--no-pat and --pat-file contradict each other"
-    [[ -z "${GHA_PAT:-}" ]] || warn "--no-pat given: ignoring the GHA_PAT in your environment"
     case "$MODE" in
-      install|reconfigure) ;;
-      *) warn "--no-pat has no effect on '${MODE}': that mode never sends a PAT anyway" ;;
+      install|reconfigure)
+        [[ -z "${GHA_PAT:-}" ]] \
+          || warn "--no-pat given: ignoring the GHA_PAT in your environment" ;;
+      rotate-pat)
+        # Inert here, but saying "never sends a PAT" would read as "you will not
+        # be asked for a credential" -- and rotate-pat still needs the NEW one.
+        warn "--no-pat governs the admin PAT only; rotate-pat still needs --new-pat-file" ;;
+      *)
+        warn "--no-pat has no effect on '${MODE}': that mode never sends a PAT anyway" ;;
     esac
   fi
 }
@@ -295,11 +302,10 @@ build_env() { # build_env <host-section>
     printf 'export GHA_COUNT=%s\n'    "$(shq "$runners")"
     printf 'export GHA_OLD_USER=%s\n' "$(shq "$old_user")"
     [[ -n "$force" ]] && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
-    # With --no-pat we deliberately send nothing. GHA_YES makes the installer
-    # answer "yes" to its own "Reuse the PAT already stored in
-    # /etc/github-runner/pat?", so a box that is already registered re-installs
-    # on the credential it holds -- which is the right answer for a re-deploy,
-    # and keeps a second copy of the admin token off this workstation.
+    # With --no-pat we deliberately send nothing and the host falls back to the
+    # credential it already stores. The installer treats its saved answers as
+    # defaults rather than overrides, so everything above still applies -- the
+    # PAT is simply the one value we are choosing not to supply.
     (( NO_PAT )) || printf 'export GHA_PAT=%s\n' "$(shq "$ADMIN_PAT")"
   fi
 
