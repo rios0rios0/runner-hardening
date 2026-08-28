@@ -870,7 +870,17 @@ drain_runners() {
     chmod 0644 "/etc/systemd/system/gha-runner@${n}.service.d/40-drain.conf"
   done
   systemctl daemon-reload
-  DRAINED_UNITS=("${inst[@]}")
+
+  # Every enumerated instance gets the drop-in - none of them may spring back
+  # mid-wipe - but only the ones that were UP get restored by the trap. A stale
+  # instance left loaded by an earlier, larger GHA_COUNT is drained like the
+  # rest, and starting it again on the way out would put back a runner this box
+  # is no longer configured to have.
+  local state
+  for n in "${inst[@]}"; do
+    state=$(systemctl show -p ActiveState --value "gha-runner@${n}.service" 2>/dev/null || echo "")
+    case "$state" in active|activating|reloading) DRAINED_UNITS+=("$n") ;; esac
+  done
   trap undrain_runners EXIT
 
   log "draining ${#inst[@]} runner(s): letting each finish the job it is on"
