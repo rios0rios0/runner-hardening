@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added `unzip` to the packages installed on every runner host. `actions/cache`, `actions/download-artifact` and every action shipping a `.zip` release shell out to it, and a fresh Ubuntu server image does not have it -- without it those steps failed mid-job with a bare `unzip: command not found`'
+time: '2026-08-27T23:47:33.444332299Z'

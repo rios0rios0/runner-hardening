@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added `fleet.sh`, which runs any installer mode across every machine in `fleet.conf` over SSH in parallel, with per-host logs and a pass/fail summary. The installer and the per-host answers travel on the connection stdin into a 0700 staging directory, so no credential ever appears in a process list on either side'
+time: '2026-08-27T23:47:33.442538852Z'

@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed the comment rule documented in `fleet.conf.example`, which claimed only a whole line could be a comment while the parser also strips a `#` or `;` that follows whitespace on a value line -- the behaviour the example file relies on for its own trailing notes'
+time: '2026-08-28T00:02:26.100150099Z'

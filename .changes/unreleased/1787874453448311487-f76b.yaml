@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'changed the wizard to stop prompting for the old over-privileged user when a run is unattended and the scan found nothing to de-privilege -- it was reaching for a terminal an SSH-driven run does not have, to ask a question with exactly one possible answer'
+time: '2026-08-27T23:47:33.448283796Z'
