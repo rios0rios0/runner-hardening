@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed a test that could hang the suite. It relied on `ensure_tty` failing but only redirected stdin, and `ensure_tty` falls back to `/dev/tty` -- the controlling terminal, which a command substitution inherits regardless. It passed in CI and blocked forever on a developer machine, with the prompt swallowed by the surrounding redirection. The probe now runs detached under `setsid`'
+time: '2026-08-28T01:15:39.194126171Z'

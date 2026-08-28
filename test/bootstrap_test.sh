@@ -479,6 +479,31 @@ it_prefers_an_explicitly_supplied_pat() {
 }
 it_prefers_an_explicitly_supplied_pat
 
+it_preloads_the_stored_answers_for_every_unattended_run() {
+  # given each combination of mode and attendedness
+  # when the preload rule is consulted
+  local got
+  got=$(
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +e
+    r() { GHA_YES="$1" should_preload_config "$2" && printf 'yes' || printf 'no'; }
+    printf '%s|%s|%s|%s' "$(r 1 install)" "$(r 1 reconfigure)" "$(r '' install)" "$(r '' reconfigure)"
+  ) </dev/null
+
+  # then both unattended modes take the host's stored answers as a baseline.
+  # `reconfigure` is the one that matters: it is not gated on a stored file, so
+  # without this an omitted key falls to a wizard default and a box stored as
+  # `untrusted` comes back `internal`, no longer wiping Docker between jobs.
+  assert_eq "should preload for an unattended install"     "yes" "$(cut -d'|' -f1 <<<"$got")"
+  assert_eq "should preload for an unattended reconfigure" "yes" "$(cut -d'|' -f2 <<<"$got")"
+  assert_eq "should preload for an interactive install, which offers to reuse it" \
+    "yes" "$(cut -d'|' -f3 <<<"$got")"
+  assert_eq "should NOT preload for an interactive reconfigure, which re-asks everything" \
+    "no" "$(cut -d'|' -f4 <<<"$got")"
+}
+it_preloads_the_stored_answers_for_every_unattended_run
+
 it_takes_an_unattended_default_instead_of_reaching_for_a_terminal() {
   # given a first install: nothing stored, and an answer the config omitted
   # when the wizard asks for it with GHA_YES set and no terminal anywhere
@@ -508,15 +533,19 @@ it_takes_an_unattended_default_instead_of_reaching_for_a_terminal
 it_still_refuses_to_invent_an_answer_that_has_no_safe_default() {
   # given a required answer with no default (the admin PAT)
   # when it is asked for unattended
+  # `setsid`, not just </dev/null: ensure_tty's second branch opens /dev/tty,
+  # the CONTROLLING terminal, which a command substitution inherits whatever
+  # stdin is. Without detaching, this passes in CI (no controlling terminal)
+  # and blocks forever on `read` when the suite is run from a real shell --
+  # with the prompt swallowed by the surrounding 2>&1, so it hangs silently.
   local out
-  out=$(
-    # shellcheck source=/dev/null
-    source "${ROOT}/harden-gha-runners.sh"
+  out=$(setsid bash -c '
+    source "$1/harden-gha-runners.sh"
     set +e
     export GHA_YES=1
     unset GHA_ORG
     ask GHA_ORG "GitHub organisation login" 2>&1
-  ) </dev/null
+  ' _ "$ROOT" 2>&1 </dev/null)
 
   # then it fails loudly instead of guessing
   assert_contains "should refuse to invent an answer that has no default" \

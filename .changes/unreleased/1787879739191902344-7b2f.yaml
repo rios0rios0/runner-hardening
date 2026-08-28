@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed `reconfigure` overwriting stored answers on an unattended run. It is not gated on a stored configuration, so it never loaded one -- and once `ask`/`ask_menu` gained unattended defaults, every key `fleet.conf` omitted was answered from scratch: a host stored as `untrusted` came back `internal` and stopped wiping Docker state between jobs. Both modes now load the stored answers as a baseline whenever the run is unattended, while an interactive `reconfigure` still re-asks everything'
+time: '2026-08-28T01:15:39.191852656Z'

@@ -35,7 +35,11 @@ org         = your-org                # organisation login, or the owner when sc
 group_id    = 1                       # 1 is "Default"; use a dedicated group when you can
 
 # --- what the runners are --------------------------------------------------
-trust       = internal                # internal (warm layer cache) | untrusted (wiped every job)
+trust       = internal                # internal (warm layer cache) | untrusted (wiped every job).
+                                      # Omitting it leaves an installed host as
+                                      # it is; on a FIRST install it defaults to
+                                      # `internal`, so set it explicitly for a
+                                      # box that will run fork PRs.
 labels      = self-hosted,linux,x64,internal
 runners     = auto                    # auto = size from the box's own CPU and RAM.
                                       # Omitting the key entirely leaves an

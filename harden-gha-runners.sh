@@ -29,9 +29,9 @@
 #   sudo ./harden-gha-runners.sh reconfigure  # redo the wizard, reinstall
 #   sudo ./harden-gha-runners.sh uninstall    # remove everything this created
 #
-# GHA_COUNT=auto sizes the runner count from the box's own CPU and RAM instead
-# of prompting, which is what makes an unattended install possible on a machine
-# whose capacity the caller does not know.
+# GHA_COUNT=auto sizes the runner count from the box's own CPU and RAM. Leaving
+# GHA_COUNT unset does the same on a machine with nothing stored; `auto` is how
+# you ask for re-sizing on one that already has a count saved.
 #
 # NON-INTERACTIVE (handy for every machine after the first - the installer
 # prints the exact line to use, prefilled, when it finishes):
@@ -98,9 +98,10 @@ ask() { # ask VARNAME "question" ["default"]
   local __v="$1" __q="$2" __d="${3:-}" __in=""
   [[ -n "${!__v:-}" ]] && { ok "${__q}: ${!__v}  ${C_DIM}(from environment)${C_R}"; return; }
   # A default nobody can reach is not a default. Unattended, take it rather
-  # than reaching for a terminal an SSH-driven run does not have -- this is
-  # only ever hit on a host with no stored answer, so there is nothing here to
-  # override; a configured box gets its value from load_config long before.
+  # than reaching for a terminal an SSH-driven run does not have. This cannot
+  # overwrite a configured host: every unattended path loads the stored answers
+  # as a baseline first (see the dispatch in main), so a value that reaches
+  # here is one no caller sent and no host had.
   if [[ -n "${GHA_YES:-}" && -n "$__d" ]]; then
     printf -v "$__v" '%s' "$__d"
     ok "${__q}: ${__d}  ${C_DIM}(default, unattended)${C_R}"
@@ -623,6 +624,22 @@ EOF
 # them unconditionally, so these are the ones a caller has to be protected from.
 CONFIG_ANSWERS=(GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT
                 GHA_TRUST GHA_OLD_USER)
+
+# Whether the stored answers should be loaded as a baseline before the wizard
+# runs. Extracted from the dispatch so the rule can be tested: getting it wrong
+# is silent, and the consequence is a host coming back configured differently
+# from how it went in.
+should_preload_config() { # should_preload_config <mode>
+  # Unattended, whichever mode: nothing can be asked, so a key the caller did
+  # not send must keep this host's stored value rather than fall to a default.
+  [[ -n "${GHA_YES:-}" ]] && return 0
+  # Interactive install offers to reuse the stored configuration, so it needs
+  # it loaded to have something to offer.
+  [[ "$1" == "install" ]] && return 0
+  # Interactive reconfigure re-asks every question from nothing. That is the
+  # entire point of the mode.
+  return 1
+}
 
 load_config() {
   [[ -s "$ENV_FILE" ]] || return 1
@@ -2619,7 +2636,21 @@ main() {
     install|reconfigure)
       preflight
       discover
-      if [[ "$mode" == "install" ]] && load_config && [[ -z "${GHA_YES:-}" ]]; then
+      # The stored answers are the BASELINE for any unattended run, whichever
+      # mode. load_config treats them as defaults, so whatever the caller sent
+      # still wins -- but a key the caller omitted keeps this host's current
+      # value instead of being answered by a wizard default further down.
+      # Without this, `reconfigure` (which is not gated on a stored file) would
+      # answer every unnamed key from scratch: a box stored as `untrusted`
+      # would come back `internal` and stop wiping Docker state between jobs.
+      # Interactive `reconfigure` deliberately skips it -- re-asking every
+      # question from nothing is the entire point of the mode.
+      local have_stored=0
+      if should_preload_config "$mode"; then
+        load_config && have_stored=1 || true
+      fi
+
+      if [[ "$mode" == "install" && $have_stored -eq 1 && -z "${GHA_YES:-}" ]]; then
         log "existing configuration found at ${ENV_FILE}"
         ask_yn "Reuse it?" y || { unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID \
                                         GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER; wizard; }

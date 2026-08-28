@@ -305,8 +305,15 @@ build_env() { # build_env <host-section>
   # reads the one already on the box, and sending answers would be a lie about
   # what that box is actually configured for.
   if [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]]; then
+    # `org` is the one key with no fallback: it is the fleet's identity, and a
+    # host cannot be re-registered somewhere the config does not name.
     [[ -n "$org" ]] || die "${h}: 'org' is required for ${MODE}"
     [[ "$scope" == "repo" && -z "$repo" ]] && die "${h}: scope = repo also needs 'repo'"
+    # Not fatal: a host already stored as scope = repo may legitimately be
+    # changing only its repository. But on a host with nothing stored the scope
+    # falls to its default of `org`, and the repo is then discarded silently.
+    [[ -n "$repo" && -z "$scope" ]] \
+      && warn "${h}: 'repo' is set but 'scope' is not; a host with no stored scope will use 'org' and ignore it"
 
     printf 'export GHA_ORG=%s\n' "$(shq "$org")"
     [[ -n "$scope" ]]    && printf 'export GHA_SCOPE=%s\n'    "$(shq "$scope")"
@@ -537,10 +544,10 @@ main() {
     echo "  password (become = sudo requires NOPASSWD), or the admin PAT lacks"
     echo "  runner-admin permission. The installer prints which one.${C_R}"
     if (( NO_PAT )); then
-      echo "  ${C_DIM}With --no-pat, 'no terminal available' means that host had no stored"
-      echo "  answer for something the installer needed -- most often no PAT yet"
-      echo "  (give it one with --pat-file on its first run), or several"
-      echo "  over-privileged users, which needs old_user set explicitly.${C_R}"
+      echo "  ${C_DIM}With --no-pat, 'no terminal available' means that host has no PAT at"
+      echo "  /etc/github-runner/pat yet -- it has never been installed. Give it one"
+      echo "  with --pat-file on its first run. Every other unattended answer now"
+      echo "  has a default or its own error message.${C_R}"
     fi
     return 1
   fi
