@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed an interactive install asking "Proceed?" twice when the operator declines to reuse the stored configuration. `wizard` already ends in `confirm_plan`, and the dispatch called it again -- with the default `n`, so a reflexive Enter aborted a run that had just been confirmed, after the environment file was written'
+time: '2026-08-28T01:37:36.776310499Z'

@@ -387,11 +387,19 @@ it_sends_only_what_the_config_specifies() {
 }
 it_sends_only_what_the_config_specifies
 
-it_writes_nothing_but_exports_to_the_environment_file() {
-  # given a config that trips build_env's `repo` without `scope` warning
-  reset_config
+# parse_config calls die on a missing file, and these tests call it directly
+# rather than in a subshell -- so a fixture written by a sibling test would exit
+# the whole suite mid-run if that sibling were ever reordered or removed, with
+# the pass/fail summary never printed.
+setup_repo_noscope_config() {
   printf '[defaults]\nbecome = none\norg = some-org\nrepo = some-repo\n\n[h1]\nhost = 10.0.0.1\n' \
     > "${WORK}/repo_noscope.conf"
+}
+
+it_writes_nothing_but_exports_to_the_environment_file() {
+  # given a config that sets `repo` without `scope`
+  reset_config
+  setup_repo_noscope_config
   parse_config "${WORK}/repo_noscope.conf"
 
   # when the environment is built, capturing stdout only
@@ -408,18 +416,33 @@ it_writes_nothing_but_exports_to_the_environment_file() {
 it_writes_nothing_but_exports_to_the_environment_file
 
 it_warns_on_stderr_when_repo_has_no_scope() {
-  # given the same config
+  # given a config that sets `repo` without `scope`
   reset_config
+  setup_repo_noscope_config
   parse_config "${WORK}/repo_noscope.conf"
 
-  # when the environment is built, capturing stderr only
+  # when the config is checked, capturing stderr only
   local errout
-  errout="$( MODE=install; ADMIN_PAT="fixture-pat-placeholder"; NEW_PAT=""; build_env h1 2>&1 >/dev/null )"
+  errout="$( warn_config_smells h1 2>&1 >/dev/null )"
 
   # then the operator gets the warning, on the stream that reaches them
   assert_contains "should warn about a repo with no scope, on stderr" \
     "$errout" "'repo' is set but 'scope' is not"
 }
+
+it_says_nothing_when_the_config_has_no_smells() {
+  # given a fully specified config
+  reset_config
+  parse_config "${WORK}/basic.conf"
+
+  # when it is checked
+  local errout
+  errout="$( warn_config_smells host1 2>&1 >/dev/null )"
+
+  # then it is silent, so the warning stays worth reading
+  assert_eq "should say nothing about a config with no smells" "" "$errout"
+}
+it_says_nothing_when_the_config_has_no_smells
 it_warns_on_stderr_when_repo_has_no_scope
 
 it_still_sends_everything_the_config_does_specify() {

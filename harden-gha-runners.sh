@@ -78,6 +78,12 @@ else
 fi
 log()  { printf '%s==>%s %s\n' "$C_BLU" "$C_R" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$C_GRN" "$C_R" "$*"; }
+# Deliberately stdout, unlike fleet.sh's warn. This script's stdout IS the
+# per-host log that fleet.sh captures; splitting warnings onto stderr would
+# interleave them out of order with the steps they belong to. Nothing here
+# builds a payload on stdout the way fleet.sh's build_env does, so there is no
+# equivalent hazard -- every caller invokes warn as a statement, never inside a
+# command substitution. Do not "sync" this with fleet.sh.
 warn() { printf '%s [!]%s %s\n' "$C_YEL" "$C_R" "$*"; }
 err()  { printf '%s [x]%s %s\n' "$C_RED" "$C_R" "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -2652,12 +2658,23 @@ main() {
 
       if [[ "$mode" == "install" && $have_stored -eq 1 && -z "${GHA_YES:-}" ]]; then
         log "existing configuration found at ${ENV_FILE}"
-        # GHA_PAT as well as the answers: load_config already read it from
-        # $PAT_FILE, so leaving it set would skip the wizard's own "reuse the
-        # stored PAT?" question and silently keep the credential of the
-        # configuration the operator just declined.
-        ask_yn "Reuse it?" y || { unset "${CONFIG_ANSWERS[@]}" GHA_PAT; wizard; }
-        [[ -n "${GHA_SCOPE:-}" ]] && confirm_plan || true
+        if ask_yn "Reuse it?" y; then
+          # Reusing the stored answers: the wizard never runs, so this is the
+          # only chance to show the plan and get it confirmed.
+          confirm_plan
+        else
+          # GHA_PAT as well as the answers: load_config already read it from
+          # $PAT_FILE, so leaving it set would skip the wizard's own "reuse the
+          # stored PAT?" question and silently keep the credential of the
+          # configuration the operator just declined.
+          #
+          # No confirm_plan here: wizard ends in one. Calling it again asked
+          # "Proceed?" a second time, defaulting to n -- so a reflexive Enter
+          # aborted a run that had just been confirmed, with the env file
+          # already written.
+          unset "${CONFIG_ANSWERS[@]}" GHA_PAT
+          wizard
+        fi
       else
         wizard
       fi

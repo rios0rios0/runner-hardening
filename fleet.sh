@@ -42,10 +42,18 @@ FLEET_VERSION="1.0.0"
 # output helpers
 # ---------------------------------------------------------------------------
 if [[ -t 1 ]]; then
-  C_B=$'\033[1m'; C_R=$'\033[0m'; C_BLU=$'\033[1;34m'; C_YEL=$'\033[1;33m'
+  C_B=$'\033[1m'; C_R=$'\033[0m'; C_BLU=$'\033[1;34m'
   C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_CYN=$'\033[1;36m'; C_DIM=$'\033[2m'
 else
-  C_B=""; C_R=""; C_BLU=""; C_YEL=""; C_RED=""; C_GRN=""; C_CYN=""; C_DIM=""
+  C_B=""; C_R=""; C_BLU=""; C_RED=""; C_GRN=""; C_CYN=""; C_DIM=""
+fi
+# warn and err write to fd 2, so their colour has to follow fd 2. Gating them
+# on the fd 1 palette put escape sequences into `2> warn.log` and stripped them
+# from a run whose stdout was redirected but whose stderr was still a terminal.
+if [[ -t 2 ]]; then
+  E_YEL=$'\033[1;33m'; E_RED=$'\033[1;31m'; E_R=$'\033[0m'
+else
+  E_YEL=""; E_RED=""; E_R=""
 fi
 log()  { printf '%s==>%s %s\n' "$C_BLU" "$C_R" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$C_GRN" "$C_R" "$*"; }
@@ -53,8 +61,8 @@ ok()   { printf '%s  ok%s %s\n' "$C_GRN" "$C_R" "$*"; }
 # base64'd into the remote host and sourced there, so a diagnostic printed to
 # stdout from anywhere inside it becomes a line the remote shell executes --
 # and never reaches the operator it was written for.
-warn() { printf '%s [!]%s %s\n' "$C_YEL" "$C_R" "$*" >&2; }
-err()  { printf '%s [x]%s %s\n' "$C_RED" "$C_R" "$*" >&2; }
+warn() { printf '%s [!]%s %s\n' "$E_YEL" "$E_R" "$*" >&2; }
+err()  { printf '%s [x]%s %s\n' "$E_RED" "$E_R" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 hr()   { printf '%s%s%s\n' "$C_DIM" "$(printf '%.0s-' {1..72})" "$C_R"; }
 head1(){ echo; hr; printf '%s%s%s\n' "$C_B" "$*" "$C_R"; hr; }
@@ -172,6 +180,21 @@ parse_config() {
   done < "$file"
 
   (( ${#HOSTS[@]} )) || die "${file}: no host sections found (a '[name]' block per machine)"
+}
+
+# Config smells worth one line before anything is contacted. Deliberately NOT
+# in build_env: that runs twice per host -- once to validate, once to build the
+# bootstrap that is actually sent -- so a warning there would either double up
+# or land on the stream that becomes the host's environment file.
+warn_config_smells() { # warn_config_smells <host-section>
+  local h="$1" repo scope
+  repo="$(cfg "$h" repo)"; scope="$(cfg "$h" scope)"
+  # Not fatal: a host already stored as scope = repo may legitimately be
+  # changing only its repository. But on a host with nothing stored the scope
+  # falls to its default of `org`, and the repo is then discarded silently.
+  [[ -n "$repo" && -z "$scope" ]] \
+    && warn "${h}: 'repo' is set but 'scope' is not; a host with no stored scope will use 'org' and ignore it"
+  return 0
 }
 
 # cfg <host> <key> [default] - host value, else [defaults] value, else default
@@ -313,11 +336,6 @@ build_env() { # build_env <host-section>
     # host cannot be re-registered somewhere the config does not name.
     [[ -n "$org" ]] || die "${h}: 'org' is required for ${MODE}"
     [[ "$scope" == "repo" && -z "$repo" ]] && die "${h}: scope = repo also needs 'repo'"
-    # Not fatal: a host already stored as scope = repo may legitimately be
-    # changing only its repository. But on a host with nothing stored the scope
-    # falls to its default of `org`, and the repo is then discarded silently.
-    [[ -n "$repo" && -z "$scope" ]] \
-      && warn "${h}: 'repo' is set but 'scope' is not; a host with no stored scope will use 'org' and ignore it"
 
     printf 'export GHA_ORG=%s\n' "$(shq "$org")"
     [[ -n "$scope" ]]    && printf 'export GHA_SCOPE=%s\n'    "$(shq "$scope")"
@@ -451,7 +469,7 @@ main() {
   # host 40 is caught before host 1 is touched, instead of half way through a
   # fleet-wide install.
   INSTALLER_B64="$(base64 < "$INSTALLER")"
-  for h in "${SELECTED[@]}"; do build_bootstrap "$h" >/dev/null; done
+  for h in "${SELECTED[@]}"; do build_bootstrap "$h" >/dev/null; warn_config_smells "$h"; done
   ok "configuration valid for all ${#SELECTED[@]} host(s)"
 
   if (( DRY_RUN )); then

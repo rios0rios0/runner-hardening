@@ -153,12 +153,14 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 ./fleet.sh -p 10 updates              # ten at a time
 ./fleet.sh rotate-pat                 # replace the admin PAT fleet-wide
 ./fleet.sh --no-pat install           # re-deploy; each host reuses its own PAT
-./fleet.sh reconfigure                # same as install over the fleet (see below)
+./fleet.sh reconfigure                # identical to install when driven here
 ```
 
 `install` applies what `fleet.conf` says: edit `labels` or `runners`, re-run,
-and the hosts converge on the new values. A key `fleet.conf` omits is **not**
-sent at all, so each host keeps the answer it already has stored — which is
+and the hosts converge on the new values. `reconfigure` does the same thing
+over the fleet — the two differ only for someone running the installer by hand
+on a box, where `reconfigure` re-asks every question from scratch. A key
+`fleet.conf` omits is **not** sent at all, so each host keeps the answer it already has stored — which is
 also what lets `--no-pat` work, the machine authenticating with the PAT it
 holds. On a host with nothing stored yet, an omitted key falls through to the
 installer's own default, which it reports as it goes. Two answers have no safe
