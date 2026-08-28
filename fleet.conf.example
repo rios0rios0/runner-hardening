@@ -10,8 +10,12 @@
 #   [<name>]          one section per machine; the name is what --limit takes,
 #                     and doubles as the hostname when `host` is not given
 #   key = value       whitespace around either side is trimmed
-#   # comment         only a WHOLE line is a comment, so a '#' inside a label
-#                     list stays intact
+#   # comment         a line whose first character is '#' or ';' is a comment,
+#                     and so is a '#' or ';' that FOLLOWS whitespace on a value
+#                     line -- which is what makes the trailing notes below work.
+#                     A marker glued to the value ('tag#1') is data and is kept,
+#                     so there is no need to escape one. There is no escape
+#                     syntax for a value that must contain ' #'.
 #
 # An unknown key is a startup error, not a silently ignored line.
 

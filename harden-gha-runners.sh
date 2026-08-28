@@ -176,10 +176,20 @@ gh_list_runners() {
   return 0
 }
 gh_api() {
-  local m="$1" p="$2" payload="${3:-}" tmp hdr
-  tmp=$(mktemp); hdr=$(mktemp)
+  local m="$1" p="$2" payload="${3:-}" tmp hdr auth
+  tmp=$(mktemp); hdr=$(mktemp); auth=$(mktemp)
+  # The PAT must never be a curl ARGUMENT. /proc/<pid>/cmdline is world
+  # readable, so for the life of every request any unprivileged account on this
+  # box -- including the runner users this installer creates -- can read the admin
+  # token straight out of the process list. `-H @file` takes the header verbatim
+  # from a file that mktemp creates 0600.
+  #
+  # `-K -` (config on stdin) was tried first and rejected: its unquoted value form
+  # silently DROPS the header rather than failing, which sends the request
+  # unauthenticated and turns a quoting mistake into a 200 nobody investigates.
+  printf 'Authorization: Bearer %s\n' "$GHA_PAT" > "$auth"
   local -a args=(-sS -o "$tmp" -D "$hdr" -w '%{http_code}' -X "$m"
-    -H "Authorization: Bearer ${GHA_PAT}"
+    -H @"$auth"
     -H "Accept: application/vnd.github+json"
     -H "X-GitHub-Api-Version: 2022-11-28")
   [[ -n "$payload" ]] && args+=(-d "$payload") || true
@@ -188,7 +198,7 @@ gh_api() {
   # GitHub returns the PAT's expiry on every authenticated response.
   GH_PAT_EXPIRY=$(grep -i '^github-authentication-token-expiration:' "$hdr" 2>/dev/null \
                   | cut -d: -f2- | tr -d '\r' | xargs || true)
-  rm -f "$tmp" "$hdr"
+  rm -f "$tmp" "$hdr" "$auth"
   return 0
 }
 
@@ -968,6 +978,13 @@ N="$1"
 PAT="$(< /etc/github-runner/pat)"
 U="${USER_PREFIX}${N}"
 
+# See the note on gh_api in the installer: a PAT passed as `-H "Authorization:
+# ..."` is readable by every local user through /proc/<pid>/cmdline. This runs
+# on every runner start, with the unprivileged runner users already on the box.
+AUTH=$(mktemp)
+trap 'rm -f "$AUTH"' EXIT
+printf 'Authorization: Bearer %s\n' "$PAT" > "$AUTH"
+
 if [[ "$GHA_SCOPE" == "org" ]]; then
   URL="https://api.github.com/orgs/${GHA_ORG}/actions/runners/generate-jitconfig"
 else
@@ -981,7 +998,7 @@ BODY=$(jq -nc \
   '{name:$n, runner_group_id:$g, labels:$l, work_folder:"_work"}')
 
 RESP=$(curl -fsS -X POST "$URL" \
-  -H "Authorization: Bearer ${PAT}" \
+  -H @"$AUTH" \
   -H "Accept: application/vnd.github+json" \
   -H "X-GitHub-Api-Version: 2022-11-28" \
   -d "$BODY") || { echo "gha-jitconfig: API request failed" >&2; exit 1; }
@@ -1015,13 +1032,17 @@ IDF="/run/gha-runner/${N}.id"
 if [[ -s "$IDF" ]]; then
   RID="$(< "$IDF")"
   PAT="$(< /etc/github-runner/pat)"
+  # Keeps the PAT out of argv; see the note on gh_api in the installer.
+  AUTH=$(mktemp)
+  trap 'rm -f "$AUTH"' EXIT
+  printf 'Authorization: Bearer %s\n' "$PAT" > "$AUTH"
   if [[ "$GHA_SCOPE" == "org" ]]; then
     RPATH="/orgs/${GHA_ORG}/actions/runners"
   else
     RPATH="/repos/${GHA_ORG}/${GHA_REPO}/actions/runners"
   fi
   [[ "$RID" =~ ^[0-9]+$ ]] && curl -fsS -X DELETE \
-    -H "Authorization: Bearer ${PAT}" \
+    -H @"$AUTH" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com${RPATH}/${RID}" >/dev/null 2>&1 || true
 fi
@@ -1196,6 +1217,10 @@ fi
 # in the org's runner list forever.
 if [[ -s /etc/github-runner/pat ]]; then
   PAT="$(< /etc/github-runner/pat)"
+  # Keeps the PAT out of argv; see the note on gh_api in the installer.
+  AUTH=$(mktemp)
+  trap 'rm -f "$AUTH"' EXIT
+  printf 'Authorization: Bearer %s\n' "$PAT" > "$AUTH"
   if [[ "$GHA_SCOPE" == "org" ]]; then
     RPATH="/orgs/${GHA_ORG}/actions/runners"
   else
@@ -1208,7 +1233,7 @@ if [[ -s /etc/github-runner/pat ]]; then
   # stops registering, and nothing else on the box would notice.
   HDR=$(mktemp)
   CODE=$(curl -sS -o /dev/null -D "$HDR" -w '%{http_code}' \
-    -H "Authorization: Bearer ${PAT}" -H "Accept: application/vnd.github+json" \
+    -H @"$AUTH" -H "Accept: application/vnd.github+json" \
     "https://api.github.com${RPATH}?per_page=1" 2>/dev/null || echo 000)
   case "$CODE" in
     200)
@@ -1230,7 +1255,7 @@ if [[ -s /etc/github-runner/pat ]]; then
   # Page through: per_page=100 alone still stops at the first 100.
   ALL='[]'; PAGE=1
   while [ "$PAGE" -le 50 ]; do
-    BODY=$(curl -fsS -H "Authorization: Bearer ${PAT}" \
+    BODY=$(curl -fsS -H @"$AUTH" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com${RPATH}?per_page=100&page=${PAGE}" 2>/dev/null)
     [ -n "${BODY:-}" ] || break
@@ -1249,7 +1274,7 @@ if [[ -s /etc/github-runner/pat ]]; then
            | .id' <<<"$ALL" 2>/dev/null)
     COUNT=0
     for rid in ${ORPHANS:-}; do
-      curl -fsS -X DELETE -H "Authorization: Bearer ${PAT}" \
+      curl -fsS -X DELETE -H @"$AUTH" \
         -H "Accept: application/vnd.github+json" \
         "https://api.github.com${RPATH}/${rid}" >/dev/null 2>&1 && COUNT=$((COUNT+1))
     done
@@ -2159,6 +2184,11 @@ log() { logger -t gha-reboot -- "$*"; }
 PAT="$(< /etc/github-runner/pat)"
 HOST=$(hostname -s)
 
+# Keeps the PAT out of argv; see the note on gh_api in the installer.
+AUTH=$(mktemp)
+trap 'rm -f "$AUTH"' EXIT
+printf 'Authorization: Bearer %s\n' "$PAT" > "$AUTH"
+
 if [ "$GHA_SCOPE" = "org" ]; then
   RPATH="/orgs/${GHA_ORG}/actions/runners"
 else
@@ -2167,7 +2197,7 @@ fi
 
 ALL='[]'; PAGE=1
 while [ "$PAGE" -le 20 ]; do
-  BODY=$(curl -fsS -H "Authorization: Bearer ${PAT}"           -H "Accept: application/vnd.github+json"           "https://api.github.com${RPATH}?per_page=100&page=${PAGE}" 2>/dev/null) || {
+  BODY=$(curl -fsS -H @"$AUTH"           -H "Accept: application/vnd.github+json"           "https://api.github.com${RPATH}?per_page=100&page=${PAGE}" 2>/dev/null) || {
     log "cannot reach the GitHub API - deferring reboot"; exit 0; }
   CHUNK=$(jq -c '.runners // []' <<<"$BODY" 2>/dev/null || echo '[]')
   N=$(jq 'length' <<<"$CHUNK" 2>/dev/null || echo 0)

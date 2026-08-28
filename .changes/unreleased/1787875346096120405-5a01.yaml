@@ -1,0 +1,3 @@
+kind: 'Security'
+body: 'kept the admin PAT out of every process argument list. `curl` was receiving it as a literal `-H "Authorization: Bearer ..."`, and `/proc/<pid>/cmdline` is world readable -- so for the life of each request any unprivileged account on the box, including the runner users the installer itself creates, could read the admin token out of the process list. All seven call sites (the installer, `gha-jitconfig`, `gha-jitreap`, `gha-janitor` and `gha-reboot-if-idle`) now pass the header with `-H @file` from a 0600 temp file removed by an EXIT trap'
+time: '2026-08-28T00:02:26.096081763Z'

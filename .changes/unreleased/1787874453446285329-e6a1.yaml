@@ -1,3 +1,3 @@
 kind: 'Added'
-body: 'added `GHA_COUNT=auto`, which sizes the runner count from the box own CPU and RAM instead of prompting. This is what makes an unattended install possible on a machine whose capacity the caller does not know'
+body: 'added `GHA_COUNT=auto`, which sizes the runner count from the box''s own CPU and RAM instead of prompting. This is what makes an unattended install possible on a machine whose capacity the caller does not know'
 time: '2026-08-27T23:47:33.446255759Z'

@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed `make setup`, `make lint` and `make sast` on a fresh clone. The gate targets come from the shared pipelines checkout, which a new contributor does not have, so `make lint` died with `No rule to make target ''shellcheck''` and `make setup` -- the first command `CONTRIBUTING.md` asks for -- did not exist at all, because it is defined in the very file that was missing. The `Makefile` now bootstraps that checkout itself and explains what to run when it is absent'
+time: '2026-08-28T00:02:26.098094139Z'

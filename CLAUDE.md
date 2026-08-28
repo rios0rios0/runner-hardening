@@ -39,9 +39,14 @@ targets load the shared configuration first.
   that can only be answered interactively is unreachable to the fleet. When you
   add a prompt, add the matching `GHA_*` variable, a `fleet.conf` key, and a
   line in the README's variable table.
-- **No secret may become a command-line argument** on either side of the SSH
-  connection. `/proc/<pid>/cmdline` is readable by other local users; the
-  environment file the bootstrap writes is `0600` and removed by an EXIT trap.
+- **No secret may become a command-line argument**, anywhere. `/proc/<pid>/cmdline`
+  is readable by every local user, including the unprivileged runner accounts
+  the installer creates. Two consequences: the SSH bootstrap streams its
+  environment file on stdin (`0600`, removed by an EXIT trap), and every `curl`
+  call passes the admin token with `-H @file` rather than `-H "Authorization:
+  Bearer ..."`. Do not "simplify" either one back. `curl -K -` is not a
+  substitute: its unquoted value form drops a malformed header silently, which
+  sends the request unauthenticated instead of failing.
 - **Comment the surprising decision, not the obvious line.** The existing
   comments explain why a systemd directive is deliberately *not* set, why
   `exec` is avoided in the runner wrapper, why pagination matters on the

@@ -1,3 +1,3 @@
 kind: 'Added'
-body: 'added `harden-gha-runners.sh`, a self-contained installer that turns a raw Ubuntu box into a hardened GitHub Actions runner host: one unprivileged user per runner with no sudo and no docker group, rootless Docker per user, ephemeral JIT registrations with a fresh workspace per job, hardened systemd units, and a capacity-derived memory and CPU policy'
+body: 'added `harden-gha-runners.sh`, a self-contained installer that turns a raw Ubuntu box into a hardened GitHub Actions runner host: one unprivileged user per runner with no `sudo` and no `docker` group, rootless Docker per user, ephemeral JIT registrations with a fresh workspace per job, hardened systemd units, and a capacity-derived memory and CPU policy'
 time: '2026-08-27T23:47:33.440392752Z'
