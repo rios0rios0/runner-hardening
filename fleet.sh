@@ -189,11 +189,12 @@ parse_config() {
 warn_config_smells() { # warn_config_smells <host-section>
   local h="$1" repo scope
   repo="$(cfg "$h" repo)"; scope="$(cfg "$h" scope)"
-  # Not fatal: a host already stored as scope = repo may legitimately be
-  # changing only its repository. But on a host with nothing stored the scope
-  # falls to its default of `org`, and the repo is then discarded silently.
+  # Not fatal: a host already stored as scope = repo is legitimately changing
+  # only its repository. Anywhere else the key does nothing -- a host stored as
+  # org ignores it, and one with nothing stored falls to the default of org,
+  # where the wizard actively clears it.
   [[ -n "$repo" && -z "$scope" ]] \
-    && warn "${h}: 'repo' is set but 'scope' is not; a host with no stored scope will use 'org' and ignore it"
+    && warn "${h}: 'repo' is set but 'scope' is not; it is ignored unless this host is already stored as scope = repo"
   return 0
 }
 
@@ -469,7 +470,11 @@ main() {
   # host 40 is caught before host 1 is touched, instead of half way through a
   # fleet-wide install.
   INSTALLER_B64="$(base64 < "$INSTALLER")"
-  for h in "${SELECTED[@]}"; do build_bootstrap "$h" >/dev/null; warn_config_smells "$h"; done
+  for h in "${SELECTED[@]}"; do
+    build_bootstrap "$h" >/dev/null
+    # Only install/reconfigure send answers, so only they can act on a scope.
+    [[ "$MODE" == "install" || "$MODE" == "reconfigure" ]] && warn_config_smells "$h"
+  done
   ok "configuration valid for all ${#SELECTED[@]} host(s)"
 
   if (( DRY_RUN )); then

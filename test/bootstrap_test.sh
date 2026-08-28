@@ -430,6 +430,41 @@ it_warns_on_stderr_when_repo_has_no_scope() {
     "$errout" "'repo' is set but 'scope' is not"
 }
 
+it_only_warns_about_smells_on_modes_that_can_act_on_them() {
+  # given a config that sets `repo` without `scope`
+  reset_config
+  setup_repo_noscope_config
+
+  # when a read-only mode is planned against it
+  local out
+  out=$( MODE=""; NO_PAT=0; PAT_FILE=""
+         main -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" -n -y verify 2>&1 )
+  assert_contains "the verify plan should have been reached at all" "$out" "dry run"
+
+  # then it stays quiet: that mode sends no answers, so there is no scope
+  # decision for the warning to be about
+  assert_not_contains "should not warn about a scope a read-only mode never sets" \
+    "$out" "'repo' is set but 'scope' is not"
+}
+it_only_warns_about_smells_on_modes_that_can_act_on_them
+
+it_warns_about_smells_on_a_mode_that_does_set_a_scope() {
+  # given the same config, planned for install
+  reset_config
+  setup_repo_noscope_config
+
+  # when the run is planned
+  local out
+  out=$( MODE=""; NO_PAT=0; PAT_FILE=""
+         main -c "${WORK}/repo_noscope.conf" -f "${WORK}/stub-installer.sh" -n -y --no-pat install 2>&1 )
+  assert_contains "the install plan should have been reached at all" "$out" "dry run"
+
+  # then the operator is told, before anything is contacted
+  assert_contains "should warn about a repo with no scope when installing" \
+    "$out" "'repo' is set but 'scope' is not"
+}
+it_warns_about_smells_on_a_mode_that_does_set_a_scope
+
 it_says_nothing_when_the_config_has_no_smells() {
   # given a fully specified config
   reset_config

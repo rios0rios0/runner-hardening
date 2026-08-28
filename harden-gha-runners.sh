@@ -631,6 +631,10 @@ EOF
 CONFIG_ANSWERS=(GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT
                 GHA_TRUST GHA_OLD_USER)
 
+# Set by load_config: 1 when the caller supplied any answer or a PAT, so the
+# stored file was a fallback rather than the whole truth.
+CONFIG_OVERRIDDEN=0
+
 # Whether the stored answers should be loaded as a baseline before the wizard
 # runs. Extracted from the dispatch so the rule can be tested: getting it wrong
 # is silent, and the consequence is a host coming back configured differently
@@ -658,9 +662,13 @@ load_config() {
   # this function inside an && chain for its side effect.
   local -A supplied=()
   local v
+  CONFIG_OVERRIDDEN=0
   for v in "${CONFIG_ANSWERS[@]}"; do
-    [[ -n "${!v+set}" && -n "${!v}" ]] && supplied["$v"]="${!v}" || true
+    [[ -n "${!v+set}" && -n "${!v}" ]] && { supplied["$v"]="${!v}"; CONFIG_OVERRIDDEN=1; } || true
   done
+  # A supplied credential counts as an override too, and this has to be read
+  # before the fallback below sets it from $PAT_FILE.
+  [[ -n "${GHA_PAT:-}" ]] && CONFIG_OVERRIDDEN=1 || true
 
   # shellcheck disable=SC1090
   . "$ENV_FILE"
@@ -2658,7 +2666,18 @@ main() {
 
       if [[ "$mode" == "install" && $have_stored -eq 1 && -z "${GHA_YES:-}" ]]; then
         log "existing configuration found at ${ENV_FILE}"
-        if ask_yn "Reuse it?" y; then
+        if (( CONFIG_OVERRIDDEN )); then
+          # "Reuse the stored configuration" would be a lie: the run would use
+          # the caller's values and leave the old ones on disk. That matters
+          # most for the PAT -- save_config is only reached from wizard, so a
+          # replacement token would register the runners and then never be
+          # written to /etc/github-runner/pat, which gha-jitconfig reads on
+          # every job start. The box would mint runners on a token it no longer
+          # has. Going through the wizard also re-derives the values that
+          # depend on GHA_TRUST, which reusing would have left stale.
+          log "answers supplied in the environment override the stored ones"
+          wizard
+        elif ask_yn "Reuse it?" y; then
           # Reusing the stored answers: the wizard never runs, so this is the
           # only chance to show the plan and get it confirmed.
           confirm_plan
