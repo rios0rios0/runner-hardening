@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'refreshed `CLAUDE.md` so the tests section lists the `runner_state_between_jobs` health-gate function the suite now exercises and corrects the bootstrap case count'
+time: '2026-09-01T16:54:47.260638889Z'

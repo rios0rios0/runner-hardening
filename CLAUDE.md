@@ -19,7 +19,7 @@ Ubuntu image plus `ssh` provides.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets use
 make lint    # ShellCheck
-make test    # parse check + the bootstrap suite (~2s, 82 cases, no VM needed)
+make test    # parse check + the bootstrap suite (~2s, 81 cases, no VM needed)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -176,7 +176,9 @@ repository) and drift silently:
 
 `test/bootstrap_test.sh` sources both scripts and exercises their real
 functions — `parse_config`, `build_env`, `build_bootstrap`, `load_config`,
-`should_preload_config`. The bootstrap cases are not simulations: each runs the
+`should_preload_config`, and `runner_state_between_jobs` (the pure core of the
+`verify` health gate, which excuses a runner caught auto-restarting between jobs
+instead of reporting it down). The bootstrap cases are not simulations: each runs the
 real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer that reports what it received. Only the SSH
 hop is substituted.
