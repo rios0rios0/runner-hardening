@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: 'Review a pull request against rios0rios0/runner-hardening; reach for this skill whenever judging a change to the installer, the fleet driver, their generated artefacts, or the tests.'
+description: 'Review a pull request against rios0rios0/runner-hardening; reach for this skill whenever judging any change to the repository — the installer, the fleet driver, their generated artefacts, the tests, or the configuration and documentation files.'
 ---
 
 # Code review — runner-hardening
@@ -15,7 +15,7 @@ below.
 
 ## Source of truth and precedence
 
-When guidance conflicts, later wins over earlier:
+When guidance conflicts, earlier wins over later:
 
 1. The code as it actually runs (Bash semantics under `set -Eeuo pipefail`).
 2. This skill's repo-specific checklist.
