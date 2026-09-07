@@ -209,7 +209,7 @@ Every change updates a `chlog` fragment under `.changes/unreleased/`; never
 edit `CHANGELOG.md` by hand:
 
 ```bash
-chlog new --kind Fixed --body "fixed the thing that was broken"
+chlog new --kind Fixed --body 'fixed the thing that was broken'
 ```
 
 Kinds are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.

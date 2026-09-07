@@ -119,9 +119,10 @@ the ones this stack depends on:
 ## Security
 
 - **Never write a PEM header sentinel or a realistic key shape into a fixture**
-  (GitHub `ghp_` prefixes, OpenAI `sk-` prefixes, AWS `AKIA` prefixes, Slack `xoxb` prefixes, JWT-shaped strings, or the dashed `BEGIN …` banners).
-  Gitleaks matches the shape, not the value, so a placeholder that merely *looks* like a
-  credential fails the pipeline. Use inert placeholders such as `fixture-token-placeholder`.
+  (GitHub `ghp_` prefixes, OpenAI `sk-` prefixes, AWS `AKIA` prefixes, Slack `xoxb`
+  prefixes, JWT-shaped strings, or the dashed `BEGIN …` banners). Gitleaks matches
+  the shape, not the value, so a placeholder that merely *looks* like a credential
+  fails the pipeline. Use inert placeholders such as `fixture-token-placeholder`.
 - **Anonymity.** This repo is public and describes infrastructure. Flag any host
   name, IP address, organisation name, or fleet size. Examples must use
   `your-org`, `example`, and RFC 5737 / RFC 1918 addresses.

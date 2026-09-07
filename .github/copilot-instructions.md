@@ -135,6 +135,6 @@ only `make test` has run.
 This repo is public and describes infrastructure: no host names, IP addresses,
 organisation names, or fleet sizes. Examples use `your-org`, `example`, and
 RFC 5737 / RFC 1918 addresses. Every change adds a `chlog` fragment under
-`.changes/unreleased/` (`chlog new --kind <Kind> --body "..."`); never edit
+`.changes/unreleased/` (`chlog new --kind <Kind> --body '...'`); never edit
 `CHANGELOG.md` by hand — it is generated. Update `README.md` whenever a flag, a
 `GHA_*` variable, a `fleet.conf` key, or a requirement changes.
