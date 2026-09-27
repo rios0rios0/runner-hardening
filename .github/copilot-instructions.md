@@ -10,7 +10,7 @@ image plus `ssh`.
 | `harden-gha-runners.sh`  | The installer. Runs as root on one Ubuntu box and does all the work.       |
 | `fleet.sh`               | Fans any installer mode out across the machines in `fleet.conf`, over SSH. |
 | `fleet.conf.example`     | The documented fleet format. `fleet.conf` itself is gitignored.            |
-| `test/bootstrap_test.sh` | Tests for the config reader and the remote bootstrap.                      |
+| `test/bootstrap_test.sh` | Tests for the config reader, the remote bootstrap and the disk guard.      |
 
 `CLAUDE.md` at the repo root covers the same ground in more depth; read it for
 the full architecture map. This file is the fast orientation for Copilot Chat.
@@ -20,7 +20,7 @@ the full architecture map. This file is the fast orientation for Copilot Chat.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets need
 make lint    # ShellCheck
-make test    # parse check + the bootstrap suite (~2s, 81 assertions, no VM)
+make test    # parse check + the test suite (~3s, 108 assertions, no VM)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -39,7 +39,7 @@ function, or just run the whole suite.
   `load_config`, then run one `phase_*`. `install` and `reconfigure` are the
   exception: they run a **fixed, ordered pipeline** (preflight → discover →
   wizard/load_config → audit → stop_existing → deprivilege → wipe → prereqs →
-  per-runner user + rootless Docker → swap → token_helper → runners → systemd →
+  per-runner user + rootless Docker → swap → token_helper → diskguard → runners → systemd →
   janitor → unattended → cleanup_stale → verify → summary). The order encodes
   dependencies. Do not reorder without tracing what each phase assumes exists.
 
@@ -50,6 +50,8 @@ function, or just run the whole suite.
   file.
 
 - **The ephemeral loop is the core invariant.** systemd starts `gha-runner@N`;
+  a first `ExecStartPre` (root) runs `gha-diskguard`, which frees that runner's
+  own caches once the disk is past 75% and is a no-op otherwise; the next
   `ExecStartPre` (root) mints a single-use JIT config to `/run/gha-runner/N.jit`
   so the PAT is never seen by the runner user; `ExecStart` (runner user) wipes
   `_work` and runs `./run.sh --jitconfig` for exactly ONE job; `ExecStopPost`
@@ -97,6 +99,12 @@ function, or just run the whole suite.
   the failure propagates under `errexit`. Do not inline it again.
 - **Every mode is idempotent.** A second consecutive run that changes something
   is a bug.
+- **The disk guard runs before the registration is minted, and deletes as the
+  runner user.** Before `gha-jitconfig` is the one point a runner is guaranteed
+  idle, so the two `ExecStartPre` lines must not be swapped. Every path it
+  clears is job-writable, so `as_runner` drops to the runner user (`setpriv`)
+  for every deletion; a planted symlink then reaches no further than the job
+  could delete itself. Do not move a deletion back to root.
 - **Every wizard question must also be answerable from the environment.**
   `fleet.sh` drives the installer over SSH with no pty, so an interactive-only
   prompt is unreachable to the fleet.
@@ -115,6 +123,8 @@ These sets are duplicated by design and drift silently:
   `fleet.conf.example`, and the README.
 - **A new `GHA_*` answer** goes in `CONFIG_ANSWERS`, the `save_config` heredoc,
   the wizard, and the README's variable table.
+- **Anything the installer puts in a runner's `$HOME`** goes in the disk
+  guard's `KEEP` list too, or the first reset under disk pressure deletes it.
 
 ## Testing
 
@@ -122,7 +132,10 @@ These sets are duplicated by design and drift silently:
 functions (`parse_config`, `build_env`, `build_bootstrap`, `load_config`,
 `should_preload_config`, `runner_state_between_jobs`). The bootstrap cases run
 the real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
-side, against a stand-in installer — only the SSH hop is substituted. Cases are
+side, against a stand-in installer — only the SSH hop is substituted. The
+disk-guard cases render `gha-diskguard` from `render_diskguard` and drive its
+eviction steps against a scratch runner tree — only the root-only privilege
+drop is substituted. Cases are
 hand-rolled BDD (`# given / # when / # then`), each an `it_*` function defined
 and invoked on the next line; the final tally picks up new ones automatically.
 

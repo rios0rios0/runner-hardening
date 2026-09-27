@@ -12,14 +12,14 @@ Ubuntu image plus `ssh` provides.
 | `harden-gha-runners.sh`  | The installer. Runs as root on one Ubuntu box and does all the work.       |
 | `fleet.sh`               | Fans any installer mode out across the machines in `fleet.conf`, over SSH. |
 | `fleet.conf.example`     | The documented fleet format. `fleet.conf` itself is gitignored.            |
-| `test/bootstrap_test.sh` | Tests for the config reader and the remote bootstrap.                      |
+| `test/bootstrap_test.sh` | Tests for the config reader, the remote bootstrap and the disk guard.      |
 
 ## Commands
 
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets use
 make lint    # ShellCheck
-make test    # parse check + the bootstrap suite (~2s, 81 cases, no VM needed)
+make test    # parse check + the test suite (~3s, 108 assertions, no VM needed)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -38,7 +38,7 @@ function. `install` and `reconfigure` are the exception — they run a **fixed,
 ordered pipeline** (`preflight` → `discover` → `wizard`/`load_config` →
 `phase_audit` → `phase_stop_existing` → `phase_deprivilege` → `phase_wipe` →
 `phase_prereqs` → per-runner user + rootless Docker → `maybe_add_swap` →
-`phase_token_helper` → `phase_runners` → `phase_systemd` → `phase_janitor` →
+`phase_token_helper` → `phase_diskguard` → `phase_runners` → `phase_systemd` → `phase_janitor` →
 `phase_unattended` → `phase_cleanup_stale` → `phase_verify` → `summary`). The
 order encodes dependencies; do not reorder without tracing what each phase
 assumes already exists.
@@ -58,6 +58,7 @@ as a heredoc. To change the janitor's behaviour you edit the heredoc inside
 |------------------------------------------|-----------------------|---------------------------------------------------------------|
 | `/usr/local/sbin/gha-jitconfig`          | `phase_token_helper`  | root-only; mints one single-use JIT config per runner start   |
 | `/usr/local/sbin/gha-jitreap`            | `phase_token_helper`  | root-only; deletes the registration when a runner stops       |
+| `/usr/local/sbin/gha-diskguard`          | `phase_diskguard` (text from `render_diskguard`) | root-only; before each job, frees that runner's caches under disk pressure |
 | `/opt/actions-runner/<n>/run-ephemeral.sh` | `phase_runners`     | runs exactly one job, then cleans up and exits                |
 | `/etc/systemd/system/gha-runner@.service`| `phase_systemd`       | the hardened unit template                                    |
 | `/etc/systemd/system/gha.slice`          | `write_resource_policy` | aggregate CPU/memory boundary for all runners                |
@@ -68,6 +69,7 @@ as a heredoc. To change the janitor's behaviour you edit the heredoc inside
 
 ```
 systemd starts gha-runner@N
+  → ExecStartPre=-+/usr/local/sbin/gha-diskguard N  (root; no-op below 75% disk, else frees runner N's caches)
   → ExecStartPre=+/usr/local/sbin/gha-jitconfig N   (root; PAT never seen by the runner user)
       writes a single-use JIT config to /run/gha-runner/N.jit
   → ExecStart=run-ephemeral.sh                       (runner user; reads the .jit, wipes _work)
@@ -89,6 +91,8 @@ counts *attempts*, so a healthy runner finishing many quick jobs would trip it.
 | `/etc/github-runner/env`    | the stored answers (`GHA_*`), sourced by `load_config`             |
 | `/etc/github-runner/pat`    | the admin PAT, `0600 root:root`, never readable by a job           |
 | `/opt/actions-runner/<n>`   | one extracted runner tree per instance, owned by `gha<n>`          |
+| `/home/gha<n>`              | the runner's `$HOME`: package caches, SDKs, the rootless Docker data root; kept between jobs |
+| `/opt/hostedtoolcache-gha<n>` | the runner's private hosted tool cache (`AGENT_TOOLSDIRECTORY` when `trust=internal`) |
 | `/run/gha-runner/<n>.jit`   | the current single-use registration; tmpfs, gone on reboot         |
 | `/var/lib/github-runner`    | installer state                                                    |
 
@@ -151,6 +155,13 @@ is data) → `select_hosts` → per host: `build_env` emits the `GHA_*` exports 
   installed anyway.
 - **Every mode is idempotent.** A second consecutive run that changes something
   is a bug, not a feature.
+- **The disk guard runs before the registration is minted, and deletes as the
+  runner user.** Before `gha-jitconfig` is the one point a runner is guaranteed
+  idle: swap the two `ExecStartPre` lines and it can delete a toolchain from
+  under a job it was just handed. Every path it clears is job-writable, so a job
+  can plant a symlink there; `as_runner` drops to the runner user (`setpriv`)
+  for every deletion, which caps what a planted link can reach at what the job
+  could delete itself. Do not "simplify" a deletion back to root.
 - **Anything that changes system state is untestable here.** It has to be
   exercised on a disposable Ubuntu VM — say so rather than claiming a change is
   verified when only `make test` has run.
@@ -171,6 +182,8 @@ repository) and drift silently:
   emits, `fleet.conf.example`, and the README.
 - **A new `GHA_*` answer** goes in `CONFIG_ANSWERS`, the `save_config` heredoc,
   the wizard, and the README's variable table.
+- **Anything the installer puts in a runner's `$HOME`** goes in the disk
+  guard's `KEEP` list too, or the first reset under disk pressure deletes it.
 
 ## Tests
 
@@ -181,7 +194,10 @@ functions — `parse_config`, `build_env`, `build_bootstrap`, `load_config`,
 instead of reporting it down). The bootstrap cases are not simulations: each runs the
 real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer that reports what it received. Only the SSH
-hop is substituted.
+hop is substituted. The disk-guard cases render `gha-diskguard` from
+`render_diskguard`, source it, and drive its eviction steps against a scratch
+runner tree whose atimes they set; only the root-only privilege drop
+(`as_runner`) is substituted.
 
 - Hand-rolled BDD, `# given / # when / # then`, no mocking library.
 - Each case is a function named `it_*`, **defined and then invoked on the very

@@ -52,6 +52,13 @@ alone — say it needs VM exercise.
   registration, `Restart=always` loops. Flag anything that lets `run.sh` survive
   a second job, or that makes the wrapper `exec ./run.sh` — `exec` discards the
   EXIT trap and skips cleanup, silently restoring a long-lived runner.
+- **The disk guard keeps its place and its privilege drop.** `gha-diskguard`
+  must stay the `ExecStartPre` that runs before `gha-jitconfig`: an unregistered
+  runner cannot be handed a job, which is the only thing that makes deleting its
+  caches safe. Every deletion goes through `as_runner` (`setpriv` to the runner
+  user) because every path it clears is job-writable; flag a deletion moved to
+  root. Anything a change puts in a runner's `$HOME` must join the guard's
+  `KEEP` list, or the first reset under disk pressure deletes it.
 - **`StartLimitIntervalSec=0` is deliberate.** systemd's start limit counts
   *attempts*; a healthy runner finishing many quick jobs would trip a nonzero
   limit. Do not flag it as a missing safeguard, and flag any change that removes
@@ -98,7 +105,8 @@ alone — say it needs VM exercise.
   systemd directive is deliberately unset.
 - **Tests.** New behaviour in the pure functions (`parse_config`, `build_env`,
   `build_bootstrap`, `load_config`, `should_preload_config`,
-  `runner_state_between_jobs`) should come with an `it_*` case. Do not ask for a
+  `runner_state_between_jobs`) and in the disk guard that `render_diskguard`
+  emits should come with an `it_*` case. Do not ask for a
   test that would require a VM.
 
 ## Shared guide rules

@@ -1258,6 +1258,244 @@ REAP
 }
 
 # ===========================================================================
+# DISK GUARD - bounded caches, enforced between jobs
+#
+# trust=internal keeps a runner's caches from one job to the next on purpose,
+# and there are three of them: $HOME (every package manager's cache, and the
+# SDKs some setup-* actions unpack there), the hosted tool cache, and the
+# rootless Docker store. Nothing bounded the first two - the janitor only ever
+# pruned Docker - and every runner keeps a private copy of all three. On a busy
+# fleet that reached tens of GB per runner, most of it superseded tool versions
+# no job had read in weeks, and it filled the disk.
+#
+# The guard runs as ExecStartPre, before the registration is minted: the one
+# moment its runner is guaranteed idle, because the last job is over and no
+# new one can be assigned to a runner that is not registered yet. So it can
+# delete caches outright, which the daily janitor, racing live jobs, cannot.
+#
+# Rendered by its own function, not written inline, so the test suite can
+# exercise the real script without root.
+# ===========================================================================
+render_diskguard() {
+  cat <<'GUARD'
+#!/usr/bin/env bash
+# gha-diskguard <n> - runs as root from ExecStartPre=-+, before gha-jitconfig.
+# Written by harden-gha-runners.sh; change the installer, not this file.
+#
+# A no-op until the disk holding this runner's caches reaches the soft
+# threshold. Past it, frees space from THIS runner's caches, cheapest loss
+# first, measuring again after every step and stopping as soon as the disk is
+# back under the threshold. Never fails the unit: a cold cache beats a runner
+# that will not start.
+set -uo pipefail
+export LC_ALL=C
+
+STALE_DAYS=7   # a cache entry no job has read in a week is not earning its space
+# What the installer itself put in $HOME, and all a reset keeps: the rootless
+# daemon's user unit, the CLI config naming its context, its data root (emptied
+# through Docker, never with rm under a running daemon), and the skeleton.
+KEEP=(.config/systemd .config/docker .local/share/docker .local/share/systemd
+      .docker .bashrc .profile .bash_logout)
+# Judged child by child rather than whole: ~/.cache holds a dozen unrelated
+# tools' caches, and one of them in daily use must not keep the rest alive.
+SPLIT=(.cache)
+declare -A WHERE=()
+
+log() { echo "gha-diskguard[${N}]: $*"; }
+
+use_pct()  { local p; p=$(df --output=pcent "$1" 2>/dev/null | tail -1 | tr -dc '0-9'); echo "${p:-0}"; }
+avail_mb() { local a; a=$(df -BM --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'); echo "${a:-0}"; }
+over()     { (( $(use_pct "$1") >= SOFT )); }
+# The fuller of the filesystems this runner's caches live on - one disk on
+# most boxes, but /home and /opt can be separate.
+worst_pct() {
+  local d p w=0
+  for d in "$H" "$TC"; do p=$(use_pct "$d"); (( p > w )) && w=$p; done
+  echo "$w"
+}
+
+# Every deletion runs as the runner user, never as root. All of these paths are
+# job-writable, so a job can plant a symlink anywhere in them; as the runner
+# user, the most a planted link can make rm reach is what the job could
+# already delete itself.
+as_runner() {
+  setpriv --reuid="$U" --regid="$U" --init-groups -- \
+    env HOME="$H" XDG_RUNTIME_DIR="/run/user/${RUID}" \
+        DOCKER_HOST="unix:///run/user/${RUID}/docker.sock" "$@"
+}
+
+# Go's module cache is read-only on purpose (0444 files in 0555 directories),
+# and not even the owner can unlink inside a directory it cannot write - so rm
+# fails on it unless those directories are opened up first.
+rm_tree() { # rm_tree <path>...
+  local p
+  for p in "$@"; do
+    if [[ -d "$p" && ! -L "$p" ]]; then
+      as_runner find "$p" -type d ! -perm -u+w -exec chmod u+w {} + 2>/dev/null
+    fi
+    as_runner rm -rf -- "$p" 2>/dev/null
+  done
+  return 0
+}
+
+# Has no job read anything under <path> in STALE_DAYS? Files only: listing a
+# directory (du, find, this script) refreshes its atime, while a file's atime
+# moves only when something reads it - running a tool, loading a cached
+# package. relatime updates it at most daily, all the precision this needs. On
+# a noatime mount everything looks as old as its install, and this degrades to
+# evicting by install age.
+stale() { # stale <path>
+  [[ -z "$(find "$1" -type f -amin "-$(( STALE_DAYS * 1440 ))" -print -quit 2>/dev/null)" ]]
+}
+
+# The entries of a home a reset removes, each one whole: everything except
+# KEEP, descending only into the directories that lead to a KEEP entry and into
+# SPLIT. Never deeper - half a Go module or half a pub package is a corrupt
+# cache, not a smaller one. A symlink is an entry, never a way in.
+home_entries() { # home_entries <dir> [<path relative to the home>]
+  local dir="$1" rel="${2:-}" e r k s keep descend
+  for e in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    [[ -e "$e" || -L "$e" ]] || continue
+    r="${rel:+${rel}/}${e##*/}"
+    keep=0; descend=0
+    for k in "${KEEP[@]}"; do
+      [[ "$r" == "$k" ]] && keep=1
+      [[ "$k" == "$r"/* ]] && descend=1
+    done
+    for s in "${SPLIT[@]}"; do [[ "$r" == "$s" ]] && descend=1; done
+    (( keep )) && continue
+    if (( descend )) && [[ -d "$e" && ! -L "$e" ]]; then
+      home_entries "$e" "$r"
+    else
+      printf '%s\n' "$e"
+    fi
+  done
+  return 0
+}
+
+# One entry per installed tool version: <tool>/<version> holds both the tree
+# and the .complete marker the setup-* actions look for.
+tool_entries() { # tool_entries <toolcache>
+  local e
+  for e in "$1"/*/*; do [[ -d "$e" && ! -L "$e" ]] && printf '%s\n' "$e"; done
+  return 0
+}
+
+# Listed in full before anything is deleted, so the walk never runs into a
+# directory the loop below has just removed.
+evict_stale() { # evict_stale <lister> <root>
+  local e; local -a all=() gone=()
+  mapfile -t all < <("$1" "$2")
+  for e in ${all[@]+"${all[@]}"}; do
+    stale "$e" || continue
+    rm_tree "$e"
+    [[ -e "$e" || -L "$e" ]] || gone+=("${e#"$2"/}")
+  done
+  (( ${#gone[@]} )) && log "evicted ${#gone[@]} unused for ${STALE_DAYS}+ days: ${gone[*]}"
+  return 0
+}
+
+# ---- the steps, cheapest loss first -----------------------------------------
+# The wrapper deletes _work before every job anyway; one left by a job that was
+# killed before its cleanup ran would otherwise cost caches it need not.
+drop_leftover_work() { rm_tree "${RUNNER_BASE}/${N}/_work"; }
+evict_stale_tools() {
+  evict_stale tool_entries "$TC"
+  as_runner find "$TC" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null
+  return 0
+}
+evict_stale_home() { evict_stale home_entries "$H"; }
+# Safe to take everything: nothing runs between jobs. `system prune` spares
+# named volumes on current Docker, hence the separate `volume prune -a`.
+prune_docker() {
+  [[ -S "/run/user/${RUID}/docker.sock" ]] || return 0
+  as_runner timeout 600 docker system prune -af --volumes >/dev/null 2>&1
+  as_runner timeout 300 docker volume prune -af           >/dev/null 2>&1
+  as_runner timeout 300 docker builder prune -af          >/dev/null 2>&1
+  return 0
+}
+wipe_toolcache() {
+  local -a e=(); mapfile -t e < <(find "$TC" -mindepth 1 -maxdepth 1 2>/dev/null)
+  rm_tree ${e[@]+"${e[@]}"}
+}
+reset_home() {
+  local -a e=(); mapfile -t e < <(home_entries "$H")
+  rm_tree ${e[@]+"${e[@]}"}
+}
+
+# Each step names the directory whose filesystem it frees, so a box with /home
+# and /opt on separate disks only clears the side that is actually full.
+STEPS=(
+  work:drop_leftover_work
+  tools:evict_stale_tools
+  home:evict_stale_home
+  home:prune_docker       # the rootless data root lives in $HOME
+  tools:wipe_toolcache
+  home:reset_home
+)
+
+run_steps() {
+  local step fn dir before
+  for step in "${STEPS[@]}"; do
+    fn="${step#*:}"; dir="${WHERE[${step%%:*}]}"
+    over "$dir" || continue
+    before=$(avail_mb "$dir")
+    "$fn"
+    log "${fn//_/ }: freed $(( $(avail_mb "$dir") - before )) MB, disk now $(use_pct "$dir")%"
+  done
+  return 0
+}
+
+main() {
+  N="${1:-}"
+  [[ "$N" =~ ^[0-9]+$ ]] || { echo "usage: gha-diskguard <runner-number>" >&2; exit 0; }
+  . /etc/github-runner/env 2>/dev/null || exit 0
+  SOFT=${GHA_DISK_SOFT:-75}   # the janitor's soft threshold, read the same way
+  [[ "$SOFT" =~ ^[0-9]+$ ]] || SOFT=75
+  U="${USER_PREFIX}${N}"
+  RUID=$(id -u "$U" 2>/dev/null) || exit 0
+  # The same literal paths the unit's ReadWritePaths name, not getent's answer:
+  # whatever a reset clears must be the tree this runner's jobs could write.
+  H="/home/${U}"
+  TC="/opt/hostedtoolcache-${U}"
+  [[ -d "$H" && -d "$TC" ]] || exit 0
+  WHERE=([work]="${RUNNER_BASE}/${N}" [tools]="$TC" [home]="$H")
+
+  (( $(worst_pct) >= SOFT )) || exit 0       # the common case, in milliseconds
+
+  # One guard at a time. Runners that finish together would otherwise all
+  # measure the same full disk and all empty their caches, when the first
+  # one's work alone may have been enough - so the others wait, then measure.
+  install -d -m 0711 -o root -g root /run/gha-runner
+  exec 9>/run/gha-runner/diskguard.lock
+  flock -w 300 9 || log "gave up waiting for another runner's guard; going ahead"
+  (( $(worst_pct) >= SOFT )) || exit 0
+
+  log "disk at $(worst_pct)%, soft threshold ${SOFT}% - freeing space from runner ${N}'s caches"
+  run_steps
+  if (( $(worst_pct) >= SOFT )); then
+    log "STILL at $(worst_pct)% with runner ${N}'s caches emptied. Each runner empties its own"
+    log "before its next job; if every one of them reports this, the disk is filling with"
+    log "something that is not a runner cache - see: harden-gha-runners.sh diagnose"
+  fi
+  exit 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
+GUARD
+}
+
+phase_diskguard() {
+  head1 "Installing the between-jobs disk guard"
+  render_diskguard > /usr/local/sbin/gha-diskguard
+  chmod 0700 /usr/local/sbin/gha-diskguard
+  bash -n /usr/local/sbin/gha-diskguard || die "the generated disk guard is malformed"
+  ok "/usr/local/sbin/gha-diskguard (past ${GHA_DISK_SOFT:-75}% disk, a runner frees its own caches before its next job)"
+}
+
+# ===========================================================================
 # RUNNER BINARIES + ONE-JOB WRAPPER
 # ===========================================================================
 phase_runners() {
@@ -1277,6 +1515,10 @@ phase_runners() {
   # may already be 0600 and would fail the same way.
   chmod 0644 "$tarball"
   tar -tzf "$tarball" >/dev/null 2>&1 || { rm -f "$tarball"; die "runner tarball is corrupt"; }
+  # Only now that this release is proven good: every install that meets a new
+  # release downloads it, and nothing used to remove the one before.
+  find /var/cache -maxdepth 1 -name 'actions-runner-*.tar.gz' ! -name "${tarball##*/}" \
+    -delete 2>/dev/null || true
 
   # systemd chdirs into WorkingDirectory as the runner user. Every component
   # of the path must be traversable by that user or the unit dies at step
@@ -1364,13 +1606,15 @@ EOF
 }
 
 # ===========================================================================
-# JANITOR - disk pressure + health, on a daily timer
+# JANITOR - Docker trim + health, on a daily timer
 #
 # trust=internal deliberately keeps the layer cache warm, which means the
-# per-user rootless daemons accumulate images forever. Without this the box hits
-# "no space left on device" in a few months. The same timer notices runners
-# that have died (expired PAT, revoked token) instead of letting them sit
-# in `failed` unobserved.
+# per-user rootless daemons accumulate images forever. This trims them daily,
+# but it is only a backstop: it runs once a day, prunes Docker and nothing else,
+# and every prune races jobs that are running. What actually bounds the disk is
+# gha-diskguard, between jobs (see DISK GUARD). The same timer notices runners
+# that have died (expired PAT, revoked token) instead of letting them sit in
+# `failed` unobserved.
 # ===========================================================================
 phase_janitor() {
   head1 "Installing the disk/health janitor"
@@ -1533,7 +1777,7 @@ EOF
   chmod 0644 /etc/systemd/system/gha-janitor.service /etc/systemd/system/gha-janitor.timer
   systemctl daemon-reload
   systemctl enable --now gha-janitor.timer >/dev/null 2>&1 || true
-  ok "gha-janitor.timer enabled (daily; trims at 75% disk, full prune at 90%)"
+  ok "gha-janitor.timer enabled (daily; trims Docker at 75% disk, full Docker prune at 90%)"
 }
 
 # ===========================================================================
@@ -1611,6 +1855,11 @@ User=${USER_PREFIX}%i
 Group=${USER_PREFIX}%i
 WorkingDirectory=${RUNNER_BASE}/%i
 
+# Root-only, and BEFORE the registration is minted: between two jobs, the one
+# moment this runner is guaranteed idle. A no-op until the disk passes the soft
+# threshold; past it, frees space from this runner's own caches. The "-" keeps
+# disk hygiene from ever being the reason a runner does not start.
+ExecStartPre=-+/usr/local/sbin/gha-diskguard %i
 # Root-only: mints the single-use JIT config. The runner user never sees the PAT.
 ExecStartPre=+/usr/local/sbin/gha-jitconfig %i
 ExecStart=${RUNNER_BASE}/%i/run-ephemeral.sh
@@ -1619,6 +1868,9 @@ ExecStopPost=+/usr/local/sbin/gha-jitreap %i
 Restart=always
 RestartSec=10
 ${backoff}
+# The start timeout covers every ExecStartPre. Emptying a runner's caches under
+# I/O load can take minutes; the 90s default would kill the guard mid-sweep.
+TimeoutStartSec=15min
 # control-group, not mixed: the wrapper is now the main PID, and run.sh is a
 # child. mixed would signal only the wrapper and leave the runner to be killed.
 KillMode=control-group
@@ -1775,6 +2027,24 @@ phase_verify() {
   [[ "$(stat -c '%a %U' "$PAT_FILE" 2>/dev/null)" == "600 root" ]] \
     && ok "PAT is 0600 root:root" \
     || { err "PAT file permissions are wrong"; fail=1; }
+
+  # Measured where the runners keep their caches. Past the soft threshold each
+  # runner empties its own before its next job, so a disk that is still past
+  # the hard one means that is not keeping up - and a box can be one large job
+  # from failing every job with ENOSPC while every other check here is green.
+  local soft="${GHA_DISK_SOFT:-75}" hard="${GHA_DISK_HARD:-90}" mnt pct
+  while read -r mnt pct; do
+    pct="${pct//%/}"
+    [[ "$pct" =~ ^[0-9]+$ ]] || continue
+    if (( pct >= hard )); then
+      err "disk ${pct}% full on ${mnt} - past the ${hard}% hard threshold, jobs are about to fail with ENOSPC"
+      fail=1
+    elif (( pct >= soft )); then
+      warn "disk ${pct}% full on ${mnt} - past ${soft}%, so each runner frees its own caches before its next job"
+    else
+      ok "disk ${pct}% full on ${mnt}"
+    fi
+  done < <(df --output=target,pcent /home "$RUNNER_BASE" 2>/dev/null | tail -n +2 | sort -u)
 
   for n in $(seq 1 "${GHA_COUNT}"); do
     u="${USER_PREFIX}${n}"; uid=$(id -u "$u" 2>/dev/null || echo "")
@@ -2594,6 +2864,21 @@ phase_diagnose() {
     "$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}" )"
   printf '    runner binary: %s\n' "$(cat "${RUNNER_BASE}/1/bin/runnerversion" 2>/dev/null || echo '?')"
 
+  # A full disk fails jobs in ways that look like anything but a full disk: a
+  # crashed listener, a container that cannot be saved, a tool that dies
+  # mid-unpack. Each runner keeps its own warm caches, so name their size.
+  echo
+  echo "${C_B}disk${C_R}"
+  df -h /home "$RUNNER_BASE" 2>/dev/null | awk '!seen[$0]++' | sed 's/^/    /'
+  for n in $(seq 1 "${GHA_COUNT}"); do
+    u="${USER_PREFIX}${n}"
+    printf '    runner %s: home %s, tool cache %s\n' "$n" \
+      "$(timeout 120 du -sxh "/home/${u}" 2>/dev/null | cut -f1)" \
+      "$(timeout 120 du -sxh "/opt/hostedtoolcache-${u}" 2>/dev/null | cut -f1)"
+  done
+  echo "    ${C_DIM}latest disk-guard actions (journalctl -t gha-diskguard):${C_R}"
+  journalctl -t gha-diskguard -n 8 --no-pager -o short-iso 2>/dev/null | sed 's/^/      /'
+
   for n in $(seq 1 "${GHA_COUNT}"); do
     u="${USER_PREFIX}${n}"; uid=$(id -u "$u" 2>/dev/null); d="${RUNNER_BASE}/${n}"
     echo
@@ -2674,6 +2959,7 @@ phase_uninstall() {
   rm -rf /etc/systemd/system/system.slice.d/10-gha-protect.conf
   rm -f "/etc/systemd/system/${GHA_SLICE:-gha.slice}"
   rm -f /etc/systemd/system/gha-runner@.service /usr/local/sbin/gha-jitconfig \
+        /usr/local/sbin/gha-diskguard \
         /etc/systemd/system/gha-janitor.service /etc/systemd/system/gha-janitor.timer \
         /usr/local/sbin/gha-janitor /usr/local/sbin/gha-jitreap \
         /usr/local/sbin/gha-reboot-if-idle /etc/sysctl.d/99-gha-rootless.conf \
@@ -2704,7 +2990,10 @@ summary() {
     systemctl status 'gha-runner@*'
 
   ${C_B}Housekeeping runs itself:${C_R}
-    gha-janitor.timer  daily - trims caches at 75% disk, full prune at 90%,
+    gha-diskguard      before every job - past 75% disk, that runner frees its
+                       own caches: whatever no job read in a week first, the
+                       rest only if still needed (journalctl -t gha-diskguard)
+    gha-janitor.timer  daily - trims Docker at 75% disk, full prune at 90%,
                        checks the admin PAT, and logs if a runner has died
     gha-reboot.timer   02:00-05:00 - applies a pending reboot ONLY when no
                        runner on this host is executing a job
@@ -2878,6 +3167,7 @@ main() {
       done
       maybe_add_swap
       phase_token_helper
+      phase_diskguard
       phase_runners
       phase_systemd
       phase_janitor

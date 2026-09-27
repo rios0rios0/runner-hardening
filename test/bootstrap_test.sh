@@ -24,7 +24,9 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# chmod first: the disk-guard cases build a read-only Go module cache, which
+# rm -rf cannot remove from under a directory it cannot write.
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # shellcheck source=/dev/null
 source "${ROOT}/fleet.sh"
@@ -786,6 +788,233 @@ it_still_reports_a_unit_that_is_not_coming_back() {
   assert_eq "should still report a failed unit" "no" "$failed"
 }
 it_still_reports_a_unit_that_is_not_coming_back
+
+echo
+echo "disk guard"
+
+# gha-diskguard is generated, so it is rendered from the real installer, then
+# sourced and driven against a scratch runner tree. The one thing it does that
+# a test cannot is the privilege drop, which needs root: as_runner is replaced
+# by running the command as whoever runs the suite, and nothing else changes.
+( source "${ROOT}/harden-gha-runners.sh"; render_diskguard ) > "${WORK}/gha-diskguard" 2>/dev/null
+
+# guard_probe <commands> -> runs <commands> in a subshell with the guard loaded
+# and its globals pointed at the scratch runner under ${WORK}/g
+guard_probe() {
+  (
+    # shellcheck source=/dev/null
+    source "${WORK}/gha-diskguard"
+    set +e
+    N=1; U="$(id -un)"; SOFT=75
+    RUID=4294967294       # no such user: no docker socket, so prune_docker is inert
+    RUNNER_BASE="${WORK}/g/opt"; H="${WORK}/g/home"; TC="${WORK}/g/tc"
+    declare -A WHERE=([work]="${RUNNER_BASE}/1" [tools]="$TC" [home]="$H")
+    as_runner() { env HOME="$H" "$@"; }
+    eval "$1"
+  )
+}
+
+fresh_runner_tree() {
+  chmod -R u+w "${WORK}/g" 2>/dev/null; rm -rf "${WORK}/g"
+  mkdir -p "${WORK}/g/opt/1" "${WORK}/g/home" "${WORK}/g/tc"
+}
+
+# put <file> [<days since a job last read it>] - nothing reads a fixture after
+# this, so the atime it is given is the one the guard sees
+put() {
+  mkdir -p "$(dirname "$1")"; printf 'x' > "$1"
+  [[ -z "${2:-}" ]] || touch -a -d "$2 days ago" "$1"
+}
+
+exists() { if [[ -e "$1" || -L "$1" ]]; then echo yes; else echo no; fi; }
+
+it_ships_a_guard_that_parses() {
+  # given the guard exactly as the installer writes it
+  # when it is parsed
+  local rc=0
+  bash -n "${WORK}/gha-diskguard" 2>/dev/null || rc=$?
+
+  # then it is a valid script - the unit would otherwise fail its first start
+  assert_eq "should render a disk guard that parses" "0" "$rc"
+}
+it_ships_a_guard_that_parses
+
+it_runs_the_guard_before_the_registration_is_minted() {
+  # given the unit template the installer writes
+  # when the order of its ExecStartPre lines is read
+  local guard mint
+  guard=$(grep -n '^ExecStartPre=.*gha-diskguard' "${ROOT}/harden-gha-runners.sh" | cut -d: -f1)
+  mint=$(grep -n '^ExecStartPre=.*gha-jitconfig' "${ROOT}/harden-gha-runners.sh" | cut -d: -f1)
+
+  # then the guard runs first: an unregistered runner cannot be handed a job,
+  # which is the only thing that makes deleting its caches safe
+  if [[ -n "$guard" && -n "$mint" ]] && (( guard < mint )); then
+    pass "should run the guard while the runner is still unregistered"
+  else
+    fail "should run the guard while the runner is still unregistered" \
+         "guard at line [${guard}], JIT mint at line [${mint}]"
+  fi
+}
+it_runs_the_guard_before_the_registration_is_minted
+
+it_evicts_only_what_no_job_has_read_in_a_week() {
+  # given a tool cache and a home whose entries were last read at different times
+  fresh_runner_tree
+  local tc="${WORK}/g/tc" h="${WORK}/g/home"
+  put "${tc}/go/1.20.0/x64/bin/go" 30
+  put "${tc}/go/1.22.0/x64/bin/go" 30
+  put "${tc}/go/1.22.0/x64/src/fmt.go"                 # read today
+  put "${tc}/flutter/3.0.0/x64/bin/flutter" 30
+  put "${h}/.cache/pip/wheel" 30
+  put "${h}/.cache/go-build/ab/cd"                     # read today
+  put "${h}/.pub-cache/hosted/pkg/lib.dart" 30
+  put "${h}/go/pkg/mod/mod.go"                         # read today
+
+  # when the two stale steps run
+  guard_probe 'evict_stale_tools; evict_stale_home' >/dev/null
+
+  # then exactly the entries nobody read in a week are gone, each one whole
+  assert_eq "should evict a tool version no job has read in a week" \
+    "no" "$(exists "${tc}/go/1.20.0")"
+  assert_eq "should keep a tool version if any file in it was read this week" \
+    "yes" "$(exists "${tc}/go/1.22.0/x64/bin/go")"
+  assert_eq "should remove a tool whose last version was evicted" \
+    "no" "$(exists "${tc}/flutter")"
+  assert_eq "should judge each ~/.cache child alone, evicting the stale one" \
+    "no" "$(exists "${h}/.cache/pip")"
+  assert_eq "should judge each ~/.cache child alone, keeping the one in use" \
+    "yes" "$(exists "${h}/.cache/go-build/ab/cd")"
+  assert_eq "should evict a stale top-level cache from the home" \
+    "no" "$(exists "${h}/.pub-cache")"
+  assert_eq "should keep a top-level cache read this week" \
+    "yes" "$(exists "${h}/go/pkg/mod/mod.go")"
+}
+it_evicts_only_what_no_job_has_read_in_a_week
+
+it_resets_a_home_to_what_the_installer_put_there() {
+  # given a home holding the rootless Docker plumbing and what jobs left behind
+  fresh_runner_tree
+  local h="${WORK}/g/home"
+  put "${h}/.config/systemd/user/docker.service"
+  put "${h}/.docker/config.json"
+  put "${h}/.local/share/docker/overlayfs/layer"
+  put "${h}/.bashrc"
+  put "${h}/.profile"
+  put "${h}/.config/gh/hosts.yml"
+  put "${h}/.local/share/flutter/sdk"
+  put "${h}/.local/bin/tool"
+  put "${h}/.npm/_cacache/index"
+  put "${h}/.gitconfig"
+  put "${h}/.ssh/config"
+
+  # when the home is reset
+  guard_probe 'reset_home' >/dev/null
+
+  # then the daemon still starts and still has its images, and nothing a job
+  # wrote survives
+  assert_eq "should keep the rootless daemon's user unit" \
+    "yes" "$(exists "${h}/.config/systemd/user/docker.service")"
+  assert_eq "should keep the Docker CLI config naming the rootless context" \
+    "yes" "$(exists "${h}/.docker/config.json")"
+  assert_eq "should leave the Docker data root to docker, never to rm" \
+    "yes" "$(exists "${h}/.local/share/docker/overlayfs/layer")"
+  assert_eq "should keep the skeleton dotfiles" "yes" "$(exists "${h}/.bashrc")"
+  assert_eq "should remove a tool's config a job wrote" "no" "$(exists "${h}/.config/gh")"
+  assert_eq "should remove an SDK unpacked beside the Docker data root" \
+    "no" "$(exists "${h}/.local/share/flutter")"
+  assert_eq "should remove binaries a job installed to ~/.local/bin" "no" "$(exists "${h}/.local/bin")"
+  assert_eq "should remove a package cache" "no" "$(exists "${h}/.npm")"
+  assert_eq "should remove dotfiles a job wrote" "no" "$(exists "${h}/.gitconfig")"
+  assert_eq "should remove an ssh config a job could have planted" "no" "$(exists "${h}/.ssh")"
+}
+it_resets_a_home_to_what_the_installer_put_there
+
+it_removes_a_read_only_go_module_cache() {
+  # given Go's module cache, which Go makes read-only on purpose
+  fresh_runner_tree
+  local mod="${WORK}/g/home/go/pkg/mod/example.com/m@v1.0.0"
+  put "${mod}/m.go"
+  chmod 0444 "${mod}/m.go"
+  chmod 0555 "$mod" "$(dirname "$mod")"
+
+  # when the home is reset
+  guard_probe 'reset_home' >/dev/null
+
+  # then it is gone - rm alone cannot unlink inside a directory it cannot write
+  assert_eq "should remove a read-only module cache" "no" "$(exists "${WORK}/g/home/go")"
+}
+it_removes_a_read_only_go_module_cache
+
+it_never_follows_a_planted_symlink() {
+  # given symlinks a job planted in its home, one where the walk would descend
+  fresh_runner_tree
+  local h="${WORK}/g/home" outside="${WORK}/g/outside"
+  put "${outside}/precious"
+  mkdir -p "${h}/.cache"
+  ln -s "$outside" "${h}/.cache/evil"
+  ln -s "$outside" "${h}/.local"
+
+  # when the home is reset
+  guard_probe 'reset_home' >/dev/null
+
+  # then only the links go. In production rm also runs as the runner user, so
+  # a link to something root owns could not be followed into anyway.
+  assert_eq "should not delete through a planted symlink" "yes" "$(exists "${outside}/precious")"
+  assert_eq "should remove the planted symlink itself" "no" "$(exists "${h}/.cache/evil")"
+  assert_eq "should not descend into a symlinked directory" "no" "$(exists "${h}/.local")"
+}
+it_never_follows_a_planted_symlink
+
+# steps_probe <disk % before any step> <disk % once stale tools are evicted>
+#   -> the steps the guard took, in order
+steps_probe() {
+  fresh_runner_tree
+  guard_probe "
+    calls=()
+    use_pct()  { if [[ -e \"\${WORK}/g/freed\" ]]; then echo $2; else echo $1; fi; }
+    avail_mb() { echo 0; }
+    log()      { :; }
+    drop_leftover_work() { calls+=(work); }
+    evict_stale_tools()  { calls+=(tools); : > \"\${WORK}/g/freed\"; }
+    evict_stale_home()   { calls+=(home); }
+    prune_docker()       { calls+=(docker); }
+    wipe_toolcache()     { calls+=(wipe); }
+    reset_home()         { calls+=(reset); }
+    run_steps
+    echo \"\${calls[*]}\""
+}
+
+it_stops_as_soon_as_the_disk_is_back_under_the_threshold() {
+  # given a disk at 90% that evicting stale tool versions brings to 60%
+  # when the guard runs its steps
+  local got; got=$(steps_probe 90 60)
+
+  # then nothing costlier runs: the warm caches jobs are using stay warm
+  assert_eq "should stop at the first step that brings the disk under the threshold" \
+    "work tools" "$got"
+}
+it_stops_as_soon_as_the_disk_is_back_under_the_threshold
+
+it_escalates_cheapest_loss_first_while_the_disk_stays_full() {
+  # given a disk no step manages to free
+  # when the guard runs its steps
+  local got; got=$(steps_probe 95 95)
+
+  # then every step runs, in the order that loses the least warm cache first
+  assert_eq "should escalate one step at a time, cheapest loss first" \
+    "work tools home docker wipe reset" "$got"
+}
+it_escalates_cheapest_loss_first_while_the_disk_stays_full
+
+it_does_nothing_below_the_threshold() {
+  # given a disk under the soft threshold
+  # when the guard runs its steps
+  local got; got=$(steps_probe 50 50)
+
+  # then it touches nothing - a box with room keeps every cache warm
+  assert_eq "should take no step below the soft threshold" "" "$got"
+}
+it_does_nothing_below_the_threshold
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
