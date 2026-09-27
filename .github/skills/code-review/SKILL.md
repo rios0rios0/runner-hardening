@@ -63,6 +63,14 @@ alone — say it needs VM exercise.
   *attempts*; a healthy runner finishing many quick jobs would trip a nonzero
   limit. Do not flag it as a missing safeguard, and flag any change that removes
   it.
+- **No `RestartSteps`/`RestartMaxDelaySec`, for the same reason.** They count
+  every restart and every job ends in one, so they idled healthy runners for
+  minutes after each job. The backoff lives in `gha-jitconfig`, keyed on cycles
+  that ran no job; flag a change that brings systemd's back, or that keys the
+  backoff on the exit status (run-helper exits 0 even on a terminated error).
+  `restart_backoff_delay` and `cycle_ran_a_job` are spliced into the generated
+  helpers with `declare -f`: flag a change that makes either call another
+  installer function or read an installer global.
 - **`harden-gha-runners.sh` stays self-contained.** It is copied onto machines
   alone, so a new `source` of another repo file is a defect even though the
   helper is duplicated in `fleet.sh` on purpose.
@@ -105,8 +113,9 @@ alone — say it needs VM exercise.
   systemd directive is deliberately unset.
 - **Tests.** New behaviour in the pure functions (`parse_config`, `build_env`,
   `build_bootstrap`, `load_config`, `should_preload_config`,
-  `runner_state_between_jobs`) and in the disk guard that `render_diskguard`
-  emits should come with an `it_*` case. Do not ask for a
+  `runner_state_between_jobs`, `restart_backoff_delay`, `cycle_ran_a_job`) and
+  in the disk guard that `render_diskguard` emits should come with an `it_*`
+  case. Do not ask for a
   test that would require a VM.
 
 ## Shared guide rules
@@ -141,8 +150,8 @@ the ones this stack depends on:
 ## What not to flag
 
 - The deliberate duplication of helpers between the two scripts.
-- `StartLimitIntervalSec=0`, or the wrapper's avoidance of `exec` — both are
-  intentional and documented.
+- `StartLimitIntervalSec=0`, the absence of `RestartSteps`, or the wrapper's
+  avoidance of `exec` — all intentional and documented.
 - Missing unit tests for phases that change system state; there is no way to test
   them without a VM here.
 - Style already fixed by ShellCheck and the shared config — do not re-litigate

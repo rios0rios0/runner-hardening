@@ -20,7 +20,7 @@ the full architecture map. This file is the fast orientation for Copilot Chat.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets need
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 108 assertions, no VM)
+make test    # parse check + the test suite (~3s, 122 assertions, no VM)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -51,12 +51,17 @@ function, or just run the whole suite.
 
 - **The ephemeral loop is the core invariant.** systemd starts `gha-runner@N`;
   a first `ExecStartPre` (root) runs `gha-diskguard`, which frees that runner's
-  own caches once the disk is past 75% and is a no-op otherwise; the next
-  `ExecStartPre` (root) mints a single-use JIT config to `/run/gha-runner/N.jit`
+  own caches once the disk is past 75% and is a no-op otherwise (with
+  `trust=untrusted` it resets the runner in full, every time); the next
+  `ExecStartPre` (root) waits out any restart backoff, then mints a
+  single-use JIT config to `/run/gha-runner/N.jit`
   so the PAT is never seen by the runner user; `ExecStart` (runner user) wipes
   `_work` and runs `./run.sh --jitconfig` for exactly ONE job; `ExecStopPost`
-  (root) deletes the registration; `Restart=always` loops with a fresh
-  registration and workspace. A change that lets `run.sh` survive a second job,
+  (root) counts a cycle that ran no job and deletes the registration;
+  `Restart=always` loops with a fresh registration and workspace. The
+  backoff is keyed on job-less cycles (no `_diag/Worker_*.log` newer than the
+  cycle's `.jit`), never on systemd's `RestartSteps`, which counts every
+  restart and so idled healthy runners for minutes after each job. A change that lets `run.sh` survive a second job,
   or that lets the wrapper `exec` (which discards the EXIT trap and skips
   cleanup), silently turns these back into long-lived runners. Every README
   security claim rests on this chain.
@@ -105,6 +110,9 @@ function, or just run the whole suite.
   clears is job-writable, so `as_runner` drops to the runner user (`setpriv`)
   for every deletion; a planted symlink then reaches no further than the job
   could delete itself. Do not move a deletion back to root.
+- **`restart_backoff_delay` and `cycle_ran_a_job` are spliced into the
+  generated JIT helpers with `declare -f`.** Edit them in the installer and
+  keep them self-contained: nothing else of the installer travels with them.
 - **Every wizard question must also be answerable from the environment.**
   `fleet.sh` drives the installer over SSH with no pty, so an interactive-only
   prompt is unreachable to the fleet.
@@ -130,7 +138,8 @@ These sets are duplicated by design and drift silently:
 
 `test/bootstrap_test.sh` sources both scripts and exercises their real
 functions (`parse_config`, `build_env`, `build_bootstrap`, `load_config`,
-`should_preload_config`, `runner_state_between_jobs`). The bootstrap cases run
+`should_preload_config`, `runner_state_between_jobs`, `restart_backoff_delay`,
+`cycle_ran_a_job`). The bootstrap cases run
 the real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer — only the SSH hop is substituted. The
 disk-guard cases render `gha-diskguard` from `render_diskguard` and drive its

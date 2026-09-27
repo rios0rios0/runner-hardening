@@ -144,7 +144,7 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 | `GHA_PAT`                | admin PAT, stored `0600 root:root` and never readable by a job            |
 | `GHA_GROUP_ID`           | runner group id; `1` is *Default*                                         |
 | `GHA_LABELS`             | comma-separated runner labels                                             |
-| `GHA_TRUST`              | `internal` keeps the layer cache warm; `untrusted` wipes state every job  |
+| `GHA_TRUST`              | `internal` keeps caches warm between jobs; `untrusted` resets the runner's home, tool cache, Docker and workspace before every job |
 | `GHA_COUNT`              | runner count, or `auto` to size it from the box's own CPU and RAM         |
 | `GHA_OLD_USER`           | the over-privileged account to dismantle, or `none`                       |
 | `GHA_YES`                | answer every confirmation with yes                                        |
@@ -249,6 +249,20 @@ sudo /usr/local/sbin/gha-janitor   # run the janitor now
 ./fleet.sh verify                  # check the whole fleet
 ```
 
+### Restarts
+
+A runner registers again 10 seconds after its job ends. One whose starts keep
+failing — the listener exits without ever running a job — backs off instead:
+10 seconds, then 20, 40, 80, 160, and at most 5 minutes between attempts, so a
+broken box does not spend the fleet's shared API budget minting and deleting
+registrations. The first cycle that runs a job resets it, and a stop you asked
+for (a drain, a reboot, `rotate-pat`) never counts. `verify` fails once three
+starts in a row have run no job, and `diagnose` shows the count.
+
+systemd's own `RestartSteps` backoff is deliberately not used: it counts every
+restart, and an ephemeral runner restarts after every job, so it made healthy
+runners wait the full 5 minutes before each one.
+
 ### Disk
 
 With `trust = internal` a runner keeps its caches from one job to the next on
@@ -270,9 +284,17 @@ soon as the disk is back under 75%:
 4. the runner's whole hosted tool cache
 5. everything in its home the installer did not put there
 
-Every deletion runs as the runner's own user, never as root, so a symlink a job
-plants in its home cannot make the guard delete anything the job could not.
-`verify` warns past 75% and fails past 90%.
+With `trust = untrusted` there is no cache worth keeping, only state a fork PR
+could leave for the next job — a `~/.gitconfig` hook, a Docker CLI plugin, a
+poisoned build cache. So there the guard clears all of the above before every
+job, whatever the disk says.
+
+Either way a reset keeps only what the rootless daemon needs: its user unit,
+the link that enables it, and its data root, which is emptied through Docker
+rather than deleted under a running daemon. Every deletion runs as the runner's
+own user, never as root, so a symlink a job plants in its home cannot make the
+guard delete anything the job could not. `verify` warns past 75% and fails past
+90%.
 
 ```bash
 journalctl -t gha-diskguard               # what the guard freed, and when
@@ -285,7 +307,10 @@ sudo ./harden-gha-runners.sh diagnose     # each runner's cache sizes
   of hardening.** Set *Require approval for all external contributors* under
   **Settings → Actions → General**, or keep public repositories on
   GitHub-hosted runners. `trust = untrusted` reduces the blast radius; it does
-  not eliminate it.
+  not eliminate it. Its reset covers the runner's home, tool cache, Docker and
+  workspace, but not the runner's own install tree, which its user has to be
+  able to write, nor a process a job starts through that user's own service
+  manager — either can outlive the job that planted it.
 - **A box that has already run a hostile job cannot be cleaned by a script.**
   The `audit` mode reports the usual persistence surfaces, but a job that held
   root could have hidden from all of them. Reimage, then run this installer.
