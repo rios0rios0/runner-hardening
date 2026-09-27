@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added a disk check to `verify`, which now warns once the disk holding the runners'' caches passes the 75% soft threshold and fails past the 90% hard threshold -- a box one large job away from failing every job with `ENOSPC` used to pass every check. `diagnose` now reports each runner''s home and tool-cache size and the disk guard''s latest actions'
+time: '2026-09-27T22:07:33.750905798Z'

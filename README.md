@@ -36,7 +36,7 @@ arrangement:
 - **Ephemeral JIT registration** — a single-use runner config is minted by a root-only helper at every start, so no credential and no workspace survives a job.
 - **Hardened systemd units** — dedicated user, read-only filesystem outside `ReadWritePaths`, no capabilities, no new privileges, private `/tmp`.
 - **Capacity-aware resource policy** — a lone job may use the whole machine, while an aggregate slice ceiling stops the fleet from exhausting the host and keeps any OOM kill inside CI.
-- **Self-maintaining** — a daily janitor trims image caches under disk pressure, reaps leaked registrations, and warns before the admin PAT expires; a reboot guard applies pending kernel updates only when no runner is busy.
+- **Self-maintaining** — before every job a disk guard frees space from that runner's own caches once the disk passes 75%, starting with whatever no job has read in a week; a daily janitor trims Docker images, reaps leaked registrations, and warns before the admin PAT expires; a reboot guard applies pending kernel updates only when no runner is busy.
 - **Fleet driver** — `fleet.sh` runs any mode on every machine in `fleet.conf` over SSH, in parallel, with per-host logs and a pass/fail summary.
 - **Diagnostics that name the cause** — `diagnose`, `verify` and a leave-one-out `sandbox-probe` that identifies the exact systemd directive breaking a build.
 
@@ -239,7 +239,7 @@ Both timers are installed and enabled by the installer:
 
 | Timer               | Schedule       | What it does                                                                                        |
 |---------------------|----------------|------------------------------------------------------------------------------------------------------|
-| `gha-janitor.timer` | daily          | trims caches at 75% disk and fully prunes at 90%, reaps orphan registrations, checks the admin PAT   |
+| `gha-janitor.timer` | daily          | trims Docker images at 75% disk and fully prunes them at 90%, reaps orphan registrations, checks the admin PAT |
 | `gha-reboot.timer`  | 02:00–05:00    | applies a pending reboot **only** when no runner on the host is executing a job                     |
 
 ```bash
@@ -247,6 +247,36 @@ journalctl -fu 'gha-runner@*'      # watch the runners
 systemctl status 'gha-runner@*'
 sudo /usr/local/sbin/gha-janitor   # run the janitor now
 ./fleet.sh verify                  # check the whole fleet
+```
+
+### Disk
+
+With `trust = internal` a runner keeps its caches from one job to the next on
+purpose, and every runner keeps its own private copy: its home directory (each
+package manager's cache, and the SDKs some `setup-*` actions unpack there), its
+hosted tool cache, and its rootless Docker store. With heavy toolchains —
+CodeQL bundles, mobile SDKs, browser images — that reaches tens of gigabytes
+per runner, so size the disk for the runner count, not for one runner.
+
+What keeps it bounded is `gha-diskguard`, which each runner runs before every
+job: the one moment it is guaranteed idle, because it has not registered yet
+and cannot be handed a job. Below 75% disk it does nothing. At or above, it
+frees space from that runner's own caches, cheapest loss first, and stops as
+soon as the disk is back under 75%:
+
+1. a workspace left behind by a job that was killed before its cleanup ran
+2. tool versions and caches no job has read in 7 days
+3. the runner's Docker images, volumes and build cache
+4. the runner's whole hosted tool cache
+5. everything in its home the installer did not put there
+
+Every deletion runs as the runner's own user, never as root, so a symlink a job
+plants in its home cannot make the guard delete anything the job could not.
+`verify` warns past 75% and fails past 90%.
+
+```bash
+journalctl -t gha-diskguard               # what the guard freed, and when
+sudo ./harden-gha-runners.sh diagnose     # each runner's cache sizes
 ```
 
 ## Limits of this hardening
