@@ -446,7 +446,7 @@ wizard() {
   # --- trust level, which drives the cache policy --------------------------
   ask_menu GHA_TRUST "What kind of code will these runners execute?" \
     "internal:Internal / trusted repos only  ${C_DIM}(keeps layer cache warm)${C_R}" \
-    "untrusted:Public repos or fork PRs  ${C_DIM}(wipes all state between jobs)${C_R}"
+    "untrusted:Public repos or fork PRs  ${C_DIM}(home, caches and Docker wiped before every job)${C_R}"
 
   if [[ "$GHA_TRUST" == "untrusted" ]]; then
     WIPE_DOCKER_AFTER_JOB=true; SHARE_TOOLCACHE=false
@@ -694,6 +694,7 @@ confirm_plan() {
   trust level   ${GHA_TRUST}
                 wipe docker state after every job: ${WIPE_DOCKER_AFTER_JOB}
                 share hosted-tool cache across jobs: ${SHARE_TOOLCACHE}
+                reset home and tool cache before every job: $( [[ "$GHA_TRUST" == "untrusted" ]] && echo true || echo false )
 
   ${C_B}Destructive actions:${C_R}
    - stop and remove every existing actions.runner.* service
@@ -1167,11 +1168,52 @@ install_rootless_docker() {
 }
 
 # ===========================================================================
-# ROOT-ONLY JIT HELPER
+# RESTART BACKOFF - for runners that are failing, and only for them
+#
+# Restart=always brings a runner back after every job: that is the ephemeral
+# loop working. A runner that cannot start comes back just as fast, and each
+# attempt mints a registration and deletes it again - two API calls every
+# RestartSec, on a PAT the whole fleet shares. That one has to back off; the
+# healthy one must not.
+#
+# systemd's RestartSteps/RestartMaxDelaySec cannot tell them apart: it counts
+# every auto-restart, so once a runner had finished six jobs it sat out the
+# full five minutes before registering for each next one. The exit status
+# cannot either, because the runner's run-helper maps even a terminated error
+# to 0. What can is whether a job ran: Runner.Worker writes one
+# _diag/Worker_*.log per job. gha-jitreap counts the cycles in a row that ran
+# none, and gha-jitconfig waits on that count before minting. Both carry the
+# two functions below, spliced in with `declare -f`, so there is one
+# definition and the test suite exercises it.
 # ===========================================================================
-phase_token_helper() {
-  head1 "Installing the root-only JIT helper"
-  cat > /usr/local/sbin/gha-jitconfig <<'HELPER'
+
+# restart_backoff_delay <cycles in a row that ran no job> -> seconds to wait
+restart_backoff_delay() {
+  local n="$1"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  if (( n == 0 )); then
+    echo 0
+  elif (( n >= 6 )); then
+    echo 300
+  else
+    echo $(( 10 << (n - 1) ))
+  fi
+}
+
+# cycle_ran_a_job <runner dir> <file written when the cycle's registration was minted>
+cycle_ran_a_job() {
+  [[ -e "$2" ]] || return 1
+  [[ -n "$(find "$1/_diag" -maxdepth 1 -name 'Worker_*.log' -newer "$2" -print -quit 2>/dev/null)" ]]
+}
+
+# ===========================================================================
+# ROOT-ONLY JIT HELPER
+#
+# Rendered by functions rather than written inline, so the test suite can
+# check the scripts as shipped without root.
+# ===========================================================================
+render_jitconfig() {
+  cat <<'HELPER'
 #!/usr/bin/env bash
 # Runs as root via systemd ExecStartPre=+. Mints a single-use JIT runner config
 # and drops it where exactly one runner user can read it. The PAT never leaves
@@ -1179,6 +1221,20 @@ phase_token_helper() {
 set -euo pipefail
 N="$1"
 . /etc/github-runner/env
+HELPER
+  declare -f restart_backoff_delay
+  cat <<'HELPER'
+
+# Wait before minting only if the last cycles ran no job; see RESTART BACKOFF
+# in the installer. Waiting here, before any registration exists, also means a
+# `systemctl stop` cuts the wait short instead of sitting it out.
+FAILS=$(cat "/run/gha-runner/${N}.fails" 2>/dev/null || echo 0)
+WAIT=$(restart_backoff_delay "$FAILS")
+if (( WAIT > 0 )); then
+  echo "gha-jitconfig: the last ${FAILS} start(s) ran no job - waiting ${WAIT}s before registering again"
+  sleep "$WAIT"
+fi
+
 PAT="$(< /etc/github-runner/pat)"
 U="${USER_PREFIX}${N}"
 
@@ -1222,9 +1278,10 @@ chmod 0040 "$F"   # group-read only: this runner's user, and no other
 jq -er '.runner.id' <<<"$RESP" > "/run/gha-runner/${N}.id" 2>/dev/null || true
 chmod 0600 "/run/gha-runner/${N}.id" 2>/dev/null || true
 HELPER
-  chmod 0700 /usr/local/sbin/gha-jitconfig
+}
 
-  cat > /usr/local/sbin/gha-jitreap <<'REAP'
+render_jitreap() {
+  cat <<'REAP'
 #!/usr/bin/env bash
 # Runs as root via ExecStopPost=+. Deletes the registration this unit minted.
 # If the runner finished a job normally GitHub already retired it and this
@@ -1232,6 +1289,27 @@ HELPER
 set -uo pipefail
 N="$1"
 . /etc/github-runner/env 2>/dev/null || exit 0
+REAP
+  declare -f cycle_ran_a_job
+  cat <<'REAP'
+
+# Count the cycles in a row that ran no job, for gha-jitconfig's backoff. A
+# stop somebody asked for - a drain, a reboot, rotate-pat - is no failure even
+# though that cycle ran no job either, and its stop or restart job is still
+# running while this does. The .jit file was written when this cycle's
+# registration was minted, which makes it the marker; it is removed below, so
+# this has to come first.
+install -d -m 0711 -o root -g root /run/gha-runner
+FAILS="/run/gha-runner/${N}.fails"
+if [[ -z "$(systemctl list-jobs --no-legend "gha-runner@${N}.service" 2>/dev/null)" ]]; then
+  if cycle_ran_a_job "${RUNNER_BASE}/${N}" "/run/gha-runner/${N}.jit"; then
+    rm -f "$FAILS"
+  else
+    n=$(cat "$FAILS" 2>/dev/null || echo 0); [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    echo $(( n + 1 )) > "$FAILS"
+  fi
+fi
+
 IDF="/run/gha-runner/${N}.id"
 if [[ -s "$IDF" ]]; then
   RID="$(< "$IDF")"
@@ -1253,7 +1331,15 @@ fi
 rm -f "/run/gha-runner/${N}.jit" "$IDF"
 exit 0
 REAP
-  chmod 0700 /usr/local/sbin/gha-jitreap
+}
+
+phase_token_helper() {
+  head1 "Installing the root-only JIT helper"
+  render_jitconfig > /usr/local/sbin/gha-jitconfig
+  render_jitreap > /usr/local/sbin/gha-jitreap
+  chmod 0700 /usr/local/sbin/gha-jitconfig /usr/local/sbin/gha-jitreap
+  bash -n /usr/local/sbin/gha-jitconfig && bash -n /usr/local/sbin/gha-jitreap \
+    || die "a generated JIT helper is malformed"
   ok "/usr/local/sbin/gha-jitconfig + gha-jitreap"
 }
 
@@ -1273,6 +1359,10 @@ REAP
 # new one can be assigned to a runner that is not registered yet. So it can
 # delete caches outright, which the daily janitor, racing live jobs, cannot.
 #
+# trust=untrusted keeps no caches on purpose, and the same moment serves it:
+# there the guard resets the runner in full before every job, disk or no disk,
+# so nothing a fork PR leaves in $HOME or the tool cache reaches the next job.
+#
 # Rendered by its own function, not written inline, so the test suite can
 # exercise the real script without root.
 # ===========================================================================
@@ -1285,17 +1375,22 @@ render_diskguard() {
 # A no-op until the disk holding this runner's caches reaches the soft
 # threshold. Past it, frees space from THIS runner's caches, cheapest loss
 # first, measuring again after every step and stopping as soon as the disk is
-# back under the threshold. Never fails the unit: a cold cache beats a runner
-# that will not start.
+# back under the threshold. An untrusted runner is reset in full before every
+# job instead. Never fails the unit: a cold cache beats a runner that will not
+# start.
 set -uo pipefail
 export LC_ALL=C
 
 STALE_DAYS=7   # a cache entry no job has read in a week is not earning its space
-# What the installer itself put in $HOME, and all a reset keeps: the rootless
-# daemon's user unit, the CLI config naming its context, its data root (emptied
-# through Docker, never with rm under a running daemon), and the skeleton.
-KEEP=(.config/systemd .config/docker .local/share/docker .local/share/systemd
-      .docker .bashrc .profile .bash_logout)
+# All a reset keeps of $HOME: the rootless daemon's user unit, the link that
+# enables it, and its data root (emptied through Docker, never with rm under a
+# running daemon). Nothing broader. A job can write anywhere in $HOME, and a
+# Docker CLI plugin, a credential helper, a user unit beside the daemon's or a
+# rewritten .profile, kept here, would run in the next job. Nothing else is
+# needed either: jobs, the wrapper and this script all pass DOCKER_HOST.
+KEEP=(.config/systemd/user/docker.service
+      .config/systemd/user/default.target.wants/docker.service
+      .local/share/docker)
 # Judged child by child rather than whole: ~/.cache holds a dozen unrelated
 # tools' caches, and one of them in daily use must not keep the rest alive.
 SPLIT=(.cache)
@@ -1405,10 +1500,13 @@ evict_stale_tools() {
   return 0
 }
 evict_stale_home() { evict_stale home_entries "$H"; }
-# Safe to take everything: nothing runs between jobs. `system prune` spares
-# named volumes on current Docker, hence the separate `volume prune -a`.
+# Safe to take everything: nothing runs between jobs. Running containers go
+# first, because `system prune` skips them - a job's `--restart always`
+# container would otherwise outlive it. `system prune` also spares named
+# volumes on current Docker, hence the separate `volume prune -a`.
 prune_docker() {
   [[ -S "/run/user/${RUID}/docker.sock" ]] || return 0
+  as_runner timeout 300 sh -c 'docker ps -aq | xargs -r docker rm -f' >/dev/null 2>&1
   as_runner timeout 600 docker system prune -af --volumes >/dev/null 2>&1
   as_runner timeout 300 docker volume prune -af           >/dev/null 2>&1
   as_runner timeout 300 docker builder prune -af          >/dev/null 2>&1
@@ -1433,6 +1531,19 @@ STEPS=(
   tools:wipe_toolcache
   home:reset_home
 )
+
+# An untrusted runner has no cache worth keeping warm, only what a fork PR
+# could leave for the next job: a ~/.gitconfig hook, a poisoned build cache, a
+# Docker CLI plugin, a tampered image. So it gets every step, before every job,
+# whatever the disk says. The wrapper's own post-job Docker wipe cannot be the
+# only defence: the wrapper sits in a tree the job can write.
+reset_runner() {
+  drop_leftover_work
+  prune_docker
+  wipe_toolcache
+  reset_home
+  log "reset to its installed state before the next job (trust=untrusted)"
+}
 
 run_steps() {
   local step fn dir before
@@ -1460,6 +1571,11 @@ main() {
   TC="/opt/hostedtoolcache-${U}"
   [[ -d "$H" && -d "$TC" ]] || exit 0
   WHERE=([work]="${RUNNER_BASE}/${N}" [tools]="$TC" [home]="$H")
+
+  if [[ "${GHA_TRUST:-}" == "untrusted" ]]; then
+    reset_runner
+    exit 0
+  fi
 
   (( $(worst_pct) >= SOFT )) || exit 0       # the common case, in milliseconds
 
@@ -1829,14 +1945,6 @@ assert_can_chdir() {
 phase_systemd() {
   head1 "Writing hardened systemd units"
 
-  # systemd 254+ can back a failing unit off exponentially. A healthy runner
-  # restarting between jobs still waits only RestartSec; a crash-looping one
-  # stretches out to RestartMaxDelaySec instead of hammering every 10s.
-  local backoff=""
-  if (( ${SYSTEMD_VER:-0} >= 254 )); then
-    backoff=$'RestartSteps=6\nRestartMaxDelaySec=300'
-  fi
-
   cat > /etc/systemd/system/gha-runner@.service <<EOF
 [Unit]
 Description=Ephemeral GitHub Actions runner %i
@@ -1845,8 +1953,8 @@ Wants=network-online.target
 # Start limit DISABLED on purpose. An ephemeral runner restarts after every
 # job, and systemd's start limit counts attempts rather than failures - so a
 # healthy runner completing 20 quick jobs in 10 minutes would trip a burst
-# limit and be stopped for doing its job correctly. Broken units are handled
-# by the restart backoff below plus gha-jitreap, not by a start cap.
+# limit and be stopped for doing its job correctly. A broken unit is slowed by
+# gha-jitconfig's own backoff instead, which only a failing runner ever meets.
 StartLimitIntervalSec=0
 
 [Service]
@@ -1857,8 +1965,9 @@ WorkingDirectory=${RUNNER_BASE}/%i
 
 # Root-only, and BEFORE the registration is minted: between two jobs, the one
 # moment this runner is guaranteed idle. A no-op until the disk passes the soft
-# threshold; past it, frees space from this runner's own caches. The "-" keeps
-# disk hygiene from ever being the reason a runner does not start.
+# threshold; past it, frees space from this runner's own caches. An untrusted
+# runner is reset in full here, before every job. The "-" keeps this from ever
+# being the reason a runner does not start.
 ExecStartPre=-+/usr/local/sbin/gha-diskguard %i
 # Root-only: mints the single-use JIT config. The runner user never sees the PAT.
 ExecStartPre=+/usr/local/sbin/gha-jitconfig %i
@@ -1867,7 +1976,10 @@ ExecStopPost=+/usr/local/sbin/gha-jitreap %i
 
 Restart=always
 RestartSec=10
-${backoff}
+# NOT RestartSteps/RestartMaxDelaySec, for the same reason as the start limit:
+# systemd counts every restart and every job ends in one, so a healthy runner
+# that had finished six jobs waited the full RestartMaxDelaySec before each
+# next one. The backoff is gha-jitconfig's, counted in cycles that ran no job.
 # The start timeout covers every ExecStartPre. Emptying a runner's caches under
 # I/O load can take minutes; the 90s default would kill the guard mid-sweep.
 TimeoutStartSec=15min
@@ -1966,6 +2078,8 @@ EOF
   # a re-install that lowered the count still has to clear the instances the
   # new count no longer names.
   rm -f /etc/systemd/system/gha-runner@*.service.d/40-drain.conf
+  # A backoff earned under the old configuration says nothing about the new one.
+  rm -f /run/gha-runner/*.fails
 
   systemctl daemon-reload
   for n in $(seq 1 "$GHA_COUNT"); do
@@ -2076,6 +2190,17 @@ phase_verify() {
       journalctl -u "gha-runner@${n}" -n 15 --no-pager -o cat 2>/dev/null \
         | sed 's/^/      /' || echo "      (no journal)"
       echo "${C_DIM}      -----------------------------${C_R}"
+    fi
+    # To systemd, a runner that keeps failing to start looks like one between
+    # jobs - a clean exit, then auto-restart - because run-helper exits 0 even
+    # on a terminated error. The job-less count gha-jitreap keeps is what gives
+    # it away.
+    local fails
+    fails=$(cat "/run/gha-runner/${n}.fails" 2>/dev/null || echo 0)
+    [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
+    if (( fails >= 3 )); then
+      err "gha-runner@${n}: its last ${fails} starts ran no job - now waiting $(restart_backoff_delay "$fails")s between attempts (see: ${0##*/} diagnose)"
+      fail=1
     fi
   done
 
@@ -2883,12 +3008,13 @@ phase_diagnose() {
     u="${USER_PREFIX}${n}"; uid=$(id -u "$u" 2>/dev/null); d="${RUNNER_BASE}/${n}"
     echo
     echo "${C_B}gha-runner@${n}${C_R}"
-    printf '    state   : %s / %s   result=%s exit=%s restarts=%s\n' \
+    printf '    state   : %s / %s   result=%s exit=%s restarts=%s job-less starts in a row=%s\n' \
       "$(systemctl show -p ActiveState --value "gha-runner@${n}" 2>/dev/null)" \
       "$(systemctl show -p SubState --value "gha-runner@${n}" 2>/dev/null)" \
       "$(systemctl show -p Result --value "gha-runner@${n}" 2>/dev/null)" \
       "$(systemctl show -p ExecMainStatus --value "gha-runner@${n}" 2>/dev/null)" \
-      "$(systemctl show -p NRestarts --value "gha-runner@${n}" 2>/dev/null)"
+      "$(systemctl show -p NRestarts --value "gha-runner@${n}" 2>/dev/null)" \
+      "$(cat "/run/gha-runner/${n}.fails" 2>/dev/null || echo 0)"
     printf '    user    : %s (uid %s)\n' "$u" "${uid:-MISSING}"
     printf '    socket  : %s\n' "$( [[ -S /run/user/${uid}/docker.sock ]] && echo present || echo MISSING )"
     printf '    wrapper : %s\n' "$(stat -c '%a %U:%G' "${d}/run-ephemeral.sh" 2>/dev/null || echo MISSING)"

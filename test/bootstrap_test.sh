@@ -891,13 +891,19 @@ it_evicts_only_what_no_job_has_read_in_a_week() {
 }
 it_evicts_only_what_no_job_has_read_in_a_week
 
-it_resets_a_home_to_what_the_installer_put_there() {
-  # given a home holding the rootless Docker plumbing and what jobs left behind
+it_resets_a_home_to_what_the_rootless_daemon_needs() {
+  # given a home holding the rootless Docker plumbing and what jobs left behind,
+  # including the kind of thing a hostile job would plant for the next one
   fresh_runner_tree
-  local h="${WORK}/g/home"
+  local h="${WORK}/g/home" wants="${WORK}/g/home/.config/systemd/user/default.target.wants"
   put "${h}/.config/systemd/user/docker.service"
-  put "${h}/.docker/config.json"
+  mkdir -p "$wants"
+  ln -s "${h}/.config/systemd/user/docker.service" "${wants}/docker.service"
   put "${h}/.local/share/docker/overlayfs/layer"
+  put "${h}/.config/systemd/user/planted.service"
+  ln -s "${h}/.config/systemd/user/planted.service" "${wants}/planted.service"
+  put "${h}/.docker/config.json"
+  put "${h}/.docker/cli-plugins/docker-buildx"
   put "${h}/.bashrc"
   put "${h}/.profile"
   put "${h}/.config/gh/hosts.yml"
@@ -911,14 +917,21 @@ it_resets_a_home_to_what_the_installer_put_there() {
   guard_probe 'reset_home' >/dev/null
 
   # then the daemon still starts and still has its images, and nothing a job
-  # wrote survives
+  # wrote survives - least of all what would run in the next job
   assert_eq "should keep the rootless daemon's user unit" \
     "yes" "$(exists "${h}/.config/systemd/user/docker.service")"
-  assert_eq "should keep the Docker CLI config naming the rootless context" \
-    "yes" "$(exists "${h}/.docker/config.json")"
+  assert_eq "should keep the link that starts the daemon at boot" \
+    "yes" "$(exists "${wants}/docker.service")"
   assert_eq "should leave the Docker data root to docker, never to rm" \
     "yes" "$(exists "${h}/.local/share/docker/overlayfs/layer")"
-  assert_eq "should keep the skeleton dotfiles" "yes" "$(exists "${h}/.bashrc")"
+  assert_eq "should remove a user unit a job planted beside the daemon's" \
+    "no" "$(exists "${h}/.config/systemd/user/planted.service")"
+  assert_eq "should remove the link that would have started the planted unit" \
+    "no" "$(exists "${wants}/planted.service")"
+  assert_eq "should remove the Docker CLI config, where a credential helper or plugin hides" \
+    "no" "$(exists "${h}/.docker")"
+  assert_eq "should remove login-shell dotfiles a job could have rewritten" \
+    "no" "$(exists "${h}/.profile")"
   assert_eq "should remove a tool's config a job wrote" "no" "$(exists "${h}/.config/gh")"
   assert_eq "should remove an SDK unpacked beside the Docker data root" \
     "no" "$(exists "${h}/.local/share/flutter")"
@@ -927,7 +940,7 @@ it_resets_a_home_to_what_the_installer_put_there() {
   assert_eq "should remove dotfiles a job wrote" "no" "$(exists "${h}/.gitconfig")"
   assert_eq "should remove an ssh config a job could have planted" "no" "$(exists "${h}/.ssh")"
 }
-it_resets_a_home_to_what_the_installer_put_there
+it_resets_a_home_to_what_the_rootless_daemon_needs
 
 it_removes_a_read_only_go_module_cache() {
   # given Go's module cache, which Go makes read-only on purpose
@@ -1015,6 +1028,116 @@ it_does_nothing_below_the_threshold() {
   assert_eq "should take no step below the soft threshold" "" "$got"
 }
 it_does_nothing_below_the_threshold
+
+it_resets_an_untrusted_runner_in_full_whatever_the_disk_says() {
+  # given an untrusted runner on a near-empty disk, its caches read minutes ago
+  fresh_runner_tree
+  local tc="${WORK}/g/tc" h="${WORK}/g/home"
+  put "${WORK}/g/opt/1/_work/repo/checkout"
+  put "${tc}/node/22.0.0/x64/bin/node"
+  put "${h}/.cache/go-build/ab/cd"
+  put "${h}/.gitconfig"
+  put "${h}/.local/share/docker/overlayfs/layer"
+
+  # when the guard readies it for its next job
+  guard_probe 'use_pct() { echo 10; }; reset_runner' >/dev/null
+
+  # then nothing a job left survives, fresh or not: a runner serving fork PRs
+  # has no warm cache worth protecting, only state a job could have planted
+  assert_eq "should drop a workspace a job left behind" \
+    "no" "$(exists "${WORK}/g/opt/1/_work")"
+  assert_eq "should empty the tool cache, versions in use included" \
+    "no" "$(exists "${tc}/node")"
+  assert_eq "should empty the home, caches read minutes ago included" \
+    "no" "$(exists "${h}/.cache/go-build")"
+  assert_eq "should remove config a fork PR could have planted" \
+    "no" "$(exists "${h}/.gitconfig")"
+  assert_eq "should still leave the Docker data root to docker" \
+    "yes" "$(exists "${h}/.local/share/docker/overlayfs/layer")"
+}
+it_resets_an_untrusted_runner_in_full_whatever_the_disk_says
+
+echo
+echo "restart backoff"
+
+# installer_probe <commands> -> runs <commands> with the installer's functions
+# loaded, in a subshell, for the same reason as load_config_probe
+installer_probe() {
+  (
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +e
+    eval "$1"
+  )
+}
+
+it_restarts_a_healthy_runner_at_once_and_backs_a_failing_one_off() {
+  # given runners whose last 0, 1, 2 ... starts in a row ran no job
+  # when the wait before each one's next registration is worked out
+  local got
+  got=$(installer_probe 'for n in 0 1 2 3 5 6 40 junk; do printf "%s " "$(restart_backoff_delay "$n")"; done')
+
+  # then one that just ran a job waits for nothing, and one that keeps failing
+  # waits longer each time, never more than five minutes
+  assert_eq "should wait 0s after a job, then 10s doubling per job-less start, capped at 300s" \
+    "0 10 20 40 160 300 300 0 " "$got"
+}
+it_restarts_a_healthy_runner_at_once_and_backs_a_failing_one_off
+
+it_counts_a_cycle_as_healthy_only_when_a_job_ran() {
+  # given runner trees after four kinds of cycle
+  local r="${WORK}/cycles" c
+  rm -rf "$r"; mkdir -p "$r"/{ran,idle,listener,unminted}/_diag
+  for c in ran idle listener; do touch -d '10 minutes ago' "${r}/${c}/minted"; done
+  touch -d '5 minutes ago'  "${r}/ran/_diag/Worker_20260101-000000-utc.log"      # a job after the mint
+  touch -d '20 minutes ago' "${r}/idle/_diag/Worker_20251231-000000-utc.log"     # only an older job
+  touch -d '5 minutes ago'  "${r}/listener/_diag/Runner_20260101-000000-utc.log" # listener, no job
+  touch -d '5 minutes ago'  "${r}/unminted/_diag/Worker_20260101-000000-utc.log" # never minted
+
+  # when each cycle is judged
+  local got
+  got=$(installer_probe "
+    for c in ran idle listener unminted; do
+      if cycle_ran_a_job \"${r}/\$c\" \"${r}/\$c/minted\"; then printf 'yes '; else printf 'no '; fi
+    done")
+
+  # then only a Worker log written after this cycle's mint counts. The exit
+  # status could not tell: the runner exits 0 whether or not a job ran.
+  assert_eq "should count a cycle healthy only when a job ran after its mint" \
+    "yes no no no " "$got"
+}
+it_counts_a_cycle_as_healthy_only_when_a_job_ran
+
+it_ships_jit_helpers_that_parse_and_carry_the_tested_backoff() {
+  # given the two JIT helpers exactly as the installer writes them
+  local jc="${WORK}/gha-jitconfig" jr="${WORK}/gha-jitreap" rc=0 wait
+  installer_probe 'render_jitconfig' > "$jc" 2>/dev/null
+  installer_probe 'render_jitreap' > "$jr" 2>/dev/null
+
+  # when they are parsed, and the backoff spliced into gha-jitconfig is run
+  { bash -n "$jc" && bash -n "$jr"; } 2>/dev/null || rc=1
+  wait=$(bash -c "$(sed -n '/^restart_backoff_delay ()/,/^}/p' "$jc"); restart_backoff_delay 3" 2>&1)
+
+  # then both are valid, and each carries the one definition this suite tests
+  # rather than a copy that could drift from it
+  assert_eq "should render JIT helpers that parse" "0" "$rc"
+  assert_eq "should splice the tested backoff into gha-jitconfig" "40" "$wait"
+  assert_contains "should splice the tested job check into gha-jitreap" \
+    "$(cat "$jr")" "cycle_ran_a_job ()"
+}
+it_ships_jit_helpers_that_parse_and_carry_the_tested_backoff
+
+it_no_longer_lets_systemd_back_off_healthy_runners() {
+  # given the unit template the installer writes
+  # when it is searched for systemd's own restart backoff
+  local found
+  found=$(grep -cE '^[^#]*(RestartSteps|RestartMaxDelaySec)=[0-9]' "${ROOT}/harden-gha-runners.sh")
+
+  # then there is none: it counts every restart, and every job ends in one, so
+  # it idled each healthy runner five minutes before every job
+  assert_eq "should not set RestartSteps or RestartMaxDelaySec" "0" "$found"
+}
+it_no_longer_lets_systemd_back_off_healthy_runners
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
