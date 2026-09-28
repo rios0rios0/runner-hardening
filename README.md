@@ -34,7 +34,7 @@ arrangement:
 
 - **Rootless Docker per runner** — `container:` jobs and `docker build` both keep working, with no root-owned socket for a job to reach.
 - **Ephemeral JIT registration** — a single-use runner config is minted by a root-only helper at every start, so no credential and no workspace survives a job.
-- **Hardened systemd units** — dedicated user, read-only filesystem outside `ReadWritePaths`, no capabilities, no new privileges, private `/tmp`.
+- **Hardened systemd units** — dedicated user, read-only filesystem outside `ReadWritePaths`, no capabilities, no new privileges, private `/tmp`, and job temp files (`TMPDIR`) in a private `/var/tmp` on disk, not the RAM-backed `/tmp` every runner on the box would otherwise share.
 - **Capacity-aware resource policy** — a lone job may use the whole machine, while an aggregate slice ceiling stops the fleet from exhausting the host and keeps any OOM kill inside CI.
 - **Heavy jobs kept apart** — the first runner on each box also carries a `heavy` label for jobs the size of a CodeQL analysis, and every job sees a `CODEQL_RAM` sized from the box, so two analyses never pile onto one machine.
 - **Self-maintaining** — before every job a disk guard frees space from that runner's own caches once the disk passes 75%, starting with whatever no job has read in a week; a daily janitor trims Docker images, reaps leaked registrations, and warns before the admin PAT expires; a reboot guard applies pending kernel updates only when no runner is busy.

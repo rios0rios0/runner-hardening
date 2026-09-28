@@ -1343,6 +1343,21 @@ it_no_longer_relies_on_an_oomd_that_is_not_installed() {
 }
 it_no_longer_relies_on_an_oomd_that_is_not_installed
 
+it_keeps_job_temp_files_off_the_ram_disk_the_runners_share() {
+  # given the unit template the installer writes
+  # when it is searched for where a job's temp files go
+  local tmpdir private
+  tmpdir=$(grep -cx 'Environment=TMPDIR=/var/tmp' "${ROOT}/harden-gha-runners.sh")
+  private=$(grep -cx 'PrivateTmp=yes' "${ROOT}/harden-gha-runners.sh")
+
+  # then they go to the unit's private /var/tmp, on disk: Ubuntu 26.04's /tmp
+  # is a tmpfs of half the RAM that every runner on the box shares, and a few
+  # concurrent test suites filled it; PrivateTmp is what keeps /var/tmp private
+  assert_eq "should point TMPDIR at the private /var/tmp exactly once" "1" "$tmpdir"
+  assert_eq "should keep PrivateTmp on, which makes /var/tmp private" "1" "$private"
+}
+it_keeps_job_temp_files_off_the_ram_disk_the_runners_share
+
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

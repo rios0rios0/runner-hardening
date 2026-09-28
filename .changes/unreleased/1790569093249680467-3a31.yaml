@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed jobs failing with `No space left on device` while the disk had room. Ubuntu 26.04 mounts `/tmp` as a tmpfs sized at half the RAM, and each runner''s private `/tmp` is only a directory on it, so every runner on a box shared one small RAM disk that a few concurrent test suites filled. Each runner now sets `TMPDIR=/var/tmp`, which is just as private and wiped after every job, but on disk'
+time: '2026-09-28T04:18:13.249456336Z'

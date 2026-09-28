@@ -2054,10 +2054,20 @@ OOMPolicy=continue
 
 # --- hardening -------------------------------------------------------------
 NoNewPrivileges=yes
-# PrivateTmp isolates /tmp per job. Caveat: the rootless daemon has its own
-# /tmp, so a job doing 'docker run -v /tmp/x:/x' binds an empty dir. If a build
-# fails in a way that smells like a missing bind mount, drop this first.
+# PrivateTmp isolates /tmp and /var/tmp per job. Caveat: the rootless daemon
+# has its own, so a job doing 'docker run -v /tmp/x:/x' (or a mktemp path)
+# binds an empty dir. If a build fails in a way that smells like a missing bind
+# mount, drop this first.
 PrivateTmp=yes
+# Job temp files go to /var/tmp, not /tmp. Ubuntu 26.04 mounts /tmp as a tmpfs
+# sized at half the RAM, and PrivateTmp only makes each runner a directory on
+# it, so every runner on the box shares one small RAM disk - concurrent test
+# suites, each with an embedded database under \$TMPDIR, filled it and failed
+# with ENOSPC on a mostly empty disk. A tmpfs page is also RAM, charged to the
+# job's own memory ceiling. The private /var/tmp is wiped at every stop just
+# the same, but it lives on the disk the disk guard watches. Tools that
+# hardcode /tmp still land on the tmpfs.
+Environment=TMPDIR=/var/tmp
 ProtectSystem=strict
 ProtectHome=no
 ProtectProc=invisible
@@ -2123,9 +2133,11 @@ EOF
     install -d -m 0700 -o "$u" -g "$u" "$tc"
     install -d -m 0755 "/etc/systemd/system/gha-runner@${n}.service.d"
     # Drop-ins from earlier sandbox experiments outrank the base unit and would
-    # silently persist across a reinstall.
+    # silently persist across a reinstall. 50-tmpdir.conf carried the TMPDIR
+    # line before the unit did; left behind, it would override any change to it.
     rm -f "/etc/systemd/system/gha-runner@${n}.service.d/20-sandbox-relax.conf" \
-          "/etc/systemd/system/gha-runner@${n}.service.d/30-sandbox-off.conf"
+          "/etc/systemd/system/gha-runner@${n}.service.d/30-sandbox-off.conf" \
+          "/etc/systemd/system/gha-runner@${n}.service.d/50-tmpdir.conf"
   done
 
   write_resource_policy
@@ -2223,7 +2235,7 @@ phase_verify() {
     else
       ok "disk ${pct}% full on ${mnt}"
     fi
-  done < <(df --output=target,pcent /home "$RUNNER_BASE" 2>/dev/null | tail -n +2 | sort -u)
+  done < <(df --output=target,pcent /home "$RUNNER_BASE" /var/tmp 2>/dev/null | tail -n +2 | sort -u)
 
   # OOMPolicy=continue lets an OOM kill fail the job's step and leaves the unit
   # up, so no unit result records one any more - the kernel log still does. A
