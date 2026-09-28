@@ -36,6 +36,7 @@ arrangement:
 - **Ephemeral JIT registration** — a single-use runner config is minted by a root-only helper at every start, so no credential and no workspace survives a job.
 - **Hardened systemd units** — dedicated user, read-only filesystem outside `ReadWritePaths`, no capabilities, no new privileges, private `/tmp`.
 - **Capacity-aware resource policy** — a lone job may use the whole machine, while an aggregate slice ceiling stops the fleet from exhausting the host and keeps any OOM kill inside CI.
+- **Heavy jobs kept apart** — the first runner on each box also carries a `heavy` label for jobs the size of a CodeQL analysis, and every job sees a `CODEQL_RAM` sized from the box, so two analyses never pile onto one machine.
 - **Self-maintaining** — before every job a disk guard frees space from that runner's own caches once the disk passes 75%, starting with whatever no job has read in a week; a daily janitor trims Docker images, reaps leaked registrations, and warns before the admin PAT expires; a reboot guard applies pending kernel updates only when no runner is busy.
 - **Fleet driver** — `fleet.sh` runs any mode on every machine in `fleet.conf` over SSH, in parallel, with per-host logs and a pass/fail summary.
 - **Diagnostics that name the cause** — `diagnose`, `verify` and a leave-one-out `sandbox-probe` that identifies the exact systemd directive breaking a build.
@@ -147,6 +148,8 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 | `GHA_TRUST`              | `internal` keeps caches warm between jobs; `untrusted` resets the runner's home, tool cache, Docker and workspace before every job |
 | `GHA_COUNT`              | runner count, or `auto` to size it from the box's own CPU and RAM         |
 | `GHA_OLD_USER`           | the over-privileged account to dismantle, or `none`                       |
+| `GHA_HEAVY_RUNNERS`      | how many runners, from runner 1, also carry the label `heavy`; `0` for none (default `1`) — see [Memory](#memory) |
+| `GHA_CODEQL_RAM`         | the `CODEQL_RAM`, in MB, every job sees: `auto` (default) sizes it from the box, `off` leaves CodeQL to size itself |
 | `GHA_YES`                | answer every confirmation with yes                                        |
 | `GHA_FORCE_DEPRIVILEGE`  | de-privilege an account the installer protects — read the warning first   |
 | `GHA_DRAIN_TIMEOUT`      | seconds to let running jobs finish before a re-install stops the runners (default `1800`) |
@@ -194,6 +197,7 @@ group_id = 1
 trust    = internal
 labels   = self-hosted,linux,x64,internal
 runners  = auto
+heavy_runners = 1
 old_user = none
 
 [build-01]
@@ -233,6 +237,20 @@ jobs:
       - run: npm ci && npm test
 ```
 
+Send the heaviest job — a CodeQL analysis — to the `heavy` runners, so a box
+never runs more of them at once than it has heavy runners:
+
+```yaml
+jobs:
+  codeql:
+    runs-on: [self-hosted, linux, x64, internal, heavy]
+```
+
+`runs-on` is a hard selector: a job asking for `heavy` waits until a runner
+carrying it is free, and forever if none exists. When the analysis comes from a
+reusable workflow, that workflow has to let you give its CodeQL job a `runs-on`
+of its own.
+
 ## Operating the fleet
 
 Both timers are installed and enabled by the installer:
@@ -262,6 +280,40 @@ starts in a row have run no job, and `diagnose` shows the count.
 systemd's own `RestartSteps` backoff is deliberately not used: it counts every
 restart, and an ephemeral runner restarts after every job, so it made healthy
 runners wait the full 5 minutes before each one.
+
+### Memory
+
+Each runner may use most of the machine on its own, and `gha.slice` caps what
+all of them use together, so the operating system always keeps a working set.
+What the cap cannot do is choose which jobs share it. A CodeQL analysis sizes
+itself from the whole machine rather than from its runner, and on a mid-sized
+codebase it fills its runner's memory ceiling and swaps on top: two of them on
+one box overrun the slice, swap fills, and the kernel kills one. Two settings
+keep them apart:
+
+- **`heavy_runners`** (default `1`): runners 1 to N also register with the label
+  `heavy`. Send CodeQL there (see [the workflow example](#using-the-runners-in-a-workflow))
+  and no more than N analyses ever share a box; the next one queues. Every other
+  job still runs on every runner, the heavy ones included.
+- **`codeql_ram`** (default `auto`): every job sees `CODEQL_RAM`, which
+  `codeql-action` prefers to its own whole-machine estimate. `auto` gives what a
+  heavy job can take while each other runner keeps 1 GB, split between the
+  heavy runners and never above a runner's own ceiling. With no heavy runner it
+  is each runner's fair share. A number of MB is taken as given; `off` lets
+  CodeQL size itself again.
+
+When the kernel does kill a job's process, only that process dies: the step
+fails as killed (exit code 137) and the job ends as a failure. systemd's
+default would instead stop the whole runner, which the job logs as "The runner
+has received a shutdown signal" — or, when the killed process sits below the
+step, such as a compiler or an extractor, reports as cancelled. Nothing in the
+unit's state records the kill afterwards, so `verify` reads it from the kernel
+log and warns on any in the last 24 hours:
+
+```bash
+journalctl -k -g oom-kill               # which process, in which runner
+sudo ./harden-gha-runners.sh verify     # warns on any OOM kill in the last day
+```
 
 ### Disk
 

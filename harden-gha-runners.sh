@@ -481,6 +481,18 @@ wizard() {
   # --- labels --------------------------------------------------------------
   ask GHA_LABELS "Runner labels (comma separated)" "self-hosted,linux,x64,${GHA_TRUST}"
 
+  # --- heavy jobs (see HEAVY JOBS) -----------------------------------------
+  # Leading zeros are refused, not trimmed: bash arithmetic reads 08 as octal
+  # and dies on it far from here.
+  ask GHA_HEAVY_RUNNERS "Runners that also take heavy jobs (label 'heavy'; 0 for none)" "1"
+  [[ "$GHA_HEAVY_RUNNERS" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || die "the heavy runner count must be 0 or a positive integer, got '${GHA_HEAVY_RUNNERS}'"
+  (( GHA_HEAVY_RUNNERS > GHA_COUNT )) \
+    && warn "${GHA_HEAVY_RUNNERS} heavy runners on a box with ${GHA_COUNT}: every runner takes heavy jobs" || true
+  ask GHA_CODEQL_RAM "Memory CodeQL may use, in MB ('auto' sizes it from this box, 'off' leaves it to CodeQL)" "auto"
+  [[ "$GHA_CODEQL_RAM" =~ ^(auto|off|[1-9][0-9]*)$ ]] \
+    || die "the CodeQL memory budget must be 'auto', 'off' or a number of MB, got '${GHA_CODEQL_RAM}'"
+
   # --- old user ------------------------------------------------------------
   if [[ -z "${GHA_OLD_USER:-}" ]]; then
     if (( ${#DETECTED_OLD_USERS[@]} == 1 )); then
@@ -613,6 +625,8 @@ GHA_LABELS="${GHA_LABELS}"
 GHA_COUNT="${GHA_COUNT}"
 GHA_TRUST="${GHA_TRUST}"
 GHA_OLD_USER="${GHA_OLD_USER:-none}"
+GHA_HEAVY_RUNNERS="${GHA_HEAVY_RUNNERS:-1}"
+GHA_CODEQL_RAM="${GHA_CODEQL_RAM:-auto}"
 WIPE_DOCKER_AFTER_JOB="${WIPE_DOCKER_AFTER_JOB}"
 SHARE_TOOLCACHE="${SHARE_TOOLCACHE}"
 RUNNER_NAME_PREFIX="$(hostname -s)"
@@ -629,7 +643,7 @@ EOF
 # The answers save_config writes. Sourcing the env file would assign all of
 # them unconditionally, so these are the ones a caller has to be protected from.
 CONFIG_ANSWERS=(GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT
-                GHA_TRUST GHA_OLD_USER)
+                GHA_TRUST GHA_OLD_USER GHA_HEAVY_RUNNERS GHA_CODEQL_RAM)
 
 # Set by load_config: 1 when the caller supplied any answer or a PAT, so the
 # stored file was a fallback rather than the whole truth.
@@ -685,11 +699,17 @@ load_config() {
 
 confirm_plan() {
   local budget=$(( (MEM_MB - 1500) / GHA_COUNT ))
+  compute_resource_policy
   head1 "Plan"
   cat <<EOF
   target        ${GHA_ORG}${GHA_REPO:+/$GHA_REPO}  (group ${GHA_GROUP_ID})
   labels        ${GHA_LABELS}
   runners       ${GHA_COUNT}, as users ${USER_PREFIX}1 .. ${USER_PREFIX}${GHA_COUNT}
+  heavy jobs    $( (( ${GHA_HEAVY_RUNNERS:-1} > 0 )) \
+                     && echo "runners 1 .. ${GHA_HEAVY_RUNNERS:-1} also carry the label 'heavy'" \
+                     || echo "no runner carries the label 'heavy'" )
+  CodeQL        $( [[ -n "${RP_CODEQL:-}" ]] && echo "every job sees CODEQL_RAM=${RP_CODEQL} MB" \
+                     || echo "CODEQL_RAM unset - CodeQL sizes itself from the whole box" )
   per runner    ~${budget} MB memory ceiling, 130% CPU quota
   trust level   ${GHA_TRUST}
                 wipe docker state after every job: ${WIPE_DOCKER_AFTER_JOB}
@@ -1207,6 +1227,37 @@ cycle_ran_a_job() {
 }
 
 # ===========================================================================
+# HEAVY JOBS
+#
+# The resource policy caps what all the runners on a box use together, not how
+# the jobs inside that cap are mixed, and one kind of job does not mix. A CodeQL
+# analysis sizes itself from the whole machine and, on a mid-sized codebase,
+# fills its runner's entire memory ceiling and swaps on top. Two on one box
+# overrun gha.slice, swap fills, and the kernel kills one of them. A runner
+# cannot refuse such a job: it only learns what it was given once it has it.
+#
+# Where the job is sent can prevent the overlap. The first GHA_HEAVY_RUNNERS
+# runners on a box also register with the label `heavy`, so a workflow that
+# sends its analysis to `[self-hosted, heavy]` never has more than that many
+# of them on one box - a second one queues instead of stacking. Every other job
+# still runs on every runner, the heavy ones included.
+#
+# Spliced into gha-jitconfig with `declare -f`, like the backoff above, so the
+# labels a runner registers with are the ones the test suite checks.
+# ===========================================================================
+
+# runner_labels <runner number> <labels> <heavy runner count> -> this runner's labels
+runner_labels() {
+  local n="$1" list="$2" heavy="$3"
+  [[ "$heavy" =~ ^[0-9]+$ ]] || heavy=0
+  if [[ "$n" =~ ^[1-9][0-9]*$ ]] && (( n <= 10#$heavy )) \
+     && [[ ",${list}," != *",heavy,"* ]]; then
+    list="${list},heavy"
+  fi
+  printf '%s\n' "$list"
+}
+
+# ===========================================================================
 # ROOT-ONLY JIT HELPER
 #
 # Rendered by functions rather than written inline, so the test suite can
@@ -1223,6 +1274,7 @@ N="$1"
 . /etc/github-runner/env
 HELPER
   declare -f restart_backoff_delay
+  declare -f runner_labels
   cat <<'HELPER'
 
 # Wait before minting only if the last cycles ran no job; see RESTART BACKOFF
@@ -1251,10 +1303,14 @@ else
   URL="https://api.github.com/repos/${GHA_ORG}/${GHA_REPO}/actions/runners/generate-jitconfig"
 fi
 
+# An env file written before heavy runners existed has no GHA_HEAVY_RUNNERS;
+# the installer's default for it is 1, so that is what an absent value means.
+LABELS=$(runner_labels "$N" "$GHA_LABELS" "${GHA_HEAVY_RUNNERS:-1}")
+
 BODY=$(jq -nc \
   --arg n "${RUNNER_NAME_PREFIX}-${N}-$(date +%s)" \
   --argjson g "$GHA_GROUP_ID" \
-  --argjson l "$(jq -Rc 'split(",")' <<<"$GHA_LABELS")" \
+  --argjson l "$(jq -Rc 'split(",")' <<<"$LABELS")" \
   '{name:$n, runner_group_id:$g, labels:$l, work_folder:"_work"}')
 
 RESP=$(curl -fsS -X POST "$URL" \
@@ -1987,6 +2043,14 @@ TimeoutStartSec=15min
 # child. mixed would signal only the wrapper and leave the runner to be killed.
 KillMode=control-group
 TimeoutStopSec=300
+# continue, not systemd's default of stop. When the kernel OOM-kills a job's
+# process, stop tears the whole unit down: the runner logs "The runner has
+# received a shutdown signal", which reads as if somebody stopped it, and when
+# the killed process sits below a step's own - a compiler, an extractor - the
+# job is even reported as cancelled. With continue only that process dies, the
+# step fails as killed (SIGKILL, exit 137), and the job ends as the failure it
+# is. The runner still exits after the job, as it does after every job.
+OOMPolicy=continue
 
 # --- hardening -------------------------------------------------------------
 NoNewPrivileges=yes
@@ -2067,10 +2131,11 @@ EOF
   write_resource_policy
 
   for n in $(seq 1 "$GHA_COUNT"); do
-    ok "runner ${n}: >=${RP_FAIR} MB guaranteed, up to ${RP_CEILING} MB, CPU weight 100"
+    ok "runner ${n}: >=${RP_FAIR} MB guaranteed, up to ${RP_CEILING} MB, CPU weight 100, labels $(runner_labels "$n" "$GHA_LABELS" "${GHA_HEAVY_RUNNERS:-1}")"
   done
   log "one busy runner may use all ${CPU_COUNT} cores and up to ${RP_CEILING} MB"
   log "all ${GHA_COUNT} together are capped at ${RP_AGGREGATE} MB by ${GHA_SLICE}"
+  [[ -n "${RP_CODEQL:-}" ]] && log "every job sees CODEQL_RAM=${RP_CODEQL} MB (codeql_ram=${GHA_CODEQL_RAM:-auto})" || true
 
   # The drain override outranks the unit file just rewritten above, so it has
   # to go before the reload or every runner would come back with Restart=no
@@ -2159,6 +2224,23 @@ phase_verify() {
       ok "disk ${pct}% full on ${mnt}"
     fi
   done < <(df --output=target,pcent /home "$RUNNER_BASE" 2>/dev/null | tail -n +2 | sort -u)
+
+  # OOMPolicy=continue lets an OOM kill fail the job's step and leaves the unit
+  # up, so no unit result records one any more - the kernel log still does. A
+  # warning, not a failure: the box is fine, a job was not. Counted in the
+  # runner units and in the runners' own slices, where container jobs live.
+  local uids="" ooms
+  for n in $(seq 1 "${GHA_COUNT}"); do
+    uid=$(id -u "${USER_PREFIX}${n}" 2>/dev/null) && uids+="${uids:+|}${uid}" || true
+  done
+  ooms=$(journalctl -k --since -24h --no-pager -o cat 2>/dev/null | grep -F 'oom-kill:constraint' \
+         | grep -cE "task_memcg=/(${GHA_SLICE}/|user\.slice/user-(${uids:-none})\.slice/)" || true)
+  if (( ooms > 0 )); then
+    warn "${ooms} job process(es) OOM-killed on this box in the last 24h (journalctl -k -g oom-kill)"
+    warn "  jobs are outgrowing the memory they share - see heavy_runners and codeql_ram"
+  else
+    ok "no job OOM-killed on this box in the last 24h"
+  fi
 
   for n in $(seq 1 "${GHA_COUNT}"); do
     u="${USER_PREFIX}${n}"; uid=$(id -u "$u" 2>/dev/null || echo "")
@@ -2333,7 +2415,37 @@ phase_reap() {
 # ===========================================================================
 GHA_SLICE="gha.slice"
 
-compute_resource_policy() {   # sets RP_FAIR RP_CEILING RP_AGGREGATE RP_SYSMIN
+# CodeQL sizes its memory from the whole machine: codeql-action takes the
+# host's total RAM less a gigabyte, and cannot see the cgroup a runner lives
+# in. So every analysis on a box believes it has the box to itself, fills its
+# runner's ceiling, and swaps on top. codeql-action gives a CODEQL_RAM already
+# in its environment precedence over that estimate, so every runner exports
+# one: what a heavy job may take while each other runner keeps 1 GB, shared
+# between the heavy runners, and never past a runner's own ceiling - beyond
+# that it only buys swap. With no heavy runner any runner may be running an
+# analysis, so each gets the fair share. An explicit number is taken as given.
+#
+# codeql_ram_budget <auto|off|MB> <aggregate> <fair> <ceiling> <runners> <heavy runners>
+#   -> the MB to export as CODEQL_RAM; nothing for `off`
+codeql_ram_budget() {
+  local want="$1" aggregate="$2" fair="$3" ceiling="$4" count="$5" heavy="$6" budget
+  [[ "$want" == "off" ]] && return 0
+  if [[ "$want" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$want"; return 0
+  fi
+  [[ "$heavy" =~ ^[0-9]+$ ]] || heavy=0
+  heavy=$(( 10#$heavy > count ? count : 10#$heavy ))
+  if (( heavy == 0 )); then
+    budget=$fair
+  else
+    budget=$(( (aggregate - (count - heavy) * 1024) / heavy ))
+  fi
+  (( budget > ceiling )) && budget=$ceiling || true
+  (( budget < fair )) && budget=$fair || true
+  printf '%s\n' "$budget"
+}
+
+compute_resource_policy() {   # sets RP_FAIR RP_CEILING RP_AGGREGATE RP_SYSMIN RP_CODEQL
   local reserve
   reserve=$(( 1024 + 200 * GHA_COUNT ))          # OS + one rootless daemon each
   RP_FAIR=$(( (MEM_MB - reserve) / GHA_COUNT ))
@@ -2345,6 +2457,31 @@ compute_resource_policy() {   # sets RP_FAIR RP_CEILING RP_AGGREGATE RP_SYSMIN
   (( RP_AGGREGATE < RP_FAIR )) && RP_AGGREGATE=$RP_FAIR || true
   RP_SYSMIN=512
   (( MEM_MB >= 8000 )) && RP_SYSMIN=768 || true
+  RP_CODEQL=$(codeql_ram_budget "${GHA_CODEQL_RAM:-auto}" "$RP_AGGREGATE" "$RP_FAIR" \
+                                "$RP_CEILING" "$GHA_COUNT" "${GHA_HEAVY_RUNNERS:-1}")
+}
+
+# Runner n's own drop-in. Rendered rather than written inline, so the test
+# suite can read what a runner is given without root.
+render_instance_dropin() { # render_instance_dropin <n> <user> <uid> <tool cache>
+  local n="$1" u="$2" uid="$3" tc="$4"
+  cat <<EOF
+[Service]
+Slice=${GHA_SLICE}
+ReadWritePaths=${RUNNER_BASE}/${n} /home/${u} ${tc} /run/user/${uid}
+Environment=DOCKER_HOST=unix:///run/user/${uid}/docker.sock
+Environment=XDG_RUNTIME_DIR=/run/user/${uid}
+# Non-container job steps run as children of this unit, so this is the cgroup
+# that governs most builds. Weight, not quota: no ceiling on a lone job.
+CPUWeight=100
+IOWeight=100
+MemoryLow=${RP_FAIR}M
+MemoryMax=${RP_CEILING}M
+EOF
+  if [[ -n "${RP_CODEQL:-}" ]]; then
+    printf '%s\n' "# What a CodeQL analysis may use; see codeql_ram_budget in the installer." \
+                  "Environment=CODEQL_RAM=${RP_CODEQL}"
+  fi
 }
 
 write_resource_policy() {
@@ -2367,11 +2504,11 @@ CPUAccounting=yes
 CPUWeight=100
 IOAccounting=yes
 IOWeight=100
-# Kill the worst-offending runner on sustained memory pressure, before the
-# machine starts swap-thrashing. A clean job failure beats a locked-up host.
-ManagedOOMMemoryPressure=kill
-ManagedOOMMemoryPressureLimit=60%
-ManagedOOMSwap=kill
+# No ManagedOOM* policy, on purpose. systemd-oomd ships as its own package on
+# current Ubuntu and a server install lacks it, so such a policy never acted.
+# Where oomd does run, it SIGKILLs a runner's whole unit, which GitHub reports
+# as a runner that lost communication. The kernel's OOM killer, confined to
+# this slice, kills one process, and the runner reports the step it failed.
 EOF
   chmod 0644 "/etc/systemd/system/${GHA_SLICE}"
 
@@ -2391,19 +2528,8 @@ EOF
     u="${USER_PREFIX}${n}"; uid=$(id -u "$u" 2>/dev/null) || continue
     tc="/opt/hostedtoolcache-${u}"
     install -d -m 0755 "/etc/systemd/system/gha-runner@${n}.service.d"
-    cat > "/etc/systemd/system/gha-runner@${n}.service.d/10-instance.conf" <<EOF
-[Service]
-Slice=${GHA_SLICE}
-ReadWritePaths=${RUNNER_BASE}/${n} /home/${u} ${tc} /run/user/${uid}
-Environment=DOCKER_HOST=unix:///run/user/${uid}/docker.sock
-Environment=XDG_RUNTIME_DIR=/run/user/${uid}
-# Non-container job steps run as children of this unit, so this is the cgroup
-# that governs most builds. Weight, not quota: no ceiling on a lone job.
-CPUWeight=100
-IOWeight=100
-MemoryLow=${RP_FAIR}M
-MemoryMax=${RP_CEILING}M
-EOF
+    render_instance_dropin "$n" "$u" "$uid" "$tc" \
+      > "/etc/systemd/system/gha-runner@${n}.service.d/10-instance.conf"
     install -d -m 0755 "/etc/systemd/system/user-${uid}.slice.d"
     cat > "/etc/systemd/system/user-${uid}.slice.d/10-gha-limits.conf" <<EOF
 [Slice]
@@ -2413,18 +2539,12 @@ IOWeight=100
 MemoryLow=${RP_FAIR}M
 MemoryMax=${RP_CEILING}M
 TasksMax=8192
-ManagedOOMMemoryPressure=kill
-ManagedOOMMemoryPressureLimit=60%
 EOF
     chmod 0644 "/etc/systemd/system/gha-runner@${n}.service.d/10-instance.conf" \
                "/etc/systemd/system/user-${uid}.slice.d/10-gha-limits.conf"
   done
 
   systemctl daemon-reload
-  # oomd is what turns "box thrashes for five minutes" into "one job fails".
-  systemctl enable --now systemd-oomd.service >/dev/null 2>&1 \
-    && ok "systemd-oomd active (kills the worst CI cgroup under pressure)" \
-    || warn "systemd-oomd unavailable - the kernel OOM killer is the fallback"
 }
 
 # ===========================================================================
@@ -2441,6 +2561,7 @@ phase_retune() {
   echo "    per runner ceiling    : ${RP_CEILING} MB  (a lone job may take this much)"
   echo "    ALL runners together  : ${RP_AGGREGATE} MB  (${GHA_SLICE} aggregate cap)"
   echo "    OS floor              : ${RP_SYSMIN} MB   (system.slice MemoryMin - keeps sshd alive)"
+  echo "    CodeQL                : ${RP_CODEQL:-unset} MB  (CODEQL_RAM every job sees; codeql_ram=${GHA_CODEQL_RAM:-auto})"
   echo "    CPU                   : weight 100, no quota - a lone job gets all ${CPU_COUNT} cores"
   echo
 
@@ -2456,7 +2577,7 @@ phase_retune() {
       >/dev/null 2>&1 || true
   done
   ok "applied to running units"
-  warn "the ${GHA_SLICE} grouping takes effect as each runner restarts (after its next job)"
+  warn "the ${GHA_SLICE} grouping and CODEQL_RAM take effect as each runner restarts (after its next job)"
   echo "  ${C_DIM}force it now with: systemctl restart 'gha-runner@*'${C_R}"
   echo
   echo "  ${C_DIM}Verify: systemctl show gha-runner@1 -p Slice -p CPUWeight -p MemoryMax -p MemoryHigh${C_R}"
@@ -3139,6 +3260,15 @@ summary() {
 
 EOF
 
+  if (( ${GHA_HEAVY_RUNNERS:-1} > 0 )); then
+    cat <<EOF
+  ${C_B}Send the heaviest job - a CodeQL analysis - to the heavy runners${C_R}, so no
+  more than ${GHA_HEAVY_RUNNERS:-1} of them ever share this box:
+        runs-on: [${GHA_LABELS//,/, }, heavy]
+
+EOF
+  fi
+
   if [[ "${GHA_OLD_USER:-none}" != "none" ]] && id "${GHA_OLD_USER}" &>/dev/null; then
     cat <<EOF
   ${C_B}The old user is locked but still present.${C_R} Nothing depends on it now.
@@ -3155,7 +3285,8 @@ EOF
 
     ${C_CYN}GHA_SCOPE=${GHA_SCOPE} GHA_ORG=${GHA_ORG}${GHA_REPO:+ GHA_REPO=${GHA_REPO}} \\
     GHA_GROUP_ID=${GHA_GROUP_ID} GHA_LABELS='${GHA_LABELS}' GHA_TRUST=${GHA_TRUST} \\
-    GHA_COUNT=${GHA_COUNT} GHA_OLD_USER=${GHA_OLD_USER:-none} GHA_YES=1 GHA_PAT='<your-pat>' \\
+    GHA_COUNT=${GHA_COUNT} GHA_OLD_USER=${GHA_OLD_USER:-none} GHA_HEAVY_RUNNERS=${GHA_HEAVY_RUNNERS:-1} \\
+    GHA_CODEQL_RAM=${GHA_CODEQL_RAM:-auto} GHA_YES=1 GHA_PAT='<your-pat>' \\
     sudo -E ./harden-gha-runners.sh${C_R}
 
   ${C_B}Still worth doing, outside this box:${C_R}
