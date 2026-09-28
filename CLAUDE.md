@@ -19,7 +19,7 @@ Ubuntu image plus `ssh` provides.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets use
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 153 assertions, no VM needed)
+make test    # parse check + the test suite (~3s, 160 assertions, no VM needed)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -108,6 +108,7 @@ when the killed process sits below a step's own, as a *cancelled* job.
 | `/opt/hostedtoolcache-gha<n>` | the runner's private hosted tool cache (`AGENT_TOOLSDIRECTORY` when `trust=internal`) |
 | `/run/gha-runner/<n>.jit`   | the current single-use registration; tmpfs, gone on reboot         |
 | `/run/gha-runner/<n>.fails` | cycles in a row that ran no job — drives the restart backoff; tmpfs |
+| `/var/tmp/systemd-private-*-gha-runner@<n>.service-*/tmp` | the job's `TMPDIR` (`/var/tmp` inside the unit): private, on disk, removed at every stop |
 | `/var/lib/github-runner`    | installer state                                                    |
 
 ### `fleet.sh` is a transport, not a second installer
@@ -191,6 +192,13 @@ is data) → `select_hosts` → per host: `build_env` emits the `GHA_*` exports 
   kernel's OOM killer to CI, and `OOMPolicy=continue` makes its kill a failed
   step. Heavy jobs are kept apart by routing (`runner_labels`) and sized by
   `CODEQL_RAM` (`codeql_ram_budget`), not by killing them sooner.
+- **`TMPDIR=/var/tmp` in the unit is deliberate.** Ubuntu 26.04 mounts `/tmp`
+  as a tmpfs sized at half the RAM, and `PrivateTmp=` only carves each runner a
+  directory on it, so all runners on a box share one small RAM disk that a few
+  concurrent test suites fill (ENOSPC with the disk mostly empty). The private
+  `/var/tmp` is just as isolated and wiped at every stop, but on disk. Do not
+  point `TMPDIR` back at `/tmp`, and do not drop `PrivateTmp=`, which is what
+  makes `/var/tmp` private.
 - **Anything that changes system state is untestable here.** It has to be
   exercised on a disposable Ubuntu VM — say so rather than claiming a change is
   verified when only `make test` has run.
@@ -220,10 +228,12 @@ repository) and drift silently:
 functions — `parse_config`, `build_env`, `build_bootstrap`, `load_config`,
 `should_preload_config`, `runner_state_between_jobs` (the pure core of the
 `verify` health gate, which excuses a runner caught auto-restarting between jobs
-instead of reporting it down), the restart backoff's `restart_backoff_delay`
-and `cycle_ran_a_job` and the heavy-job `runner_labels`, all also checked as
-spliced into the rendered JIT helpers, and `compute_resource_policy` with
-`render_instance_dropin` for the CodeQL budget a runner exports. The bootstrap cases are not simulations: each runs the
+instead of reporting it down), `report_disk` (`verify`'s line per disk, which
+promises the disk guard's sweep only where runner caches live), the restart
+backoff's `restart_backoff_delay` and `cycle_ran_a_job` and the heavy-job
+`runner_labels`, all also checked as spliced into the rendered JIT helpers, and
+`compute_resource_policy` with `render_instance_dropin` for the CodeQL budget a
+runner exports. The bootstrap cases are not simulations: each runs the
 real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer that reports what it received. Only the SSH
 hop is substituted. The disk-guard cases render `gha-diskguard` from

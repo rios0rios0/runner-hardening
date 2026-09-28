@@ -20,7 +20,7 @@ the full architecture map. This file is the fast orientation for Copilot Chat.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets need
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 153 assertions, no VM)
+make test    # parse check + the test suite (~3s, 160 assertions, no VM)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -118,6 +118,10 @@ function, or just run the whole suite.
   a stop of the whole runner ("The runner has received a shutdown signal"), and
   systemd-oomd is absent from a server install. Heavy jobs are kept apart by the
   `heavy` label and sized by the `CODEQL_RAM` each runner exports.
+- **`TMPDIR=/var/tmp` in the unit is deliberate.** Ubuntu 26.04's `/tmp` is a
+  tmpfs of half the RAM that `PrivateTmp=` shares between every runner on the
+  box; concurrent test suites filled it. The private `/var/tmp` is on disk and
+  wiped at every stop just the same.
 - **Every wizard question must also be answerable from the environment.**
   `fleet.sh` drives the installer over SSH with no pty, so an interactive-only
   prompt is unreachable to the fleet.
@@ -143,9 +147,9 @@ These sets are duplicated by design and drift silently:
 
 `test/bootstrap_test.sh` sources both scripts and exercises their real
 functions (`parse_config`, `build_env`, `build_bootstrap`, `load_config`,
-`should_preload_config`, `runner_state_between_jobs`, `restart_backoff_delay`,
-`cycle_ran_a_job`, `runner_labels`, `compute_resource_policy`,
-`render_instance_dropin`). The bootstrap cases run
+`should_preload_config`, `runner_state_between_jobs`, `report_disk`,
+`restart_backoff_delay`, `cycle_ran_a_job`, `runner_labels`,
+`compute_resource_policy`, `render_instance_dropin`). The bootstrap cases run
 the real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer — only the SSH hop is substituted. The
 disk-guard cases render `gha-diskguard` from `render_diskguard` and drive its
