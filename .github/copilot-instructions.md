@@ -20,7 +20,7 @@ the full architecture map. This file is the fast orientation for Copilot Chat.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets need
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 122 assertions, no VM)
+make test    # parse check + the test suite (~3s, 153 assertions, no VM)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -110,9 +110,14 @@ function, or just run the whole suite.
   clears is job-writable, so `as_runner` drops to the runner user (`setpriv`)
   for every deletion; a planted symlink then reaches no further than the job
   could delete itself. Do not move a deletion back to root.
-- **`restart_backoff_delay` and `cycle_ran_a_job` are spliced into the
-  generated JIT helpers with `declare -f`.** Edit them in the installer and
-  keep them self-contained: nothing else of the installer travels with them.
+- **`restart_backoff_delay`, `cycle_ran_a_job` and `runner_labels` are spliced
+  into the generated JIT helpers with `declare -f`.** Edit them in the installer
+  and keep them self-contained: nothing else of the installer travels with them.
+- **`OOMPolicy=continue` and the absence of any `ManagedOOM*` policy are
+  deliberate.** systemd's default `stop` turned one OOM-killed job process into
+  a stop of the whole runner ("The runner has received a shutdown signal"), and
+  systemd-oomd is absent from a server install. Heavy jobs are kept apart by the
+  `heavy` label and sized by the `CODEQL_RAM` each runner exports.
 - **Every wizard question must also be answerable from the environment.**
   `fleet.sh` drives the installer over SSH with no pty, so an interactive-only
   prompt is unreachable to the fleet.
@@ -139,7 +144,8 @@ These sets are duplicated by design and drift silently:
 `test/bootstrap_test.sh` sources both scripts and exercises their real
 functions (`parse_config`, `build_env`, `build_bootstrap`, `load_config`,
 `should_preload_config`, `runner_state_between_jobs`, `restart_backoff_delay`,
-`cycle_ran_a_job`). The bootstrap cases run
+`cycle_ran_a_job`, `runner_labels`, `compute_resource_policy`,
+`render_instance_dropin`). The bootstrap cases run
 the real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer — only the SSH hop is substituted. The
 disk-guard cases render `gha-diskguard` from `render_diskguard` and drive its

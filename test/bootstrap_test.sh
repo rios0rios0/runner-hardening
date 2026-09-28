@@ -66,6 +66,8 @@ echo "COUNT=${GHA_COUNT:-<unset>}"
 echo "LABELS=${GHA_LABELS:-<unset>}"
 echo "TRUST=${GHA_TRUST:-<unset>}"
 echo "GROUP=${GHA_GROUP_ID:-<unset>}"
+echo "HEAVY=${GHA_HEAVY_RUNNERS:-<unset>}"
+echo "CODEQL=${GHA_CODEQL_RAM:-<unset>}"
 echo "YES=${GHA_YES:-<unset>}"
 echo "PAT=${GHA_PAT:-<unset>}"
 echo "DIRMODE=$(stat -c %a "$(dirname "$0")")"
@@ -196,6 +198,30 @@ it_rejects_an_invalid_trust_level() {
     "$out" "trust must be 'internal' or 'untrusted'"
 }
 it_rejects_an_invalid_trust_level
+
+it_rejects_a_heavy_job_answer_the_installer_would_misread() {
+  # given heavy-job answers the installer cannot use: a count with a leading
+  # zero (bash arithmetic reads 08 as octal and dies), a negative one, and a
+  # budget that is neither a number nor a keyword
+  local out_count out_negative out_budget
+  printf '[defaults]\nbecome = none\norg = o\nheavy_runners = 08\n\n[host1]\nhost = h\n' > "${WORK}/heavy08.conf"
+  printf '[defaults]\nbecome = none\norg = o\nheavy_runners = -1\n\n[host1]\nhost = h\n' > "${WORK}/heavyneg.conf"
+  printf '[defaults]\nbecome = none\norg = o\ncodeql_ram = lots\n\n[host1]\nhost = h\n' > "${WORK}/codeqlbad.conf"
+
+  # when the environment for each host is built
+  out_count=$( reset_config; MODE=install; ADMIN_PAT=x; parse_config "${WORK}/heavy08.conf"; build_env host1 2>&1 )
+  out_negative=$( reset_config; MODE=install; ADMIN_PAT=x; parse_config "${WORK}/heavyneg.conf"; build_env host1 2>&1 )
+  out_budget=$( reset_config; MODE=install; ADMIN_PAT=x; parse_config "${WORK}/codeqlbad.conf"; build_env host1 2>&1 )
+
+  # then each fails before anything is sent anywhere
+  assert_contains "should reject a heavy runner count with a leading zero" \
+    "$out_count" "heavy_runners must be 0 or a positive integer"
+  assert_contains "should reject a negative heavy runner count" \
+    "$out_negative" "heavy_runners must be 0 or a positive integer"
+  assert_contains "should reject a CodeQL budget that is not auto, off or a number" \
+    "$out_budget" "codeql_ram must be 'auto', 'off' or a number of MB"
+}
+it_rejects_a_heavy_job_answer_the_installer_would_misread
 
 it_requires_an_org_for_install() {
   # given a config with no org
@@ -386,8 +412,24 @@ it_sends_only_what_the_config_specifies() {
   assert_not_contains "should not invent a label set"    "$out" "GHA_LABELS"
   assert_not_contains "should not invent an old user"    "$out" "GHA_OLD_USER"
   assert_not_contains "should not invent a scope"        "$out" "GHA_SCOPE"
+  assert_not_contains "should not invent a heavy runner count" "$out" "GHA_HEAVY_RUNNERS"
+  assert_not_contains "should not invent a CodeQL budget"      "$out" "GHA_CODEQL_RAM"
 }
 it_sends_only_what_the_config_specifies
+
+it_delivers_the_heavy_job_answers() {
+  # given a fleet entry that sets both heavy-job keys
+  printf '[defaults]\nbecome = none\norg = your-org\nheavy_runners = 2\ncodeql_ram = off\n\n[host1]\nhost = 10.0.0.1\n' \
+    > "${WORK}/heavy.conf"
+
+  # when the bootstrap runs on the far side
+  local out; out="$(run_bootstrap "${WORK}/heavy.conf" install 'fixture-pat-placeholder')"
+
+  # then the installer receives both, and a keyword budget arrives as the word
+  assert_contains "should deliver the heavy runner count" "$out" "HEAVY=2"
+  assert_contains "should deliver the CodeQL budget"      "$out" "CODEQL=off"
+}
+it_delivers_the_heavy_job_answers
 
 # parse_config calls die on a missing file, and these tests call it directly
 # rather than in a subshell -- so a fixture written by a sibling test would exit
@@ -589,7 +631,7 @@ it_records_whether_the_caller_overrode_the_stored_config() {
   # given the three shapes an install can take
   setup_stored_config
   local none labels pat
-  none=$(load_config_probe   'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_PAT')
+  none=$(load_config_probe   'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_HEAVY_RUNNERS GHA_CODEQL_RAM GHA_PAT')
   labels=$(load_config_probe 'unset GHA_PAT; GHA_LABELS="self-hosted,linux,x64,internal,gpu"')
   pat=$(load_config_probe    'unset GHA_LABELS; GHA_PAT="caller-pat"')
 
@@ -705,7 +747,7 @@ it_survives_nounset_with_nothing_supplied() {
 
   # when the configuration is loaded with nounset in force
   local got
-  got=$(load_config_probe 'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_PAT')
+  got=$(load_config_probe 'unset GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT GHA_TRUST GHA_OLD_USER GHA_HEAVY_RUNNERS GHA_CODEQL_RAM GHA_PAT')
 
   # then it completes rather than dying on an unbound variable
   assert_eq "should load under nounset when the caller supplied nothing" \
@@ -728,6 +770,33 @@ it_uses_the_stored_answers_when_the_caller_sends_nothing() {
     "3" "$(cut -d'|' -f2 <<<"$got")"
 }
 it_uses_the_stored_answers_when_the_caller_sends_nothing
+
+it_keeps_the_callers_heavy_job_answers_over_the_stored_file() {
+  # given a host that stores both heavy-job answers
+  setup_stored_config
+  printf 'GHA_HEAVY_RUNNERS="1"\nGHA_CODEQL_RAM="auto"\n' >> "${WORK}/inst_env"
+
+  # when an unattended install sends only a new heavy runner count (nounset
+  # kept on, as in load_config_probe)
+  local got
+  got=$(
+    # shellcheck source=/dev/null
+    source "${ROOT}/harden-gha-runners.sh"
+    set +e
+    ENV_FILE="${WORK}/inst_env"; PAT_FILE="${WORK}/inst_pat"
+    GHA_HEAVY_RUNNERS=2; unset GHA_CODEQL_RAM
+    load_config >/dev/null 2>&1
+    printf '%s|%s|%s' "${GHA_HEAVY_RUNNERS:-}" "${GHA_CODEQL_RAM:-}" "${CONFIG_OVERRIDDEN:-}"
+  )
+
+  # then both are stored answers like any other: the one sent wins, the one
+  # left out keeps the host's value, and the run knows it was overridden
+  assert_eq "should keep a caller's heavy runner count over the stored one" "2" "${got%%|*}"
+  assert_eq "should keep the stored CodeQL budget when the caller sends none" \
+    "auto" "$(cut -d'|' -f2 <<<"$got")"
+  assert_eq "should flag a heavy-job answer as an override" "1" "${got##*|}"
+}
+it_keeps_the_callers_heavy_job_answers_over_the_stored_file
 
 echo
 echo "runner unit health"
@@ -1138,6 +1207,141 @@ it_no_longer_lets_systemd_back_off_healthy_runners() {
   assert_eq "should not set RestartSteps or RestartMaxDelaySec" "0" "$found"
 }
 it_no_longer_lets_systemd_back_off_healthy_runners
+
+echo
+echo "heavy jobs and memory"
+
+it_labels_only_the_first_heavy_runners_as_heavy() {
+  # given a box whose first runner is set aside for heavy jobs
+  # when each runner's labels are worked out
+  local got
+  got=$(installer_probe '
+    printf "%s|" "$(runner_labels 1 self-hosted,x64 1)" "$(runner_labels 2 self-hosted,x64 1)" \
+                 "$(runner_labels 1 self-hosted,x64 0)" "$(runner_labels 1 self-hosted,heavy 1)" \
+                 "$(runner_labels 1 self-hosted,x64 junk)"')
+
+  # then only runner 1 carries `heavy`, a count of 0 labels nobody, a label set
+  # that already has it is not given a second, and a count that is not a
+  # number is taken as none rather than as all
+  assert_eq "should label runner 1 heavy when one runner is set aside" \
+    "self-hosted,x64,heavy" "$(cut -d'|' -f1 <<<"$got")"
+  assert_eq "should leave runner 2 as it is when only one runner is set aside" \
+    "self-hosted,x64" "$(cut -d'|' -f2 <<<"$got")"
+  assert_eq "should label nobody heavy when no runner is set aside" \
+    "self-hosted,x64" "$(cut -d'|' -f3 <<<"$got")"
+  assert_eq "should not add heavy twice" \
+    "self-hosted,heavy" "$(cut -d'|' -f4 <<<"$got")"
+  assert_eq "should treat a count that is not a number as none" \
+    "self-hosted,x64" "$(cut -d'|' -f5 <<<"$got")"
+}
+it_labels_only_the_first_heavy_runners_as_heavy
+
+it_ships_a_jit_helper_that_registers_with_the_tested_labels() {
+  # given gha-jitconfig exactly as the installer writes it
+  local jc="${WORK}/gha-jitconfig-labels" labels
+  installer_probe 'render_jitconfig' > "$jc" 2>/dev/null
+
+  # when the label function spliced into it is run
+  labels=$(bash -c "$(sed -n '/^runner_labels ()/,/^}/p' "$jc"); runner_labels 1 self-hosted 1" 2>&1)
+
+  # then it is the one this suite tests, and what it works out - not the
+  # host-wide GHA_LABELS - is what the registration is sent with
+  assert_eq "should splice the tested label function into gha-jitconfig" "self-hosted,heavy" "$labels"
+  assert_contains "should work out this runner's labels with runner_labels" \
+    "$(cat "$jc")" 'LABELS=$(runner_labels "$N" "$GHA_LABELS"'
+  assert_contains "should register with the labels it worked out" \
+    "$(cat "$jc")" "split(\",\")' <<<\"\$LABELS\")"
+}
+it_ships_a_jit_helper_that_registers_with_the_tested_labels
+
+# budget_probe <MB of RAM> <runners> <heavy runners> <codeql_ram> -> the CODEQL_RAM exported
+budget_probe() {
+  installer_probe "MEM_MB=$1 GHA_COUNT=$2 GHA_HEAVY_RUNNERS=$3 GHA_CODEQL_RAM=$4
+                   compute_resource_policy; printf '%s' \"\$RP_CODEQL\""
+}
+
+it_gives_codeql_what_one_heavy_job_can_take() {
+  # given the two box shapes an analysis was OOM-killed on - 8 GB with three
+  # runners and 12 GB with five, one heavy runner each - and the first with two
+  # when the CodeQL budget is worked out
+  local small large shared
+  small=$(budget_probe 7936 3 1 auto)
+  large=$(budget_probe 11955 5 1 auto)
+  shared=$(budget_probe 7936 3 2 auto)
+
+  # then it is the slice's aggregate less 1 GB for each other runner, split
+  # between the heavy ones - not the whole box less 1 GB, which is what CodeQL
+  # takes when left to size itself, and what overran gha.slice
+  assert_eq "should budget an 8 GB, 3-runner box at its aggregate less 2 GB" "4564" "$small"
+  assert_eq "should budget a 12 GB, 5-runner box at its aggregate less 4 GB" "6335" "$large"
+  assert_eq "should split the budget between two heavy runners" "2794" "$shared"
+}
+it_gives_codeql_what_one_heavy_job_can_take
+
+it_keeps_the_codeql_budget_between_a_fair_share_and_a_runner_ceiling() {
+  # given a one-runner box, a box with no heavy runner, and more heavy runners
+  # than the box has runners
+  # when the CodeQL budget is worked out
+  local lone none excess
+  lone=$(budget_probe 4000 1 1 auto)
+  none=$(budget_probe 7936 3 0 auto)
+  excess=$(budget_probe 7936 3 9 auto)
+
+  # then it never passes the runner's own ceiling, where it could only buy swap;
+  # with no runner set aside any of them may run an analysis, so each gets the
+  # fair share; and a heavy count past the runner count means every runner
+  assert_eq "should cap the budget at a runner's memory ceiling" "2776" "$lone"
+  assert_eq "should give the fair share when no runner is set aside" "2104" "$none"
+  assert_eq "should treat more heavy runners than runners as every runner" "2204" "$excess"
+}
+it_keeps_the_codeql_budget_between_a_fair_share_and_a_runner_ceiling
+
+it_exports_the_codeql_budget_to_every_job_unless_switched_off() {
+  # given the drop-in of a runner on an 8 GB box, with the budget worked out,
+  # set by hand, and switched off
+  local auto explicit off
+  auto=$(installer_probe 'MEM_MB=7936 GHA_COUNT=3 GHA_HEAVY_RUNNERS=1 GHA_CODEQL_RAM=auto
+                          compute_resource_policy; render_instance_dropin 2 gha2 1003 /opt/hostedtoolcache-gha2')
+  explicit=$(budget_probe 7936 3 1 3000)
+  off=$(installer_probe 'MEM_MB=7936 GHA_COUNT=3 GHA_HEAVY_RUNNERS=1 GHA_CODEQL_RAM=off
+                         compute_resource_policy; render_instance_dropin 2 gha2 1003 /opt/hostedtoolcache-gha2')
+
+  # then the unit hands the budget to every job, where codeql-action prefers it
+  # over its own estimate; a number set by hand is taken as given; and `off`
+  # leaves no CODEQL_RAM at all, so CodeQL sizes itself as it always did
+  assert_contains "should export the budget in the runner's drop-in" "$auto" "Environment=CODEQL_RAM=4564"
+  assert_eq "should take a budget set by hand as given" "3000" "$explicit"
+  assert_not_contains "should export nothing when the budget is off" "$off" "CODEQL_RAM"
+  assert_contains "should still render the rest of the drop-in when it is off" "$off" "MemoryMax=5365M"
+}
+it_exports_the_codeql_budget_to_every_job_unless_switched_off
+
+it_lets_an_oom_kill_fail_the_step_instead_of_stopping_the_runner() {
+  # given the unit template the installer writes
+  # when it is searched for the OOM policy
+  local found
+  found=$(grep -cx 'OOMPolicy=continue' "${ROOT}/harden-gha-runners.sh")
+
+  # then an OOM kill leaves the unit running: with systemd's default of stop it
+  # tore the runner down, the job read "The runner has received a shutdown
+  # signal", and a kill below a step's own process reported it as cancelled
+  assert_eq "should set OOMPolicy=continue exactly once" "1" "$found"
+}
+it_lets_an_oom_kill_fail_the_step_instead_of_stopping_the_runner
+
+it_no_longer_relies_on_an_oomd_that_is_not_installed() {
+  # given the installer
+  # when it is searched for systemd-oomd policy, outside comments
+  local policy enable
+  policy=$(grep -cE '^[^#]*ManagedOOM' "${ROOT}/harden-gha-runners.sh")
+  enable=$(grep -cE '^[^#]*systemctl .*systemd-oomd' "${ROOT}/harden-gha-runners.sh")
+
+  # then there is none: oomd is absent from a server install, so the policy
+  # never acted, and where it does run it SIGKILLs a whole runner
+  assert_eq "should set no ManagedOOM policy" "0" "$policy"
+  assert_eq "should not try to enable systemd-oomd" "0" "$enable"
+}
+it_no_longer_relies_on_an_oomd_that_is_not_installed
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"

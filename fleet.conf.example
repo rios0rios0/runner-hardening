@@ -45,6 +45,15 @@ runners     = auto                    # auto = size from the box's own CPU and R
                                       # Omitting the key entirely leaves an
                                       # installed host on its current count;
                                       # `auto` asks for re-sizing every run.
+heavy_runners = 1                     # runners 1..N also carry the label `heavy`.
+                                      # Send CodeQL to [self-hosted, heavy] and no
+                                      # more than N analyses ever share one box.
+                                      # 0 labels none. A first install uses 1.
+codeql_ram  = auto                    # MB a CodeQL analysis may use, exported to
+                                      # every job as CODEQL_RAM. auto = what one
+                                      # heavy job can take while each other
+                                      # runner keeps 1 GB; off = let CodeQL size
+                                      # itself from the whole box.
 old_user    = none                    # the over-privileged account to dismantle, or none
 
 # --- hosts -----------------------------------------------------------------

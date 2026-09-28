@@ -19,7 +19,7 @@ Ubuntu image plus `ssh` provides.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets use
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 122 assertions, no VM needed)
+make test    # parse check + the test suite (~3s, 153 assertions, no VM needed)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -56,12 +56,13 @@ as a heredoc. To change the janitor's behaviour you edit the heredoc inside
 
 | Generated artefact                       | Written by            | Role                                                          |
 |------------------------------------------|-----------------------|---------------------------------------------------------------|
-| `/usr/local/sbin/gha-jitconfig`          | `phase_token_helper` (text from `render_jitconfig`) | root-only; waits out any restart backoff, then mints one single-use JIT config |
+| `/usr/local/sbin/gha-jitconfig`          | `phase_token_helper` (text from `render_jitconfig`) | root-only; waits out any restart backoff, then mints one single-use JIT config, adding the `heavy` label for runners 1..`GHA_HEAVY_RUNNERS` |
 | `/usr/local/sbin/gha-jitreap`            | `phase_token_helper` (text from `render_jitreap`) | root-only; counts job-less cycles, deletes the registration when a runner stops |
 | `/usr/local/sbin/gha-diskguard`          | `phase_diskguard` (text from `render_diskguard`) | root-only; before each job, frees that runner's caches under disk pressure, or resets it in full when `trust=untrusted` |
 | `/opt/actions-runner/<n>/run-ephemeral.sh` | `phase_runners`     | runs exactly one job, then cleans up and exits                |
 | `/etc/systemd/system/gha-runner@.service`| `phase_systemd`       | the hardened unit template                                    |
 | `/etc/systemd/system/gha.slice`          | `write_resource_policy` | aggregate CPU/memory boundary for all runners                |
+| `/etc/systemd/system/gha-runner@<n>.service.d/10-instance.conf` | `write_resource_policy` (text from `render_instance_dropin`) | the runner's paths, memory floor and ceiling, and the `CODEQL_RAM` every job sees |
 | `/usr/local/sbin/gha-janitor` + timer    | `phase_janitor`       | daily disk trim, orphan reap, PAT expiry check                |
 | `/usr/local/sbin/gha-reboot-if-idle` + timer | `install_reboot_guard` | reboots only in-window and only when no runner is busy    |
 
@@ -91,7 +92,10 @@ they count every restart, and every job ends in one, so they made each healthy
 runner wait the full maximum before every job. The backoff is gha-jitconfig's,
 keyed on cycles that ran no job — a `_diag/Worker_*.log` newer than the cycle's
 `.jit` — because the exit status cannot tell: run-helper exits 0 even on a
-terminated error.
+terminated error. `OOMPolicy=continue` is deliberate too: systemd's default of
+`stop` turned the kernel killing one job process into a stop of the whole unit,
+which the runner reports as "The runner has received a shutdown signal" — and,
+when the killed process sits below a step's own, as a *cancelled* job.
 
 ### Where state lives on a hardened box
 
@@ -175,11 +179,18 @@ is data) → `select_hosts` → per host: `build_env` emits the `GHA_*` exports 
   `trust=untrusted` it resets the runner in full before every job — that
   reset, not the wrapper's post-job wipe, is what keeps one fork PR's state
   from the next, because the wrapper sits in a tree the job can write.
-- **`restart_backoff_delay` and `cycle_ran_a_job` are spliced into the
-  generated JIT helpers with `declare -f`.** Edit them in the installer, and
-  keep them self-contained: the helpers carry those two functions and nothing
-  else of the installer, so a call to another installer function or global
-  would parse fine and fail at runner start.
+- **`restart_backoff_delay`, `cycle_ran_a_job` and `runner_labels` are spliced
+  into the generated JIT helpers with `declare -f`.** Edit them in the
+  installer, and keep them self-contained: the helpers carry those functions and
+  nothing else of the installer, so a call to another installer function or
+  global would parse fine and fail at runner start.
+- **systemd-oomd is not part of the design.** It is a separate package absent
+  from a server install, so the `ManagedOOM*` policy that used to sit on
+  `gha.slice` never acted; where it does run it SIGKILLs a runner's whole unit,
+  which GitHub reports as a lost runner. The slice's `MemoryMax` confines the
+  kernel's OOM killer to CI, and `OOMPolicy=continue` makes its kill a failed
+  step. Heavy jobs are kept apart by routing (`runner_labels`) and sized by
+  `CODEQL_RAM` (`codeql_ram_budget`), not by killing them sooner.
 - **Anything that changes system state is untestable here.** It has to be
   exercised on a disposable Ubuntu VM — say so rather than claiming a change is
   verified when only `make test` has run.
@@ -209,8 +220,10 @@ repository) and drift silently:
 functions — `parse_config`, `build_env`, `build_bootstrap`, `load_config`,
 `should_preload_config`, `runner_state_between_jobs` (the pure core of the
 `verify` health gate, which excuses a runner caught auto-restarting between jobs
-instead of reporting it down), and the restart backoff's `restart_backoff_delay`
-and `cycle_ran_a_job`, also checked as spliced into the rendered JIT helpers. The bootstrap cases are not simulations: each runs the
+instead of reporting it down), the restart backoff's `restart_backoff_delay`
+and `cycle_ran_a_job` and the heavy-job `runner_labels`, all also checked as
+spliced into the rendered JIT helpers, and `compute_resource_policy` with
+`render_instance_dropin` for the CodeQL budget a runner exports. The bootstrap cases are not simulations: each runs the
 real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer that reports what it received. Only the SSH
 hop is substituted. The disk-guard cases render `gha-diskguard` from
