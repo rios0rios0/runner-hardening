@@ -19,7 +19,7 @@ Ubuntu image plus `ssh` provides.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets use
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 155 assertions, no VM needed)
+make test    # parse check + the test suite (~3s, 160 assertions, no VM needed)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -228,10 +228,12 @@ repository) and drift silently:
 functions — `parse_config`, `build_env`, `build_bootstrap`, `load_config`,
 `should_preload_config`, `runner_state_between_jobs` (the pure core of the
 `verify` health gate, which excuses a runner caught auto-restarting between jobs
-instead of reporting it down), the restart backoff's `restart_backoff_delay`
-and `cycle_ran_a_job` and the heavy-job `runner_labels`, all also checked as
-spliced into the rendered JIT helpers, and `compute_resource_policy` with
-`render_instance_dropin` for the CodeQL budget a runner exports. The bootstrap cases are not simulations: each runs the
+instead of reporting it down), `report_disk` (`verify`'s line per disk, which
+promises the disk guard's sweep only where runner caches live), the restart
+backoff's `restart_backoff_delay` and `cycle_ran_a_job` and the heavy-job
+`runner_labels`, all also checked as spliced into the rendered JIT helpers, and
+`compute_resource_policy` with `render_instance_dropin` for the CodeQL budget a
+runner exports. The bootstrap cases are not simulations: each runs the
 real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
 side, against a stand-in installer that reports what it received. Only the SSH
 hop is substituted. The disk-guard cases render `gha-diskguard` from

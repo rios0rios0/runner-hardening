@@ -2065,8 +2065,9 @@ PrivateTmp=yes
 # suites, each with an embedded database under \$TMPDIR, filled it and failed
 # with ENOSPC on a mostly empty disk. A tmpfs page is also RAM, charged to the
 # job's own memory ceiling. The private /var/tmp is wiped at every stop just
-# the same, but it lives on the disk the disk guard watches. Tools that
-# hardcode /tmp still land on the tmpfs.
+# the same, but it is on disk: on most boxes the one the runners' caches share,
+# so the disk guard keeps room on it. A separate /var gets no such sweep. Tools
+# that hardcode /tmp still land on the tmpfs.
 Environment=TMPDIR=/var/tmp
 ProtectSystem=strict
 ProtectHome=no
@@ -2197,6 +2198,25 @@ runner_unit_healthy() { # runner_unit_healthy <n>
   runner_state_between_jobs "$st" "$res" "$code"
 }
 
+# One filesystem's line in `verify`; returns 1 past the hard threshold. Given
+# numbers, not a df to ask, so the split-disk case is testable on a box with
+# one disk. <caches> is 1 when runner caches live on it, the only thing the
+# disk guard frees. A separate /var holds the jobs' temp files but no cache, so
+# its warning must not promise the sweep.
+report_disk() { # report_disk <mount> <pct> <soft> <hard> <caches>
+  local mnt="$1" pct="$2" soft="$3" hard="$4" caches="$5"
+  if (( pct >= hard )); then
+    err "disk ${pct}% full on ${mnt} - past the ${hard}% hard threshold, jobs are about to fail with ENOSPC"
+    return 1
+  elif (( pct < soft )); then
+    ok "disk ${pct}% full on ${mnt}"
+  elif (( caches )); then
+    warn "disk ${pct}% full on ${mnt} - past ${soft}%, so each runner frees its own caches before its next job"
+  else
+    warn "disk ${pct}% full on ${mnt} - past ${soft}%; it takes the jobs' temp files but holds no runner cache, so the disk guard frees nothing here"
+  fi
+}
+
 phase_verify() {
   head1 "Verification"
   local fail=0 n u uid
@@ -2219,22 +2239,19 @@ phase_verify() {
     && ok "PAT is 0600 root:root" \
     || { err "PAT file permissions are wrong"; fail=1; }
 
-  # Measured where the runners keep their caches. Past the soft threshold each
-  # runner empties its own before its next job, so a disk that is still past
-  # the hard one means that is not keeping up - and a box can be one large job
-  # from failing every job with ENOSPC while every other check here is green.
+  # Measured where the runners keep their caches, and where their jobs keep
+  # temp files. Past the soft threshold each runner empties its own caches
+  # before its next job, so a disk that is still past the hard one means that
+  # is not keeping up - and a box can be one large job from failing every job
+  # with ENOSPC while every other check here is green.
   local soft="${GHA_DISK_SOFT:-75}" hard="${GHA_DISK_HARD:-90}" mnt pct
+  local -A cached=()
+  while read -r mnt; do cached[$mnt]=1; done \
+    < <(df --output=target /home "$RUNNER_BASE" 2>/dev/null | tail -n +2)
   while read -r mnt pct; do
     pct="${pct//%/}"
     [[ "$pct" =~ ^[0-9]+$ ]] || continue
-    if (( pct >= hard )); then
-      err "disk ${pct}% full on ${mnt} - past the ${hard}% hard threshold, jobs are about to fail with ENOSPC"
-      fail=1
-    elif (( pct >= soft )); then
-      warn "disk ${pct}% full on ${mnt} - past ${soft}%, so each runner frees its own caches before its next job"
-    else
-      ok "disk ${pct}% full on ${mnt}"
-    fi
+    report_disk "$mnt" "$pct" "$soft" "$hard" "${cached[$mnt]:-0}" || fail=1
   done < <(df --output=target,pcent /home "$RUNNER_BASE" /var/tmp 2>/dev/null | tail -n +2 | sort -u)
 
   # OOMPolicy=continue lets an OOM kill fail the job's step and leaves the unit

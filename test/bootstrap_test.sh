@@ -1343,6 +1343,9 @@ it_no_longer_relies_on_an_oomd_that_is_not_installed() {
 }
 it_no_longer_relies_on_an_oomd_that_is_not_installed
 
+echo
+echo "job temp files"
+
 it_keeps_job_temp_files_off_the_ram_disk_the_runners_share() {
   # given the unit template the installer writes
   # when it is searched for where a job's temp files go
@@ -1357,6 +1360,38 @@ it_keeps_job_temp_files_off_the_ram_disk_the_runners_share() {
   assert_eq "should keep PrivateTmp on, which makes /var/tmp private" "1" "$private"
 }
 it_keeps_job_temp_files_off_the_ram_disk_the_runners_share
+
+it_promises_the_cache_sweep_only_where_the_runner_caches_are() {
+  # given two disks past the soft threshold: the one the runners' caches are
+  # on, and a separate /var that holds only the jobs' temp files
+  # when verify reports each
+  local caches var
+  caches=$(installer_probe 'report_disk / 80 75 90 1')
+  var=$(installer_probe 'report_disk /var 80 75 90 0')
+
+  # then only the first promises the per-runner sweep: the disk guard frees
+  # runner caches and nothing else, so on a split-disk box the /var line would
+  # promise a remediation that cannot run
+  assert_contains "should promise the sweep on the disk that holds the caches" "$caches" "each runner frees its own caches"
+  assert_not_contains "should not promise the sweep on a /var that holds none" "$var" "frees its own caches"
+  assert_contains "should say the disk guard frees nothing on that /var" "$var" "the disk guard frees nothing here"
+}
+it_promises_the_cache_sweep_only_where_the_runner_caches_are
+
+it_fails_verify_on_a_full_disk_whether_or_not_it_holds_caches() {
+  # given a separate /var past the hard threshold, and a cache disk under the
+  # soft one
+  # when verify reports each, with the status it returns
+  local full fine
+  full=$(installer_probe 'report_disk /var 95 75 90 0 2>&1; echo "status=$?"')
+  fine=$(installer_probe 'report_disk / 40 75 90 1 2>&1; echo "status=$?"')
+
+  # then the full /var fails verify, since every job's TMPDIR is on it, and
+  # the other passes
+  assert_contains "should fail verify on a /var past the hard threshold" "$full" "status=1"
+  assert_contains "should pass a disk under the soft threshold" "$fine" "status=0"
+}
+it_fails_verify_on_a_full_disk_whether_or_not_it_holds_caches
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"

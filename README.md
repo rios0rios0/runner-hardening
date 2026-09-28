@@ -346,7 +346,9 @@ the link that enables it, and its data root, which is emptied through Docker
 rather than deleted under a running daemon. Every deletion runs as the runner's
 own user, never as root, so a symlink a job plants in its home cannot make the
 guard delete anything the job could not. `verify` warns past 75% and fails past
-90%.
+90%, on the disks that hold these caches and on the one that holds the jobs'
+temp files (`/var/tmp`). A separate `/var` has no cache for the guard to free,
+and its warning says so.
 
 ```bash
 journalctl -t gha-diskguard               # what the guard freed, and when
