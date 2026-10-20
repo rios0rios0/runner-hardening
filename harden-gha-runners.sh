@@ -1100,10 +1100,14 @@ phase_prereqs() {
   # unzip is not optional: actions/cache, actions/download-artifact and every
   # action that ships a .zip release shell out to it, and a fresh Ubuntu server
   # image does not have it. Without it those steps fail mid-job with a bare
-  # "unzip: command not found" that reads like a broken action.
-  apt-get install -y -qq curl jq unzip ca-certificates gnupg uidmap dbus-user-session \
-    fuse-overlayfs slirp4netns iptables acl libicu-dev util-linux >/dev/null
-  ok "base packages (including unzip, required by actions/cache and friends)"
+  # "unzip: command not found" that reads like a broken action. make and
+  # python3-venv are the same trap one step later: jobs call make directly, and
+  # tools that build their own virtualenv (semgrep) need ensurepip, which Ubuntu
+  # ships only in python3-venv. An image that lacks them fails those jobs with
+  # "make: command not found" or "ensurepip is not available".
+  apt-get install -y -qq curl jq unzip make python3 python3-venv ca-certificates gnupg \
+    uidmap dbus-user-session fuse-overlayfs slirp4netns iptables acl libicu-dev util-linux >/dev/null
+  ok "base packages (including unzip, make and python3-venv, which jobs call directly)"
 
   if ! command -v dockerd-rootless-setuptool.sh &>/dev/null; then
     log "installing docker-ce and the rootless extras"
