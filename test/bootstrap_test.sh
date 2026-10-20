@@ -1393,6 +1393,23 @@ it_fails_verify_on_a_full_disk_whether_or_not_it_holds_caches() {
 }
 it_fails_verify_on_a_full_disk_whether_or_not_it_holds_caches
 
+it_retires_only_the_runners_a_lowered_count_no_longer_names() {
+  # given a box that ran five runners and is now configured for three, a box
+  # already at its count, and an instance list with a two-digit number in it
+  # when the installer works out which instances to retire
+  local lowered same wide
+  lowered=$(installer_probe 'printf "1\n2\n3\n4\n5\n" | instances_above 3 | tr "\n" " "')
+  same=$(installer_probe 'printf "1\n2\n" | instances_above 3 | tr "\n" " "')
+  wide=$(installer_probe 'printf "2\n10\n" | instances_above 3 | tr "\n" " "')
+
+  # then only the instances above the new count go, and the comparison is
+  # numeric: a lexical one would keep runner 10 on a box sized for 3
+  assert_eq "should retire the instances above the new count" "4 5 " "$lowered"
+  assert_eq "should retire nothing on a box at or under its count" "" "$same"
+  assert_eq "should compare instance numbers numerically" "10 " "$wide"
+}
+it_retires_only_the_runners_a_lowered_count_no_longer_names
+
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

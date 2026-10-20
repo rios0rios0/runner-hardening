@@ -849,6 +849,39 @@ existing_runner_instances() {
     | sort -n
 }
 
+# Of the instance numbers on stdin, the ones a box configured for <count>
+# runners no longer names. Numeric, not lexical: runner 10 is above a count of 3.
+instances_above() { # instances_above <count>
+  local n
+  while read -r n; do
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n > $1 )) && printf '%s\n' "$n"
+  done
+  return 0
+}
+
+# Take one runner off this box completely: unit, drop-ins, rootless Docker,
+# user, home, runner tree and tool cache. The user manager is stopped before the
+# pkill, not by it: a manager killed mid-shutdown is left behind as a failed
+# user@<uid>.service once its user no longer exists.
+remove_runner() { # remove_runner <n>
+  local n="$1" u uid
+  u="${USER_PREFIX}${n}"; uid=$(id -u "$u" 2>/dev/null || echo "")
+  systemctl disable --now "gha-runner@${n}.service" 2>/dev/null || true
+  systemctl reset-failed "gha-runner@${n}.service" 2>/dev/null || true
+  rm -rf "/etc/systemd/system/gha-runner@${n}.service.d"   # includes 20-sandbox-relax.conf
+  if [[ -n "$uid" ]]; then
+    rm -rf "/etc/systemd/system/user-${uid}.slice.d"
+    as_user "$u" systemctl --user disable --now docker.service 2>/dev/null || true
+    loginctl disable-linger "$u" 2>/dev/null || true
+    systemctl stop "user@${uid}.service" 2>/dev/null || true
+    pkill -KILL -u "$u" 2>/dev/null || true
+    userdel -r "$u" 2>/dev/null || true
+    sed -i "/^${u}:/d" /etc/subuid /etc/subgid 2>/dev/null || true
+    systemctl reset-failed "user@${uid}.service" 2>/dev/null || true
+  fi
+  rm -rf "${RUNNER_BASE:?}/${n:?}" "/opt/hostedtoolcache-${u:?}"
+}
+
 # Is this runner executing a job? Runner.Listener runs the whole time a unit is
 # up, so its presence proves nothing; Runner.Worker exists only while a job is
 # actually running. Each runner owns its own UNIX user, which is what makes
@@ -2172,6 +2205,20 @@ EOF
   DRAINED_UNITS=()
   trap - EXIT
   ok "${GHA_COUNT} runner unit(s) enabled and started"
+
+  # A re-install that lowered the count drained the instances above it, but
+  # left them enabled: the next boot would start them again, each minting a
+  # fresh registration on a box no longer sized for it, and their users, homes
+  # and tool caches would keep their disk. Retire them completely - only now,
+  # with the drain's EXIT trap gone, which would otherwise restart them.
+  local retired=0
+  while read -r n; do
+    remove_runner "$n"
+    rm -f "/run/gha-runner/${n}.jit"
+    retired=1
+    ok "retired runner ${n}: this box now runs ${GHA_COUNT}"
+  done < <(existing_runner_instances | instances_above "$GHA_COUNT")
+  if (( retired )); then systemctl daemon-reload; fi
 }
 
 # ===========================================================================
@@ -3219,20 +3266,9 @@ phase_uninstall() {
   load_config || die "no configuration at ${ENV_FILE}"
   ask_yn "Remove all runners, users and homes created by this installer?" n || die "aborted"
 
-  local n u uid
+  local n
   for n in $(seq 1 "${GHA_COUNT}"); do
-    u="${USER_PREFIX}${n}"; uid=$(id -u "$u" 2>/dev/null || echo "")
-    systemctl disable --now "gha-runner@${n}.service" 2>/dev/null || true
-    rm -rf "/etc/systemd/system/gha-runner@${n}.service.d"   # includes 20-sandbox-relax.conf
-    [[ -n "$uid" ]] && rm -rf "/etc/systemd/system/user-${uid}.slice.d" || true
-    if [[ -n "$uid" ]]; then
-      as_user "$u" systemctl --user disable --now docker.service 2>/dev/null || true
-      loginctl disable-linger "$u" 2>/dev/null || true
-      pkill -KILL -u "$u" 2>/dev/null || true
-      userdel -r "$u" 2>/dev/null || true
-      sed -i "/^${u}:/d" /etc/subuid /etc/subgid 2>/dev/null || true
-    fi
-    rm -rf "${RUNNER_BASE:?}/${n:?}" "/opt/hostedtoolcache-${u:?}"
+    remove_runner "$n"
     ok "removed runner ${n}"
   done
   systemctl disable --now gha-janitor.timer gha-reboot.timer 2>/dev/null || true

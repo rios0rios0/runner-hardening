@@ -20,7 +20,7 @@ the full architecture map. This file is the fast orientation for Copilot Chat.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets need
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 160 assertions, no VM)
+make test    # parse check + the test suite (~3s, 163 assertions, no VM)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -149,9 +149,10 @@ These sets are duplicated by design and drift silently:
 functions (`parse_config`, `build_env`, `build_bootstrap`, `load_config`,
 `should_preload_config`, `runner_state_between_jobs`, `report_disk`,
 `restart_backoff_delay`, `cycle_ran_a_job`, `runner_labels`,
-`compute_resource_policy`, `render_instance_dropin`). The bootstrap cases run
-the real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
-side, against a stand-in installer — only the SSH hop is substituted. The
+`compute_resource_policy`, `render_instance_dropin`, `instances_above`). The
+bootstrap cases run the real bootstrap through a real `bash -s`, exactly as
+`sshd` would on the far side, against a stand-in installer — only the SSH hop
+is substituted. The
 disk-guard cases render `gha-diskguard` from `render_diskguard` and drive its
 eviction steps against a scratch runner tree — only the root-only privilege
 drop is substituted. Cases are
