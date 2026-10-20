@@ -169,7 +169,9 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 ```
 
 `install` applies what `fleet.conf` says: edit `labels` or `runners`, re-run,
-and the hosts converge on the new values. `reconfigure` does the same thing
+and the hosts converge on the new values. Lowering `runners` retires the
+runners above the new count completely (unit, user, home and tool cache), so
+they neither return at the next boot nor keep their disk. `reconfigure` does the same thing
 over the fleet — the two differ only for someone running the installer by hand
 on a box, where `reconfigure` re-asks every question from scratch. A key
 `fleet.conf` omits is **not** sent at all, so each host keeps the answer it
