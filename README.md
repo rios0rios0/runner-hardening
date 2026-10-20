@@ -72,8 +72,9 @@ cp fleet.conf.example fleet.conf   # edit: hosts, org, labels
   `repo` for a single repository), or a fine-grained PAT with
   **Self-hosted runners: Read and write**
 
-Everything else — `curl`, `jq`, `unzip`, Docker CE and the rootless extras,
-`uidmap`, `fuse-overlayfs`, `slirp4netns` — is installed by the script.
+Everything else — `curl`, `jq`, `unzip`, `make`, `python3` with `venv` support,
+Docker CE and the rootless extras, `uidmap`, `fuse-overlayfs`, `slirp4netns` —
+is installed by the script.
 
 **On your workstation, for `fleet.sh`**
 
