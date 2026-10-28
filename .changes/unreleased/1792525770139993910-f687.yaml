@@ -1,3 +1,0 @@
-kind: 'Fixed'
-body: 'fixed lowering `runners` leaving the runners above the new count enabled: they came back at the next boot with fresh registrations and kept their users, homes and tool caches. `install` now retires them completely, and `uninstall` no longer leaves a failed `user@<uid>.service` behind for each runner it removes'
-time: '2026-10-20T19:49:30.139957703Z'
