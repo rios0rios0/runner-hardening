@@ -12,7 +12,7 @@ image plus `ssh`.
 | `fleet.conf.example`     | The documented fleet format. `fleet.conf` itself is gitignored.            |
 | `test/bootstrap_test.sh` | Tests for the config reader, the remote bootstrap and the disk guard.      |
 
-`CLAUDE.md` at the repo root covers the same ground in more depth; read it for
+`AGENTS.md` at the repo root covers the same ground in more depth; read it for
 the full architecture map. This file is the fast orientation for Copilot Chat.
 
 ## Commands
@@ -82,9 +82,9 @@ function, or just run the whole suite.
 - **`set -Eeuo pipefail` is on in both scripts.** A `[[ cond ]] && action` whose
   *action* can fail needs `|| true`, or write it as an `if`.
 - **Heredoc quoting is load-bearing.** `<<EOF` expands installer-side variables
-  into the generated artefact; `<<'EOF'` ships the body verbatim, so every
-  runtime `$` must be escaped (`\$JIT`). Getting it backwards yields a valid
-  script that reads an empty variable at job time. `phase_runners` runs `bash -n`
+  into the generated artefact, so every runtime `$` inside it must be escaped
+  (`\$JIT`); `<<'EOF'` ships the body verbatim. Getting it backwards yields a
+  valid script that reads an empty variable at job time. `phase_runners` runs `bash -n`
   on the wrapper it writes for this reason — keep that check for new generated
   scripts.
 - **No secret may become a command-line argument, anywhere.** `/proc/<pid>/cmdline`
