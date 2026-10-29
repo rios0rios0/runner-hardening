@@ -19,7 +19,7 @@ When guidance conflicts, earlier wins over later:
 
 1. The code as it actually runs (Bash semantics under `set -Eeuo pipefail`).
 2. This skill's repo-specific checklist.
-3. `.github/copilot-instructions.md` and `CLAUDE.md`.
+3. `.github/copilot-instructions.md` and `AGENTS.md`.
 4. The shared [Development Guide](https://github.com/rios0rios0/guide/wiki) and
    its [Git-Flow](https://github.com/rios0rios0/guide/wiki/Git-Flow) commit
    conventions.
@@ -30,7 +30,7 @@ flag the drift, do not demand the code change to match stale prose.
 ## How to run the review
 
 ```bash
-make test    # parse check + bootstrap suite (~2s, 81 assertions, no VM needed)
+make test    # parse check + the test suite (~3s, no VM needed)
 make lint    # ShellCheck — needs `make setup` first
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks — needs `make setup`
 ```
@@ -68,17 +68,17 @@ alone — say it needs VM exercise.
   minutes after each job. The backoff lives in `gha-jitconfig`, keyed on cycles
   that ran no job; flag a change that brings systemd's back, or that keys the
   backoff on the exit status (run-helper exits 0 even on a terminated error).
-  `restart_backoff_delay` and `cycle_ran_a_job` are spliced into the generated
-  helpers with `declare -f`: flag a change that makes either call another
-  installer function or read an installer global.
+  `restart_backoff_delay`, `cycle_ran_a_job` and `runner_labels` are spliced
+  into the generated helpers with `declare -f`: flag a change that makes any of
+  them call another installer function or read an installer global.
 - **`harden-gha-runners.sh` stays self-contained.** It is copied onto machines
   alone, so a new `source` of another repo file is a defect even though the
   helper is duplicated in `fleet.sh` on purpose.
 - **Heredoc quoting is load-bearing.** `<<EOF` bakes installer-side values
-  (`${d}`, `${uid}`, `${USER_PREFIX}`) into the generated artefact; `<<'EOF'`
-  ships verbatim, so every runtime `$` must be escaped (`\$JIT`,
-  `\$RUNNER_PID`). Getting it backwards yields a valid script that reads an empty
-  variable at job time. A new generated script must keep a `bash -n` check like
+  (`${d}`, `${uid}`, `${USER_PREFIX}`) into the generated artefact, so every
+  runtime `$` inside it must be escaped (`\$JIT`, `\$RUNNER_PID`); `<<'EOF'`
+  ships its body verbatim. Getting it backwards yields a valid script that reads
+  an empty variable at job time. A new generated script must keep a `bash -n` check like
   the one `phase_runners` runs on the wrapper it writes.
 - **No secret may become a command-line argument.** `/proc/<pid>/cmdline` is
   world-readable. The SSH bootstrap streams its env file on stdin; every `curl`
@@ -111,11 +111,9 @@ alone — say it needs VM exercise.
 - **Comments explain the surprising decision, not the obvious line.** Flag a new
   comment that restates code; do not flag the existing ones that explain why a
   systemd directive is deliberately unset.
-- **Tests.** New behaviour in the pure functions (`parse_config`, `build_env`,
-  `build_bootstrap`, `load_config`, `should_preload_config`,
-  `runner_state_between_jobs`, `restart_backoff_delay`, `cycle_ran_a_job`) and
-  in the disk guard that `render_diskguard` emits should come with an `it_*`
-  case. Do not ask for a
+- **Tests.** New behaviour in a pure function the suite already exercises (the
+  `it_*` cases in `test/bootstrap_test.sh` show which) or in the disk guard that
+  `render_diskguard` emits should come with an `it_*` case. Do not ask for a
   test that would require a VM.
 
 ## Shared guide rules

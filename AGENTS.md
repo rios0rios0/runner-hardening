@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents (Claude Code, Codex, Cursor, GitHub Copilot) when working with code in this repository.
 
 ## What this is
 
@@ -34,14 +34,10 @@ that works on a bare clone; the rest need `make setup` (or
 
 `main()` at the bottom of `harden-gha-runners.sh` is a `case` on the mode. Most
 modes are one line: assert root, `load_config`, run a single `phase_*`
-function. `install` and `reconfigure` are the exception — they run a **fixed,
-ordered pipeline** (`preflight` → `discover` → `wizard`/`load_config` →
-`phase_audit` → `phase_stop_existing` → `phase_deprivilege` → `phase_wipe` →
-`phase_prereqs` → per-runner user + rootless Docker → `maybe_add_swap` →
-`phase_token_helper` → `phase_diskguard` → `phase_runners` → `phase_systemd` → `phase_janitor` →
-`phase_unattended` → `phase_cleanup_stale` → `phase_verify` → `summary`). The
-order encodes dependencies; do not reorder without tracing what each phase
-assumes already exists.
+function. `install` and `reconfigure` are the exception — their branch of the
+`case` runs a **fixed, ordered pipeline** of phases. The order encodes
+dependencies; do not reorder without tracing what each phase assumes already
+exists.
 
 Both scripts end with an `if [[ "${BASH_SOURCE[0]}" == "${0}" ]]` guard around
 `main`. **That guard is what makes the test suite possible** — it sources both
@@ -85,17 +81,11 @@ systemd starts gha-runner@N
 Every security claim in the README rests on this chain. A change that lets
 `run.sh` survive a second job, or that lets the wrapper `exec` (which discards
 the EXIT trap and skips cleanup), silently turns these back into long-lived
-runners. `StartLimitIntervalSec=0` is set deliberately — systemd's start limit
-counts *attempts*, so a healthy runner finishing many quick jobs would trip it.
-For the same reason `RestartSteps`/`RestartMaxDelaySec` are deliberately absent:
-they count every restart, and every job ends in one, so they made each healthy
-runner wait the full maximum before every job. The backoff is gha-jitconfig's,
-keyed on cycles that ran no job — a `_diag/Worker_*.log` newer than the cycle's
-`.jit` — because the exit status cannot tell: run-helper exits 0 even on a
-terminated error. `OOMPolicy=continue` is deliberate too: systemd's default of
-`stop` turned the kernel killing one job process into a stop of the whole unit,
-which the runner reports as "The runner has received a shutdown signal" — and,
-when the killed process sits below a step's own, as a *cancelled* job.
+runners. `StartLimitIntervalSec=0`, `OOMPolicy=continue` and the absence of
+`RestartSteps`/`RestartMaxDelaySec` are deliberate (`phase_systemd` says why
+beside each). The restart backoff is gha-jitconfig's, keyed on cycles that ran
+no job — a `_diag/Worker_*.log` newer than the cycle's `.jit` — never on the
+exit status, which run-helper sets to 0 even on a terminated error.
 
 ### Where state lives on a hardened box
 
@@ -149,25 +139,20 @@ is data) → `select_hosts` → per host: `build_env` emits the `GHA_*` exports 
   Bearer ..."`. Do not "simplify" either one back. `curl -K -` is not a
   substitute: its unquoted value form drops a malformed header silently, which
   sends the request unauthenticated instead of failing.
-- **Comment the surprising decision, not the obvious line.** The existing
-  comments explain why a systemd directive is deliberately *not* set, why
-  `exec` is avoided in the runner wrapper, why pagination matters on the
-  runners endpoint. Keep that standard; do not add comments restating code.
+- **Comment the surprising decision, not the obvious line**; do not add
+  comments that restate code.
 - **The stored configuration is a default, never an override.** `load_config`
-  saves every caller-supplied `GHA_*` answer, sources
-  `/etc/github-runner/env`, then puts the caller's values back — and only
-  falls back to `/etc/github-runner/pat` when no `GHA_PAT` was supplied. Do not
-  replace it with a plain `. "$ENV_FILE"`: the install dispatch runs this
-  function inside an `&&` chain for its side effect, so a clobbering version
-  makes every unattended run report success while changing nothing. This is
-  also what lets `fleet.sh --no-pat install` work, so do not add a code path
-  that requires the caller to hold the admin token for a machine that already
-  has one.
+  restores the caller's `GHA_*` answers over `/etc/github-runner/env`, and reads
+  `/etc/github-runner/pat` only when no `GHA_PAT` was supplied. Do not replace
+  it with a plain `. "$ENV_FILE"`: the install dispatch runs it inside an `&&`
+  chain for its side effect, so a clobbering version makes every unattended run
+  report success while changing nothing. It is also what lets
+  `fleet.sh --no-pat install` work, so do not add a code path that requires the
+  caller to hold the admin token for a machine that already has one.
 - **`die` inside `$( )` only exits the subshell.** `build_bootstrap` assigns
   `build_env`'s output to a variable rather than inlining the substitution,
-  because that is what propagates the failure under `errexit`. Inlining it
-  again re-introduces a bug where a bad host printed its error and the run
-  installed anyway.
+  because that is what propagates the failure under `errexit`; inlined, a bad
+  host prints its error and the run installs anyway.
 - **Every mode is idempotent.** A second consecutive run that changes something
   is a bug, not a feature.
 - **The disk guard runs before the registration is minted, and deletes as the
@@ -185,18 +170,13 @@ is data) → `select_hosts` → per host: `build_env` emits the `GHA_*` exports 
   installer, and keep them self-contained: the helpers carry those functions and
   nothing else of the installer, so a call to another installer function or
   global would parse fine and fail at runner start.
-- **systemd-oomd is not part of the design.** It is a separate package absent
-  from a server install, so the `ManagedOOM*` policy that used to sit on
-  `gha.slice` never acted; where it does run it SIGKILLs a runner's whole unit,
-  which GitHub reports as a lost runner. The slice's `MemoryMax` confines the
-  kernel's OOM killer to CI, and `OOMPolicy=continue` makes its kill a failed
-  step. Heavy jobs are kept apart by routing (`runner_labels`) and sized by
-  `CODEQL_RAM` (`codeql_ram_budget`), not by killing them sooner.
-- **`TMPDIR=/var/tmp` in the unit is deliberate.** Ubuntu 26.04 mounts `/tmp`
-  as a tmpfs sized at half the RAM, and `PrivateTmp=` only carves each runner a
-  directory on it, so all runners on a box share one small RAM disk that a few
-  concurrent test suites fill (ENOSPC with the disk mostly empty). The private
-  `/var/tmp` is just as isolated and wiped at every stop, but on disk. Do not
+- **systemd-oomd is not part of the design.** `gha.slice` carries no
+  `ManagedOOM*` policy (the slice's own comment says why); its `MemoryMax`
+  confines the kernel's OOM killer to CI, and `OOMPolicy=continue` makes that
+  kill a failed step. Heavy jobs are kept apart by routing (`runner_labels`)
+  and sized by `CODEQL_RAM` (`codeql_ram_budget`), not by killing them sooner.
+- **`TMPDIR=/var/tmp` in the unit is deliberate** (the unit template says
+  why: Ubuntu 26.04's `/tmp` is a small tmpfs every runner shares). Do not
   point `TMPDIR` back at `/tmp`, and do not drop `PrivateTmp=`, which is what
   makes `/var/tmp` private.
 - **Anything that changes system state is untestable here.** It has to be
@@ -225,35 +205,20 @@ repository) and drift silently:
 ## Tests
 
 `test/bootstrap_test.sh` sources both scripts and exercises their real
-functions — `parse_config`, `build_env`, `build_bootstrap`, `load_config`,
-`should_preload_config`, `runner_state_between_jobs` (the pure core of the
-`verify` health gate, which excuses a runner caught auto-restarting between jobs
-instead of reporting it down), `report_disk` (`verify`'s line per disk, which
-promises the disk guard's sweep only where runner caches live), the restart
-backoff's `restart_backoff_delay` and `cycle_ran_a_job` and the heavy-job
-`runner_labels`, all also checked as spliced into the rendered JIT helpers, and
-`compute_resource_policy` with `render_instance_dropin` for the CodeQL budget a
-runner exports, and `instances_above`, which picks the runners a lowered count
-retires. The bootstrap cases are not simulations: each runs the
-real bootstrap through a real `bash -s`, exactly as `sshd` would on the far
-side, against a stand-in installer that reports what it received. Only the SSH
-hop is substituted. The disk-guard cases render `gha-diskguard` from
-`render_diskguard`, source it, and drive its eviction steps against a scratch
-runner tree whose atimes they set; only the root-only privilege drop
-(`as_runner`) is substituted.
+functions; the `it_*` cases show which. The bootstrap cases run the real
+bootstrap through a real `bash -s`, as `sshd` would, against a stand-in
+installer; the disk-guard cases render `gha-diskguard` from `render_diskguard`
+and drive it against a scratch runner tree. Only the SSH hop and the root-only
+`as_runner` drop are substituted. The spliced functions are also checked inside
+the rendered JIT helpers.
 
 - Hand-rolled BDD, `# given / # when / # then`, no mocking library.
-- Each case is a function named `it_*`, **defined and then invoked on the very
-  next line**. There is no runner and no filter — to run one case in isolation,
-  source the file's setup and call the function, or just run the whole suite
-  (~3s).
+- Each case is an `it_*` function **defined and then invoked on the very next
+  line**; the final `PASS`/`FAIL` tally picks new ones up. There is no runner
+  and no filter: to run one case, source the file's setup and call the
+  function, or just run the whole suite (~3s).
 - `load_config_probe` runs in a subshell with `set +e` but **`nounset` still
   on**, deliberately: the guards it tests exist to survive `-u`.
-- The file carries a file-wide `# shellcheck disable=SC2034` before its first
-  command, because ShellCheck cannot follow the interpolated `source`.
-
-Add a case by appending the `it_*` function plus its invocation; the final
-`PASS`/`FAIL` tally at the bottom picks it up automatically.
 
 ## Anonymity
 
@@ -264,13 +229,8 @@ a specific deployment. Examples use `your-org`, `example`, and RFC 5737 / RFC
 
 ## Documentation
 
-Every change updates a `chlog` fragment under `.changes/unreleased/`; never
-edit `CHANGELOG.md` by hand:
-
-```bash
-chlog new --kind Fixed --body 'fixed the thing that was broken'
-```
-
-Kinds are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
-Update `README.md` whenever a flag, a `GHA_*` variable, a `fleet.conf` key or a
+Every change adds a `chlog` fragment under `.changes/unreleased/`, made with
+`chlog new --kind <Kind> --body '<past-tense description>'` (kinds are listed
+in `.chlog.yaml`; keep the body single-quoted); never edit `CHANGELOG.md` by
+hand. Update `README.md` whenever a flag, a `GHA_*` variable, a `fleet.conf` key or a
 requirement changes.
