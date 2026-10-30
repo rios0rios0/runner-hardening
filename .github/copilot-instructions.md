@@ -20,7 +20,7 @@ the full architecture map. This file is the fast orientation for Copilot Chat.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets need
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 163 assertions, no VM)
+make test    # parse check + the test suite (~3s, 164 assertions, no VM)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -61,7 +61,8 @@ function, or just run the whole suite.
   `Restart=always` loops with a fresh registration and workspace. The
   backoff is keyed on job-less cycles (no `_diag/Worker_*.log` newer than the
   cycle's `.jit`), never on systemd's `RestartSteps`, which counts every
-  restart and so idled healthy runners for minutes after each job. A change that lets `run.sh` survive a second job,
+  restart and so idled healthy runners for minutes after each job; for the
+  same reason `RestartSec` stays at 1 s, since every job pays it. A change that lets `run.sh` survive a second job,
   or that lets the wrapper `exec` (which discards the EXIT trap and skips
   cleanup), silently turns these back into long-lived runners. Every README
   security claim rests on this chain.

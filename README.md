@@ -272,7 +272,9 @@ sudo /usr/local/sbin/gha-janitor   # run the janitor now
 
 ### Restarts
 
-A runner registers again 10 seconds after its job ends. One whose starts keep
+A runner registers again one second after its job ends. Every job ends in a
+restart, so that delay sits between every two jobs a runner takes; at 10 seconds
+it was most of the gap, spent idle while queued jobs waited. One whose starts keep
 failing — the listener exits without ever running a job — backs off instead:
 10 seconds, then 20, 40, 80, 160, and at most 5 minutes between attempts, so a
 broken box does not spend the fleet's shared API budget minting and deleting
