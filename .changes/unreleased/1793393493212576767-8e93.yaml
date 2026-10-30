@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'changed the delay before a runner registers again after its job from 10 seconds to 1. Every job ends in a restart, so the delay sat between every two jobs a runner takes and was most of the gap, idle time while queued jobs waited; a runner whose starts keep failing is still held back by the 10-second-to-5-minute backoff in `gha-jitconfig`'
+time: '2026-10-30T20:51:33.212522947Z'

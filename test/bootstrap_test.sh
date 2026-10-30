@@ -1208,6 +1208,20 @@ it_no_longer_lets_systemd_back_off_healthy_runners() {
 }
 it_no_longer_lets_systemd_back_off_healthy_runners
 
+it_brings_a_runner_back_for_its_next_job_within_a_second() {
+  # given the unit template the installer writes
+  # when it is searched for the delay before a runner comes back
+  local delay
+  delay=$(grep -xE 'RestartSec=[0-9]+' "${ROOT}/harden-gha-runners.sh")
+
+  # then it is one second: every job ends in a restart, so this delay sits
+  # between every two jobs a runner takes, and at 10s it was most of the gap
+  # while queued jobs waited. A failing runner is held back by the backoff the
+  # cases above pin, not by this.
+  assert_eq "should restart a runner one second after its job" "RestartSec=1" "$delay"
+}
+it_brings_a_runner_back_for_its_next_job_within_a_second
+
 echo
 echo "heavy jobs and memory"
 

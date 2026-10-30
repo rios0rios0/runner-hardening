@@ -19,7 +19,7 @@ Ubuntu image plus `ssh` provides.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets use
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 163 assertions, no VM needed)
+make test    # parse check + the test suite (~3s, 164 assertions, no VM needed)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
@@ -81,11 +81,12 @@ systemd starts gha-runner@N
 Every security claim in the README rests on this chain. A change that lets
 `run.sh` survive a second job, or that lets the wrapper `exec` (which discards
 the EXIT trap and skips cleanup), silently turns these back into long-lived
-runners. `StartLimitIntervalSec=0`, `OOMPolicy=continue` and the absence of
-`RestartSteps`/`RestartMaxDelaySec` are deliberate (`phase_systemd` says why
-beside each). The restart backoff is gha-jitconfig's, keyed on cycles that ran
-no job — a `_diag/Worker_*.log` newer than the cycle's `.jit` — never on the
-exit status, which run-helper sets to 0 even on a terminated error.
+runners. `StartLimitIntervalSec=0`, `RestartSec=1`, `OOMPolicy=continue` and
+the absence of `RestartSteps`/`RestartMaxDelaySec` are deliberate
+(`phase_systemd` says why beside each). The restart backoff is gha-jitconfig's,
+keyed on cycles that ran no job — a `_diag/Worker_*.log` newer than the cycle's
+`.jit` — never on the exit status, which run-helper sets to 0 even on a
+terminated error.
 
 ### Where state lives on a hardened box
 

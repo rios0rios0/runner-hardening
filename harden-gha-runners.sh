@@ -2068,7 +2068,12 @@ ExecStart=${RUNNER_BASE}/%i/run-ephemeral.sh
 ExecStopPost=+/usr/local/sbin/gha-jitreap %i
 
 Restart=always
-RestartSec=10
+# Short on purpose. Every job ends in a restart, so this delay sits between
+# every two jobs a runner takes, while queued jobs wait for it: at 10s it was
+# most of a runner's turnaround. A longer one would only slow a runner that
+# keeps failing, and gha-jitconfig already holds that one back (10s to 5 min
+# before it mints again, after starts that ran no job).
+RestartSec=1
 # NOT RestartSteps/RestartMaxDelaySec, for the same reason as the start limit:
 # systemd counts every restart and every job ends in one, so a healthy runner
 # that had finished six jobs waited the full RestartMaxDelaySec before each
