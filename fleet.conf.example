@@ -54,6 +54,12 @@ codeql_ram  = auto                    # MB a CodeQL analysis may use, exported t
                                       # heavy job can take while each other
                                       # runner keeps 1 GB; off = let CodeQL size
                                       # itself from the whole box.
+slice_ceiling = none                  # runners whose memory ceiling is the whole
+                                      # gha.slice budget instead of 85% of the
+                                      # box: none, heavy (runners 1..heavy_runners)
+                                      # or all. `heavy` lets a job too large for
+                                      # the usual ceiling take the box on the
+                                      # heavy runner. A first install uses none.
 old_user    = none                    # the over-privileged account to dismantle, or none
 
 # --- hosts -----------------------------------------------------------------

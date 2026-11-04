@@ -68,6 +68,7 @@ echo "TRUST=${GHA_TRUST:-<unset>}"
 echo "GROUP=${GHA_GROUP_ID:-<unset>}"
 echo "HEAVY=${GHA_HEAVY_RUNNERS:-<unset>}"
 echo "CODEQL=${GHA_CODEQL_RAM:-<unset>}"
+echo "SLICE=${GHA_SLICE_CEILING:-<unset>}"
 echo "YES=${GHA_YES:-<unset>}"
 echo "PAT=${GHA_PAT:-<unset>}"
 echo "DIRMODE=$(stat -c %a "$(dirname "$0")")"
@@ -203,15 +204,17 @@ it_rejects_a_heavy_job_answer_the_installer_would_misread() {
   # given heavy-job answers the installer cannot use: a count with a leading
   # zero (bash arithmetic reads 08 as octal and dies), a negative one, and a
   # budget that is neither a number nor a keyword
-  local out_count out_negative out_budget
+  local out_count out_negative out_budget out_slice
   printf '[defaults]\nbecome = none\norg = o\nheavy_runners = 08\n\n[host1]\nhost = h\n' > "${WORK}/heavy08.conf"
   printf '[defaults]\nbecome = none\norg = o\nheavy_runners = -1\n\n[host1]\nhost = h\n' > "${WORK}/heavyneg.conf"
   printf '[defaults]\nbecome = none\norg = o\ncodeql_ram = lots\n\n[host1]\nhost = h\n' > "${WORK}/codeqlbad.conf"
+  printf '[defaults]\nbecome = none\norg = o\nslice_ceiling = most\n\n[host1]\nhost = h\n' > "${WORK}/slicebad.conf"
 
   # when the environment for each host is built
   out_count=$( reset_config; MODE=install; ADMIN_PAT=x; parse_config "${WORK}/heavy08.conf"; build_env host1 2>&1 )
   out_negative=$( reset_config; MODE=install; ADMIN_PAT=x; parse_config "${WORK}/heavyneg.conf"; build_env host1 2>&1 )
   out_budget=$( reset_config; MODE=install; ADMIN_PAT=x; parse_config "${WORK}/codeqlbad.conf"; build_env host1 2>&1 )
+  out_slice=$( reset_config; MODE=install; ADMIN_PAT=x; parse_config "${WORK}/slicebad.conf"; build_env host1 2>&1 )
 
   # then each fails before anything is sent anywhere
   assert_contains "should reject a heavy runner count with a leading zero" \
@@ -220,6 +223,8 @@ it_rejects_a_heavy_job_answer_the_installer_would_misread() {
     "$out_negative" "heavy_runners must be 0 or a positive integer"
   assert_contains "should reject a CodeQL budget that is not auto, off or a number" \
     "$out_budget" "codeql_ram must be 'auto', 'off' or a number of MB"
+  assert_contains "should reject a slice ceiling that is not none, heavy or all" \
+    "$out_slice" "slice_ceiling must be 'none', 'heavy' or 'all'"
 }
 it_rejects_a_heavy_job_answer_the_installer_would_misread
 
@@ -414,12 +419,13 @@ it_sends_only_what_the_config_specifies() {
   assert_not_contains "should not invent a scope"        "$out" "GHA_SCOPE"
   assert_not_contains "should not invent a heavy runner count" "$out" "GHA_HEAVY_RUNNERS"
   assert_not_contains "should not invent a CodeQL budget"      "$out" "GHA_CODEQL_RAM"
+  assert_not_contains "should not invent a slice ceiling"      "$out" "GHA_SLICE_CEILING"
 }
 it_sends_only_what_the_config_specifies
 
 it_delivers_the_heavy_job_answers() {
   # given a fleet entry that sets both heavy-job keys
-  printf '[defaults]\nbecome = none\norg = your-org\nheavy_runners = 2\ncodeql_ram = off\n\n[host1]\nhost = 10.0.0.1\n' \
+  printf '[defaults]\nbecome = none\norg = your-org\nheavy_runners = 2\ncodeql_ram = off\nslice_ceiling = all\n\n[host1]\nhost = 10.0.0.1\n' \
     > "${WORK}/heavy.conf"
 
   # when the bootstrap runs on the far side
@@ -428,6 +434,7 @@ it_delivers_the_heavy_job_answers() {
   # then the installer receives both, and a keyword budget arrives as the word
   assert_contains "should deliver the heavy runner count" "$out" "HEAVY=2"
   assert_contains "should deliver the CodeQL budget"      "$out" "CODEQL=off"
+  assert_contains "should deliver the slice ceiling"      "$out" "SLICE=all"
 }
 it_delivers_the_heavy_job_answers
 
@@ -1329,6 +1336,40 @@ it_exports_the_codeql_budget_to_every_job_unless_switched_off() {
   assert_contains "should still render the rest of the drop-in when it is off" "$off" "MemoryMax=5365M"
 }
 it_exports_the_codeql_budget_to_every_job_unless_switched_off
+
+# ceiling_probe <MB of RAM> <runners> <heavy runners> <slice_ceiling> <runner> -> its MemoryMax line
+ceiling_probe() {
+  installer_probe "MEM_MB=$1 GHA_COUNT=$2 GHA_HEAVY_RUNNERS=$3 GHA_SLICE_CEILING=$4 GHA_CODEQL_RAM=off
+                   compute_resource_policy; render_instance_dropin $5 gha$5 100$5 /opt/hostedtoolcache-gha$5" \
+    | grep '^MemoryMax='
+}
+
+it_lifts_a_runners_memory_ceiling_to_the_slice_only_when_asked() {
+  # given a 12 GB box with two runners, and an 8 GB box with three runners and
+  # one heavy
+  # when each runner's drop-in is rendered with the ceiling left alone (as
+  # answered, and never answered at all), lifted for every runner, and lifted
+  # for the heavy runners only
+  local shared unset lifted heavy_first heavy_second
+  shared=$(ceiling_probe 11955 2 1 none 1)
+  unset=$(installer_probe 'MEM_MB=11955 GHA_COUNT=2 GHA_HEAVY_RUNNERS=1 GHA_CODEQL_RAM=off; unset GHA_SLICE_CEILING
+                           compute_resource_policy; render_instance_dropin 1 gha1 1001 /opt/hostedtoolcache-gha1' \
+          | grep '^MemoryMax=')
+  lifted=$(ceiling_probe 11955 2 1 all 2)
+  heavy_first=$(ceiling_probe 7936 3 1 heavy 1)
+  heavy_second=$(ceiling_probe 7936 3 1 heavy 2)
+
+  # then by default a runner is capped at 85% of what is left after the
+  # reserve, which killed a lone job with the slice's last gigabytes unused;
+  # `all` gives every runner the whole gha.slice budget; and `heavy` lifts
+  # runners 1..N and no other
+  assert_eq "should cap a runner at 85% of the box by default" "MemoryMax=8951M" "$shared"
+  assert_eq "should cap a runner the same when nothing was ever answered" "MemoryMax=8951M" "$unset"
+  assert_eq "should give a lifted runner the whole slice budget" "MemoryMax=10731M" "$lifted"
+  assert_eq "should lift a heavy runner when only the heavy ones are named" "MemoryMax=6612M" "$heavy_first"
+  assert_eq "should leave a runner that is not heavy at the usual ceiling" "MemoryMax=5365M" "$heavy_second"
+}
+it_lifts_a_runners_memory_ceiling_to_the_slice_only_when_asked
 
 it_lets_an_oom_kill_fail_the_step_instead_of_stopping_the_runner() {
   # given the unit template the installer writes
