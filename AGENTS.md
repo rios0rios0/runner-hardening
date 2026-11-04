@@ -19,7 +19,7 @@ Ubuntu image plus `ssh` provides.
 ```bash
 make setup   # clone/update the shared pipelines scripts the other targets use
 make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 164 assertions, no VM needed)
+make test    # parse check + the test suite (~3s, 172 assertions, no VM needed)
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 

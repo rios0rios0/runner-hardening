@@ -492,6 +492,9 @@ wizard() {
   ask GHA_CODEQL_RAM "Memory CodeQL may use, in MB ('auto' sizes it from this box, 'off' leaves it to CodeQL)" "auto"
   [[ "$GHA_CODEQL_RAM" =~ ^(auto|off|[1-9][0-9]*)$ ]] \
     || die "the CodeQL memory budget must be 'auto', 'off' or a number of MB, got '${GHA_CODEQL_RAM}'"
+  ask GHA_SLICE_CEILING "Runners whose memory ceiling is the whole ${GHA_SLICE} budget ('none', 'heavy' or 'all')" "none"
+  [[ "$GHA_SLICE_CEILING" =~ ^(none|heavy|all)$ ]] \
+    || die "the slice ceiling must be 'none', 'heavy' or 'all', got '${GHA_SLICE_CEILING}'"
 
   # --- old user ------------------------------------------------------------
   if [[ -z "${GHA_OLD_USER:-}" ]]; then
@@ -627,6 +630,7 @@ GHA_TRUST="${GHA_TRUST}"
 GHA_OLD_USER="${GHA_OLD_USER:-none}"
 GHA_HEAVY_RUNNERS="${GHA_HEAVY_RUNNERS:-1}"
 GHA_CODEQL_RAM="${GHA_CODEQL_RAM:-auto}"
+GHA_SLICE_CEILING="${GHA_SLICE_CEILING:-none}"
 WIPE_DOCKER_AFTER_JOB="${WIPE_DOCKER_AFTER_JOB}"
 SHARE_TOOLCACHE="${SHARE_TOOLCACHE}"
 RUNNER_NAME_PREFIX="$(hostname -s)"
@@ -643,7 +647,7 @@ EOF
 # The answers save_config writes. Sourcing the env file would assign all of
 # them unconditionally, so these are the ones a caller has to be protected from.
 CONFIG_ANSWERS=(GHA_SCOPE GHA_ORG GHA_REPO GHA_GROUP_ID GHA_LABELS GHA_COUNT
-                GHA_TRUST GHA_OLD_USER GHA_HEAVY_RUNNERS GHA_CODEQL_RAM)
+                GHA_TRUST GHA_OLD_USER GHA_HEAVY_RUNNERS GHA_CODEQL_RAM GHA_SLICE_CEILING)
 
 # Set by load_config: 1 when the caller supplied any answer or a PAT, so the
 # stored file was a fallback rather than the whole truth.
@@ -710,6 +714,11 @@ confirm_plan() {
                      || echo "no runner carries the label 'heavy'" )
   CodeQL        $( [[ -n "${RP_CODEQL:-}" ]] && echo "every job sees CODEQL_RAM=${RP_CODEQL} MB" \
                      || echo "CODEQL_RAM unset - CodeQL sizes itself from the whole box" )
+  slice ceiling $( case "${GHA_SLICE_CEILING:-none}" in
+                     all)   echo "every runner may grow to the whole ${GHA_SLICE} budget (${RP_AGGREGATE} MB)" ;;
+                     heavy) echo "the heavy runners may grow to the whole ${GHA_SLICE} budget (${RP_AGGREGATE} MB)" ;;
+                     *)     echo "none - every runner is capped at ${RP_CEILING} MB" ;;
+                   esac )
   per runner    ~${budget} MB memory ceiling, 130% CPU quota
   trust level   ${GHA_TRUST}
                 wipe docker state after every job: ${WIPE_DOCKER_AFTER_JOB}
@@ -2186,9 +2195,9 @@ EOF
   write_resource_policy
 
   for n in $(seq 1 "$GHA_COUNT"); do
-    ok "runner ${n}: >=${RP_FAIR} MB guaranteed, up to ${RP_CEILING} MB, CPU weight 100, labels $(runner_labels "$n" "$GHA_LABELS" "${GHA_HEAVY_RUNNERS:-1}")"
+    ok "runner ${n}: >=${RP_FAIR} MB guaranteed, up to $(runner_ceiling "$n") MB, CPU weight 100, labels $(runner_labels "$n" "$GHA_LABELS" "${GHA_HEAVY_RUNNERS:-1}")"
   done
-  log "one busy runner may use all ${CPU_COUNT} cores and up to ${RP_CEILING} MB"
+  log "one busy runner may use all ${CPU_COUNT} cores and up to $(runner_ceiling 1) MB"
   log "all ${GHA_COUNT} together are capped at ${RP_AGGREGATE} MB by ${GHA_SLICE}"
   [[ -n "${RP_CODEQL:-}" ]] && log "every job sees CODEQL_RAM=${RP_CODEQL} MB (codeql_ram=${GHA_CODEQL_RAM:-auto})" || true
 
@@ -2546,6 +2555,32 @@ compute_resource_policy() {   # sets RP_FAIR RP_CEILING RP_AGGREGATE RP_SYSMIN R
                                 "$RP_CEILING" "$GHA_COUNT" "${GHA_HEAVY_RUNNERS:-1}")
 }
 
+# A runner's MemoryMax, in MB. By default 85% of what is left once the OS and
+# the rootless daemons are reserved: a lone job gets most of the box, and a
+# runner beside it keeps something. A job that needs more than that to run at
+# all -- one compile of a very large package, say -- is killed at that ceiling
+# with the slice's last gigabytes unused. GHA_SLICE_CEILING lifts the runners it
+# names to the whole gha.slice budget instead: `heavy` for runners
+# 1..GHA_HEAVY_RUNNERS, where such a job is routed, `all` for every runner. (A
+# one-runner box gains little: its ceiling is already its fair share.) The slice
+# still caps every runner together, so the cost lands on whatever shares the
+# box: a job beside a lifted runner can be reclaimed or OOM-killed sooner.
+#
+# runner_ceiling <runner number> -> MB
+runner_ceiling() {
+  local n="$1" heavy="${GHA_HEAVY_RUNNERS:-1}" lifted=0
+  [[ "$heavy" =~ ^[0-9]+$ ]] || heavy=0
+  case "${GHA_SLICE_CEILING:-none}" in
+    all)   lifted=1 ;;
+    heavy) [[ "$n" =~ ^[1-9][0-9]*$ ]] && (( n <= 10#$heavy )) && lifted=1 || true ;;
+  esac
+  if (( lifted && RP_AGGREGATE > RP_CEILING )); then
+    printf '%s\n' "$RP_AGGREGATE"
+  else
+    printf '%s\n' "$RP_CEILING"
+  fi
+}
+
 # Runner n's own drop-in. Rendered rather than written inline, so the test
 # suite can read what a runner is given without root.
 render_instance_dropin() { # render_instance_dropin <n> <user> <uid> <tool cache>
@@ -2561,7 +2596,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/${uid}
 CPUWeight=100
 IOWeight=100
 MemoryLow=${RP_FAIR}M
-MemoryMax=${RP_CEILING}M
+MemoryMax=$(runner_ceiling "$n")M
 EOF
   if [[ -n "${RP_CODEQL:-}" ]]; then
     printf '%s\n' "# What a CodeQL analysis may use; see codeql_ram_budget in the installer." \
@@ -2622,7 +2657,7 @@ EOF
 CPUWeight=100
 IOWeight=100
 MemoryLow=${RP_FAIR}M
-MemoryMax=${RP_CEILING}M
+MemoryMax=$(runner_ceiling "$n")M
 TasksMax=8192
 EOF
     chmod 0644 "/etc/systemd/system/gha-runner@${n}.service.d/10-instance.conf" \
@@ -2644,6 +2679,8 @@ phase_retune() {
   echo "  ${CPU_COUNT} vCPU, ${MEM_MB} MB RAM, ${GHA_COUNT} runners"
   echo "    per runner guaranteed : ${RP_FAIR} MB   (MemoryLow, protected from reclaim)"
   echo "    per runner ceiling    : ${RP_CEILING} MB  (a lone job may take this much)"
+  [[ "${GHA_SLICE_CEILING:-none}" != "none" ]] \
+    && echo "    lifted ceiling        : ${RP_AGGREGATE} MB  (slice_ceiling=${GHA_SLICE_CEILING}: the whole ${GHA_SLICE} budget)" || true
   echo "    ALL runners together  : ${RP_AGGREGATE} MB  (${GHA_SLICE} aggregate cap)"
   echo "    OS floor              : ${RP_SYSMIN} MB   (system.slice MemoryMin - keeps sshd alive)"
   echo "    CodeQL                : ${RP_CODEQL:-unset} MB  (CODEQL_RAM every job sees; codeql_ram=${GHA_CODEQL_RAM:-auto})"
@@ -2658,7 +2695,7 @@ phase_retune() {
   # runner does anyway after its next job.
   for n in $(seq 1 "${GHA_COUNT}"); do
     systemctl set-property --runtime "gha-runner@${n}.service" \
-      CPUQuota= CPUWeight=100 MemoryLow="${RP_FAIR}M" MemoryMax="${RP_CEILING}M" MemoryHigh=infinity \
+      CPUQuota= CPUWeight=100 MemoryLow="${RP_FAIR}M" MemoryMax="$(runner_ceiling "$n")M" MemoryHigh=infinity \
       >/dev/null 2>&1 || true
   done
   ok "applied to running units"
@@ -3360,7 +3397,8 @@ EOF
     ${C_CYN}GHA_SCOPE=${GHA_SCOPE} GHA_ORG=${GHA_ORG}${GHA_REPO:+ GHA_REPO=${GHA_REPO}} \\
     GHA_GROUP_ID=${GHA_GROUP_ID} GHA_LABELS='${GHA_LABELS}' GHA_TRUST=${GHA_TRUST} \\
     GHA_COUNT=${GHA_COUNT} GHA_OLD_USER=${GHA_OLD_USER:-none} GHA_HEAVY_RUNNERS=${GHA_HEAVY_RUNNERS:-1} \\
-    GHA_CODEQL_RAM=${GHA_CODEQL_RAM:-auto} GHA_YES=1 GHA_PAT='<your-pat>' \\
+    GHA_CODEQL_RAM=${GHA_CODEQL_RAM:-auto} GHA_SLICE_CEILING=${GHA_SLICE_CEILING:-none} \\
+    GHA_YES=1 GHA_PAT='<your-pat>' \\
     sudo -E ./harden-gha-runners.sh${C_R}
 
   ${C_B}Still worth doing, outside this box:${C_R}

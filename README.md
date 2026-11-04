@@ -151,6 +151,7 @@ GHA_YES=1 GHA_PAT='<pat>' sudo -E ./harden-gha-runners.sh
 | `GHA_OLD_USER`           | the over-privileged account to dismantle, or `none`                       |
 | `GHA_HEAVY_RUNNERS`      | how many runners, from runner 1, also carry the label `heavy`; `0` for none (default `1`) — see [Memory](#memory) |
 | `GHA_CODEQL_RAM`         | the `CODEQL_RAM`, in MB, every job sees: `auto` (default) sizes it from the box, `off` leaves CodeQL to size itself |
+| `GHA_SLICE_CEILING`      | which runners may grow to the whole `gha.slice` budget instead of the usual per-runner ceiling: `none` (default), `heavy` or `all` — see [Memory](#memory) |
 | `GHA_YES`                | answer every confirmation with yes                                        |
 | `GHA_FORCE_DEPRIVILEGE`  | de-privilege an account the installer protects — read the warning first   |
 | `GHA_DRAIN_TIMEOUT`      | seconds to let running jobs finish before a re-install stops the runners (default `1800`) |
@@ -306,6 +307,19 @@ keep them apart:
   heavy runners and never above a runner's own ceiling. With no heavy runner it
   is each runner's fair share. A number of MB is taken as given; `off` lets
   CodeQL size itself again.
+- **`slice_ceiling`** (default `none`): each runner's memory ceiling is 85% of
+  what is left once the OS and the rootless daemons are reserved, so a lone job
+  gets most of the box and a runner beside it keeps something. A job that
+  needs more than that to run at all — one compile of a very large package —
+  is killed at that ceiling with the slice's last gigabytes unused. `heavy`
+  lifts the heavy runners to the whole `gha.slice` budget, so such a job routed
+  there gets the box while the other runners keep their guaranteed share; `all`
+  lifts every runner. (A box with one runner gains little: its ceiling is
+  already its fair share, everything but the reserve.) The slice still caps all
+  runners together, so the cost falls
+  on whatever shares the box: a job beside a lifted runner can be reclaimed or
+  OOM-killed sooner. Like every answer, it is stored by `install` or
+  `reconfigure`, and `retune` then reapplies it.
 
 When the kernel does kill a job's process, only that process dies: the step
 fails as killed (exit code 137) and the job ends as a failure. systemd's

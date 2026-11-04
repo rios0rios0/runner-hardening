@@ -125,7 +125,7 @@ HOSTS=()
 KNOWN_KEYS=(
   enabled host port user ssh_key ssh_options become
   scope org repo group_id labels trust runners old_user force_deprivilege
-  heavy_runners codeql_ram
+  heavy_runners codeql_ram slice_ceiling
 )
 
 is_known_key() {
@@ -296,7 +296,7 @@ shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }   # single-quote for a shell litera
 # Everything the wizard would otherwise ask for is answered here, because an
 # SSH session without a pty has no terminal for the installer to prompt on.
 build_env() { # build_env <host-section>
-  local h="$1" scope org repo group labels trust runners old_user force heavy codeql_ram
+  local h="$1" scope org repo group labels trust runners old_user force heavy codeql_ram slice_ceiling
 
   # No invented defaults. Since the installer treats its stored answers as
   # defaults rather than overrides, anything emitted here WINS over what the
@@ -321,6 +321,7 @@ build_env() { # build_env <host-section>
   force="$(cfg "$h" force_deprivilege)"
   heavy="$(cfg "$h" heavy_runners)"
   codeql_ram="$(cfg "$h" codeql_ram)"
+  slice_ceiling="$(cfg "$h" slice_ceiling)"
 
   # Validate what IS set. An unset key is not an error here; it is a decision.
   [[ -z "$scope" ]] || case "$scope" in org|repo) ;;
@@ -335,6 +336,8 @@ build_env() { # build_env <host-section>
     || die "${h}: heavy_runners must be 0 or a positive integer, got '${heavy}'"
   [[ -z "$codeql_ram" || "$codeql_ram" =~ ^(auto|off|[1-9][0-9]*)$ ]] \
     || die "${h}: codeql_ram must be 'auto', 'off' or a number of MB, got '${codeql_ram}'"
+  [[ -z "$slice_ceiling" || "$slice_ceiling" =~ ^(none|heavy|all)$ ]] \
+    || die "${h}: slice_ceiling must be 'none', 'heavy' or 'all', got '${slice_ceiling}'"
 
   # Only `install` and `reconfigure` build a configuration. Every other mode
   # reads the one already on the box, and sending answers would be a lie about
@@ -356,6 +359,7 @@ build_env() { # build_env <host-section>
     [[ -n "$force" ]]    && printf 'export GHA_FORCE_DEPRIVILEGE=%s\n' "$(shq "$force")"
     [[ -n "$heavy" ]]    && printf 'export GHA_HEAVY_RUNNERS=%s\n' "$(shq "$heavy")"
     [[ -n "$codeql_ram" ]] && printf 'export GHA_CODEQL_RAM=%s\n' "$(shq "$codeql_ram")"
+    [[ -n "$slice_ceiling" ]] && printf 'export GHA_SLICE_CEILING=%s\n' "$(shq "$slice_ceiling")"
     # With --no-pat we send no credential and the host uses the one it stores.
     # Every unattended run reaches it the same way -- should_preload_config
     # returns true for both modes, so load_config reads /etc/github-runner/pat.
