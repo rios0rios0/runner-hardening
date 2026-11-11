@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
+### Added
+
+- added the `slice_ceiling` key (`GHA_SLICE_CEILING`): `heavy` lifts the memory ceiling of runners 1..`heavy_runners` from 85% of what the box has left after its reserve to the whole `gha.slice` budget, and `all` lifts every runner, so a job too large for the usual ceiling (one compile of a very large package) is no longer OOM-killed with the slice's last gigabytes unused. `none`, the default, keeps every ceiling as it was, and the slice still caps all runners together
+
 ## [0.1.0] - 2026-11-04
 
 ### Added
