@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'changed every runtime script from a heredoc inside the installer into a static file that sources `/usr/local/lib/runner-hardening/lib.sh`, so ShellCheck lints it and a test suite drives it against scratch trees; the restart backoff is one shared definition instead of functions spliced in with `declare -f`'
+time: '2026-11-13T02:30:18.9570754Z'
