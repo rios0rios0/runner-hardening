@@ -20,14 +20,25 @@ lib_probe() {
 }
 
 # admin_probe <commands> -> <commands> run with <sbin>-admin sourced, as root
-# would run it. Its own options stay on: production runs under errexit.
+# would run it. Its own options stay on: production runs under errexit. The
+# privilege drop runs the command as whoever runs the suite, and records which
+# runner it would have dropped to, in state/as_runner.log.
 admin_probe() {
   (
     # shellcheck source=../../roles/runner_host/files/runner-admin.sh
     . "${HOST_FILES}/runner-admin.sh"
     require_root() { :; }
+    as_runner() { printf '%s\n' "$*" >> "$BOX/state/as_runner.log"; shift; "$@"; }
     eval "$1"
   )
+}
+
+# A file only root may read, standing for the admin PAT a job would point a
+# link at: whatever reads through such a link prints this.
+SECRET="fixture-secret-placeholder"
+secret_file() {
+  printf '%s\n' "$SECRET" > "$BOX/secret"; chmod 0600 "$BOX/secret"
+  printf '%s\n' "$BOX/secret"
 }
 
 new_box
@@ -242,11 +253,14 @@ it_lists_every_instance_once_in_numeric_order() {
 it_lists_every_instance_once_in_numeric_order
 
 it_answers_busy_from_the_worker_process_alone() {
-  # given runner 1 idle, runner 2 mid-job, and runner 7 whose user is gone, which
-  # pgrep answers with the status it also gives a real error
+  # given runner 1 up with only its listener, runner 2 mid-job, and runner 7
+  # stopped, with no cgroup at all
   new_box
+  unit_state gha-runner@1.service active running
+  in_cgroup gha-runner@1.service Runner.Listener
+  unit_state gha-runner@2.service active running
   set_busy gha2
-  printf 'gha7\n' > "$BOX/state/pgrep-error"
+  unit_state gha-runner@7.service inactive dead
 
   # when each is asked about
   local idle busy gone rc_idle rc_busy rc_gone
@@ -254,13 +268,38 @@ it_answers_busy_from_the_worker_process_alone() {
   busy=$(admin_probe 'main busy 2' 2>/dev/null); rc_busy=$?
   gone=$(admin_probe 'main busy 7' 2>/dev/null); rc_gone=$?
 
-  # then the answer is the worker's, per runner, and a user that does not
-  # exist runs nothing: idle, not "cannot tell", which would block a reboot
+  # then the answer is the worker's, in each runner's own unit, and a stopped
+  # unit runs nothing: idle, not "cannot tell", which would block a reboot
   assert_eq "should answer busy, with status 0, for a runner with a worker" "busy 0" "${busy} ${rc_busy}"
-  assert_eq "should answer idle, with status 1, for a runner without one" "idle 1" "${idle} ${rc_idle}"
-  assert_eq "should take a runner whose user is gone as idle" "idle 1" "${gone} ${rc_gone}"
+  assert_eq "should answer idle, with status 1, for a runner with only its listener" "idle 1" "${idle} ${rc_idle}"
+  assert_eq "should take a stopped runner as idle" "idle 1" "${gone} ${rc_gone}"
 }
 it_answers_busy_from_the_worker_process_alone
+
+it_looks_for_the_worker_in_the_runners_own_unit_only() {
+  # given runner 4, up and idle, whose user still runs a process named like a
+  # worker outside its unit - left in a rootless container, or a service of its
+  # user manager - and runner 5, whose cgroup cannot be read
+  new_box
+  unit_state gha-runner@4.service active running
+  spawn_named Runner.Worker
+  mkdir -p "$BOX/cgroup/user.slice/user-1004.slice/user@1004.service/app.slice"
+  printf '%s\n' "$SPAWNED" > "$BOX/cgroup/user.slice/user-1004.slice/user@1004.service/app.slice/cgroup.procs"
+  unit_state gha-runner@5.service active running
+  chmod 0000 "$(unit_cgroup gha-runner@5.service)/cgroup.procs"
+
+  # when each is asked about
+  local left unreadable rc_left rc_unreadable
+  left=$(admin_probe 'main busy 4' 2>/dev/null); rc_left=$?
+  unreadable=$(admin_probe 'main busy 5' 2>/dev/null); rc_unreadable=$?
+
+  # then nothing a job leaves outside its unit makes the runner look busy for
+  # good, holding off every reboot and every drain; and what cannot be read
+  # is "cannot tell", which a reboot defers on, never "idle"
+  assert_eq "should not count a worker-named process outside the unit's cgroup" "idle 1" "${left} ${rc_left}"
+  assert_eq "should say it cannot tell when the unit's cgroup cannot be read" "unknown 2" "${unreadable} ${rc_unreadable}"
+}
+it_looks_for_the_worker_in_the_runners_own_unit_only
 
 echo
 echo "disk guard"
@@ -285,9 +324,9 @@ guard_probe() {
     # shellcheck source=../../roles/runner_host/files/runner-diskguard.sh
     . "${HOST_FILES}/runner-diskguard.sh"
     set +e
-    as_runner()      { shift; env HOME="$H" "$@"; }
-    runner_uid()     { echo 4294967294; }
-    ensure_run_dir() { mkdir -p "$(run_dir)"; }
+    as_runner()       { printf '%s\n' "$*" >> "$BOX/state/as_runner.log"; shift; env HOME="$H" "$@"; }
+    runner_uid()      { echo 4294967294; }
+    ensure_root_dir() { mkdir -p "$1"; }
     guard_init 1 || { echo "guard_init: runner 1 is not on this box"; exit 1; }
     eval "$1"
   )
@@ -299,9 +338,9 @@ guard_main() {
   (
     # shellcheck source=../../roles/runner_host/files/runner-diskguard.sh
     . "${HOST_FILES}/runner-diskguard.sh"
-    as_runner()      { shift; env HOME="$H" "$@"; }
-    runner_uid()     { echo 4294967294; }
-    ensure_run_dir() { mkdir -p "$(run_dir)"; }
+    as_runner()       { printf '%s\n' "$*" >> "$BOX/state/as_runner.log"; shift; env HOME="$H" "$@"; }
+    runner_uid()      { echo 4294967294; }
+    ensure_root_dir() { mkdir -p "$1"; }
     eval "${1:-}"
     main 1
   )
@@ -592,6 +631,149 @@ it_takes_a_trust_level_it_does_not_know_as_untrusted() {
 }
 it_takes_a_trust_level_it_does_not_know_as_untrusted
 
+# daemon_unit - runner 1's rootless daemon unit and the link that enables it,
+# as dockerd-rootless-setuptool.sh leaves them; UNIT and REF name the unit and
+# the root-owned copy the guard keeps of it
+daemon_unit() {
+  UNIT="${H}/.config/systemd/user/docker.service"
+  REF="$BOX/var/lib/runner-hardening/rootless/gha1.docker.service"
+  mkdir -p "${H}/.config/systemd/user/default.target.wants"
+  printf '[Service]\nExecStart=/usr/bin/dockerd-rootless.sh\n' > "$UNIT"
+  ln -s "$UNIT" "${H}/.config/systemd/user/default.target.wants/docker.service"
+}
+
+it_keeps_a_root_owned_copy_of_the_daemon_unit_before_the_first_job() {
+  # given a runner whose rootless daemon was just set up, before its first job
+  fresh_runner
+  daemon_unit
+
+  # when the guard runs before that job
+  guard_main 'use_pct() { echo 40; }' >/dev/null
+
+  # then a copy is kept where no job can write, read as the runner's user
+  assert_eq "should keep a copy of the daemon's unit in the state directory" "$(cat "$UNIT")" "$(cat "$REF" 2>/dev/null)"
+  assert_contains "should read the unit as the runner's user, never through a link" \
+    "$(cat "$BOX/state/as_runner.log" 2>/dev/null)" "1 dd if=${UNIT} iflag=nofollow"
+}
+it_keeps_a_root_owned_copy_of_the_daemon_unit_before_the_first_job
+
+it_puts_the_daemon_unit_back_before_every_untrusted_job() {
+  # given an untrusted runner whose daemon unit a fork PR changed, after the
+  # guard kept its copy
+  fresh_runner RUNNER_TRUST=untrusted
+  daemon_unit
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+  printf 'ExecStartPre=/bin/sh -c fixture-planted-command\n' >> "$UNIT"
+  : > "$BOX/state/calls.log"; : > "$BOX/state/as_runner.log"
+
+  # when the guard readies it for its next job
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+  local calls; calls=$(cat "$BOX/state/calls.log")
+
+  # then the unit is the one kept, written by the runner's user, and the daemon
+  # is restarted from it: nothing the job added runs again
+  assert_eq "should put the unit back as it was kept" "$(cat "$REF")" "$(cat "$UNIT")"
+  assert_contains "should write it as the runner's user" "$(cat "$BOX/state/as_runner.log")" ".docker.service.new"
+  assert_contains "should reload the runner's user manager" "$calls" "systemctl --user daemon-reload"
+  assert_contains "should restart the daemon from the unit" "$calls" "systemctl --user restart docker.service"
+}
+it_puts_the_daemon_unit_back_before_every_untrusted_job
+
+it_replaces_a_link_planted_as_the_daemon_unit_without_following_it() {
+  # given an untrusted runner whose daemon unit a job replaced with a link to a
+  # unit of its own
+  fresh_runner RUNNER_TRUST=untrusted
+  daemon_unit
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+  mkdir -p "$BOX/outside"; printf 'fixture-job-unit\n' > "$BOX/outside/evil.service"
+  rm -f "$UNIT"; ln -s "$BOX/outside/evil.service" "$UNIT"
+
+  # when the guard readies it for its next job
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+
+  # then the link itself is replaced by the kept unit, and what it pointed at
+  # is left alone
+  assert_eq "should replace the link with a real unit" "no" "$( [[ -L "$UNIT" ]] && echo yes || echo no)"
+  assert_eq "should put the kept unit in its place" "$(cat "$REF")" "$(cat "$UNIT")"
+  assert_eq "should not write through the link" "fixture-job-unit" "$(cat "$BOX/outside/evil.service")"
+}
+it_replaces_a_link_planted_as_the_daemon_unit_without_following_it
+
+it_removes_what_a_job_left_beside_the_unit_before_the_daemon_restarts() {
+  # given an untrusted runner whose job planted a drop-in beside the daemon's unit
+  fresh_runner RUNNER_TRUST=untrusted
+  daemon_unit
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+  put "${H}/.config/systemd/user/docker.service.d/override.conf"
+
+  # when the guard readies it for its next job, noting what is on disk at the
+  # moment the daemon restarts
+  guard_main 'use_pct() { echo 10; }
+    as_runner() {
+      if [[ "$*" == *"restart docker.service"* && -e "${H}/.config/systemd/user/docker.service.d" ]]; then
+        echo "drop-in at restart" >> "$BOX/state/restart.log"
+      fi
+      shift; env HOME="$H" "$@"
+    }' >/dev/null
+
+  # then the home was reset first: the restart never reads the drop-in
+  assert_eq "should remove a planted drop-in before the daemon restarts" "no" "$(exists "$BOX/state/restart.log")"
+  assert_eq "should leave no drop-in behind" "no" "$(exists "${H}/.config/systemd/user/docker.service.d")"
+}
+it_removes_what_a_job_left_beside_the_unit_before_the_daemon_restarts
+
+it_restores_a_daemon_unit_and_link_a_job_deleted() {
+  # given an untrusted runner whose job deleted the daemon's unit and the link
+  # that starts it at boot
+  fresh_runner RUNNER_TRUST=untrusted
+  daemon_unit
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+  rm -f "$UNIT" "${H}/.config/systemd/user/default.target.wants/docker.service"
+
+  # when the guard readies it for its next job
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+
+  # then both are back, so the daemon still starts after a reboot
+  assert_eq "should put a deleted unit back" "$(cat "$REF")" "$(cat "$UNIT" 2>/dev/null)"
+  assert_eq "should put back the link that enables it" "yes" \
+    "$( [[ -L "${H}/.config/systemd/user/default.target.wants/docker.service" ]] && echo yes || echo no)"
+}
+it_restores_a_daemon_unit_and_link_a_job_deleted
+
+it_restarts_the_daemon_before_every_untrusted_job_even_when_its_unit_is_unchanged() {
+  # given an untrusted runner whose unit is as kept
+  fresh_runner RUNNER_TRUST=untrusted
+  daemon_unit
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+  : > "$BOX/state/calls.log"; : > "$BOX/state/as_runner.log"
+
+  # when the guard readies it for its next job
+  guard_main 'use_pct() { echo 10; }' >/dev/null
+
+  # then nothing is rewritten, but the daemon is still restarted: the one
+  # running may be one the job started some other way
+  assert_not_contains "should not rewrite a unit that matches its copy" "$(cat "$BOX/state/as_runner.log")" ".docker.service.new"
+  assert_contains "should still restart the daemon" "$(cat "$BOX/state/calls.log")" "systemctl --user restart docker.service"
+}
+it_restarts_the_daemon_before_every_untrusted_job_even_when_its_unit_is_unchanged
+
+it_takes_no_copy_of_a_daemon_unit_that_is_a_link() {
+  # given a runner whose daemon unit is a link to a file only root may read,
+  # and no copy kept yet
+  fresh_runner
+  local secret; secret=$(secret_file)
+  mkdir -p "${H}/.config/systemd/user"
+  ln -s "$secret" "${H}/.config/systemd/user/docker.service"
+
+  # when the guard runs
+  local out; out=$(guard_main 'use_pct() { echo 40; }' 2>&1)
+
+  # then no copy is taken, and the file behind the link is read by nobody
+  assert_eq "should take no copy of a link" "no" "$(exists "$BOX/var/lib/runner-hardening/rootless/gha1.docker.service")"
+  assert_not_contains "should never print what the link points at" "$out" "$SECRET"
+}
+it_takes_no_copy_of_a_daemon_unit_that_is_a_link
+
 echo
 echo "disk guard, lru work policy"
 
@@ -761,6 +943,56 @@ it_never_walks_into_a_work_dir_that_is_a_link() {
     "yes yes" "$(exists "${outside}/3/s/main.c") $(exists "${outside}/_tasks/T_1/1.0.0/task.json")"
 }
 it_never_walks_into_a_work_dir_that_is_a_link
+
+echo
+echo "audit and diagnose"
+
+it_never_prints_a_file_through_a_link_planted_as_authorized_keys() {
+  # given runner 1's authorized_keys planted as a link to a file only root may
+  # read, runner 2's a real one, and root's own
+  new_box
+  local secret out log; secret=$(secret_file)
+  mkdir -p "$BOX/home/gha1/.ssh" "$BOX/home/gha2/.ssh" "$BOX/root/.ssh"
+  ln -s "$secret" "$BOX/home/gha1/.ssh/authorized_keys"
+  printf 'fixture-runner-key-placeholder\n' > "$BOX/home/gha2/.ssh/authorized_keys"
+  printf 'fixture-root-key-placeholder\n' > "$BOX/root/.ssh/authorized_keys"
+
+  # when the audit every converge prints lists them
+  out=$(admin_probe 'load_host_env; audit_authorized_keys' 2>&1)
+  log=$(cat "$BOX/state/as_runner.log" 2>/dev/null)
+
+  # then the link is never followed, a runner's own file is read as that
+  # runner's user, and root's as root
+  assert_not_contains "should never print what a planted link points at" "$out" "$SECRET"
+  assert_contains "should still show what a real one holds" "$out" "fixture-runner-key-placeholder"
+  assert_contains "should read a runner's file as that runner's user" "$log" \
+    "2 dd if=$BOX/home/gha2/.ssh/authorized_keys iflag=nofollow"
+  assert_contains "should show root's own" "$out" "fixture-root-key-placeholder"
+  assert_not_contains "should not read root's own as a runner" "$log" "$BOX/root/.ssh"
+}
+it_never_prints_a_file_through_a_link_planted_as_authorized_keys
+
+it_tails_only_a_real_diag_log_and_reads_it_as_the_runner() {
+  # given runner 1's real diag log, and beside it a link a job planted to a file
+  # only root may read, with a newer mtime so it sorts first
+  new_box
+  local secret d out; secret=$(secret_file); d="$BOX/opt/actions-runner/1/_diag"
+  mkdir -p "$d"
+  printf 'fixture listener log line\n' > "$d/Runner_20261112-000000-utc.log"
+  touch -d '1 hour ago' "$d/Runner_20261112-000000-utc.log"
+  ln -s "$secret" "$d/Worker_20991231-000000-utc.log"
+  touch -h -d 'tomorrow' "$d/Worker_20991231-000000-utc.log"
+
+  # when diagnose shows the newest one
+  out=$(admin_probe 'load_host_env; diag_tail 1' 2>&1)
+
+  # then the link is passed over for the newest real log, read as runner 1's user
+  assert_not_contains "should never print what a planted log link points at" "$out" "$SECRET"
+  assert_contains "should show the newest real log" "$out" "fixture listener log line"
+  assert_contains "should read it as the runner's user" "$(cat "$BOX/state/as_runner.log" 2>/dev/null)" \
+    "1 dd if=$d/Runner_20261112-000000-utc.log iflag=nofollow"
+}
+it_tails_only_a_real_diag_log_and_reads_it_as_the_runner
 
 echo
 echo "verify"

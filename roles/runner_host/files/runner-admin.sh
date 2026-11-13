@@ -242,20 +242,29 @@ mode_diagnose() {
     journalctl -u "$(unit_of "$n")" -n 25 --no-pager -o cat 2>/dev/null | sed 's/^/      /'
 
     # The runner writes its real errors here, not to the journal.
-    # shellcheck disable=SC2012  # newest first; these names never hold a newline
-    diag=$(ls -t "${d}"/_diag/*.log 2>/dev/null | head -1)
-    if [[ -n "$diag" ]]; then
-      echo "    ${C_DIM}tail of $(basename "$diag"):${C_R}"
-      tail -n 25 "$diag" 2>/dev/null | sed 's/^/      /'
-    else
-      echo "    ${C_DIM}no _diag logs - the runner never got far enough to write one${C_R}"
-    fi
+    diag_tail "$n"
   done
 
   # The flavour's own: its binary, and how to reproduce a start by hand.
   if has_hook vendor_diagnose; then vendor_diagnose; fi
   set -eo pipefail
   return 0
+}
+
+# diag_tail <n> - the tail of runner <n>'s newest diag log. The newest regular
+# file, never a link: a job can plant one with a future mtime, pointing at the
+# admin PAT, and diagnose would have printed it as root. Read through
+# read_untrusted (lib.sh), as the runner's user.
+diag_tail() {
+  local diag
+  diag=$(find "$(runner_dir "$1")/_diag" -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null \
+         | sort -rn | head -1 | cut -d' ' -f2-)
+  if [[ -n "$diag" ]]; then
+    echo "    ${C_DIM}tail of $(basename "$diag"):${C_R}"
+    read_untrusted "$diag" 2>/dev/null | tail -n 25 | sed 's/^/      /'
+  else
+    echo "    ${C_DIM}no _diag logs - the runner never got far enough to write one${C_R}"
+  fi
 }
 
 # ===========================================================================
@@ -318,9 +327,7 @@ mode_audit() {
   find /home /root -path '*/.config/systemd/user/*' -type f 2>/dev/null | sed 's/^/    /'
 
   echo "${C_B}authorized_keys${C_R}"
-  find /home /root -name authorized_keys 2>/dev/null | while read -r f; do
-    printf '    %s\n' "$f"; sed 's/^/        /' "$f"
-  done
+  audit_authorized_keys
 
   echo "${C_B}setuid binaries outside the distro baseline${C_R}"
   # Prune container image stores: every layer carries its own su/mount/passwd,
@@ -352,6 +359,19 @@ mode_audit() {
   warn "None of this is conclusive. A job with root could have hidden from all of it."
   warn "Reimaging is the only clean remediation; the converge is what you run after."
   set -eo pipefail
+  return 0
+}
+
+# Every authorized_keys in the homes and root's, with what it holds. Regular
+# files only, each read through read_untrusted (lib.sh): a job can plant its
+# own authorized_keys as a link to the admin PAT, and every converge prints
+# this audit. RUNNER_HOME_ROOT is /home on a box, so the second root is /root.
+audit_authorized_keys() {
+  local homes="${RUNNER_HOME_ROOT:-/home}" f
+  while IFS= read -r -d '' f; do
+    printf '    %s\n' "$f"
+    read_untrusted "$f" 2>/dev/null | sed 's/^/        /'
+  done < <(find "$homes" "${homes%/home}/root" -name authorized_keys -type f -print0 2>/dev/null)
   return 0
 }
 
@@ -418,20 +438,25 @@ _probe_run() {
 mode_sandbox_probe() {
   head1 "Sandbox probe"
   command -v systemd-run >/dev/null || die "systemd-run not available"
-  local u dir build prop i j
+  local u dir src build prop i j
   u=$(runner_user 1); dir="$(runner_dir 1)/.probe"
   id "$u" &>/dev/null || die "${u} does not exist - converge this host first"
 
   # A payload shaped like the archive that failed: a dot-directory, nested
-  # dot-directories, and files inside them.
-  rm -rf "${dir:?}"; install -d -m 0755 -o "$u" -g "$u" "$dir"
-  build="${dir}/src/sample-action/.docs/examples/sample/.github/workflows"
+  # dot-directories, and files inside them. Built in a scratch directory of
+  # root's own and only then handed over: the runner tree is job-writable, and
+  # root writing into it can be led through a link a job planted there. So
+  # everything inside the tree is done as the runner's user, the cleanup too.
+  src=$(mktemp -d)
+  build="${src}/sample-action/.docs/examples/sample/.github/workflows"
   install -d -m 0755 "$build"
   echo "x" > "${build}/ci.yaml"
-  echo "y" > "${dir}/src/sample-action/.docs/readme.md"
-  tar -czf "${dir}/payload.tar.gz" -C "${dir}/src" sample-action
-  rm -rf "${dir}/src"
-  chown -R "$u:$u" "$dir"
+  echo "y" > "${src}/sample-action/.docs/readme.md"
+  tar -czf "${src}/payload.tar.gz" -C "$src" sample-action
+  chmod 0755 "$src"; chmod 0644 "${src}/payload.tar.gz"
+  as_runner 1 sh -c 'rm -rf -- "$1" && mkdir -m 0755 -- "$1" && cp -- "$2" "$1/payload.tar.gz"' \
+    _ "$dir" "${src}/payload.tar.gz" || { rm -rf "${src:?}"; die "could not hand the payload to ${u} in ${dir}"; }
+  rm -rf "${src:?}"
   ok "payload built (mirrors the failing action tarball)"
 
   echo
@@ -446,7 +471,7 @@ mode_sandbox_probe() {
   build_sandbox_props_from_unit
   if (( ${#SANDBOX_PROPS[@]} == 0 )); then
     ok "the live unit applies no sandbox restrictions - nothing to test"
-    rm -rf "${dir:?}"; return 0
+    as_runner 1 rm -rf -- "$dir"; return 0
   fi
   echo
   log "testing the ${#SANDBOX_PROPS[@]} settings this unit REALLY applies"
@@ -462,7 +487,7 @@ mode_sandbox_probe() {
     err "    sudo -u ${u} strace -f -e trace=mkdir,mkdirat,openat,openat2 tar -xzf ${dir}/payload.tar.gz -C /tmp 2>&1 | grep -i enosys"
     err "    mount | grep -E ' / | /opt '"
     err "    findmnt -no FSTYPE,OPTIONS --target ${RUNNER_BASE}"
-    rm -rf "${dir:?}"; return 1
+    as_runner 1 rm -rf -- "$dir"; return 1
   fi
 
   echo
@@ -470,7 +495,7 @@ mode_sandbox_probe() {
   if _probe_run "$u" "$dir"; then ok "  extracts cleanly"; else
     err "  FAILS even with no sandbox - this is not the unit, it is the filesystem"
     err "  check: mount | grep -E ' /opt| / '"
-    rm -rf "${dir:?}"; return 1
+    as_runner 1 rm -rf -- "$dir"; return 1
   fi
 
   log "the live unit's property set"
@@ -479,7 +504,7 @@ mode_sandbox_probe() {
     echo
     echo "  ${C_DIM}If a job still fails, the sandbox is not the cause. Capture the exact${C_R}"
     echo "  ${C_DIM}error and check disk (df -h /opt) and for a stale workspace.${C_R}"
-    rm -rf "${dir:?}"; return 0
+    as_runner 1 rm -rf -- "$dir"; return 0
   fi
   err "  reproduced the failure with the settings this unit really uses"
 
@@ -510,7 +535,7 @@ mode_sandbox_probe() {
     echo "    ${C_CYN}${0##*/} sandbox-relax${C_R}   (drop-in override)"
     echo "    ${C_CYN}a converge${C_R}             (rewrites the base unit)"
   fi
-  rm -rf "${dir:?}"
+  as_runner 1 rm -rf -- "$dir"
 }
 
 # Drop a per-instance override neutralising the seccomp-bearing directives,

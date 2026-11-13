@@ -84,13 +84,14 @@ confirm() {
 
 # The keys host.env carries. Cleared before the file is read, so what a script
 # sees is what this box's file says, never something inherited from whatever
-# started the script. The last three are never written on a box: see below.
+# started the script. The last five are never written on a box: see below.
 HOST_ENV_KEYS=(RUNNER_FLAVOR RUNNER_USER_PREFIX RUNNER_BASE RUNNER_UNIT RUNNER_SLICE
                RUNNER_SBIN_PREFIX RUNNER_CONFIG_DIR RUNNER_COUNT RUNNER_TRUST
                RUNNER_WORKER_PATTERN RUNNER_WORK_POLICY RUNNER_TOOLCACHE_PREFIX
                RUNNER_DISK_SOFT RUNNER_DISK_HARD RUNNER_STALE_DAYS RUNNER_DRAIN_TIMEOUT
                RUNNER_HEAVY_RUNNERS RUNNER_HOME_KEEP RUNNER_OLD_USERS
-               RUNNER_HOME_ROOT RUNNER_RUN_ROOT RUNNER_SYSTEMD_DIR)
+               RUNNER_HOME_ROOT RUNNER_RUN_ROOT RUNNER_SYSTEMD_DIR
+               RUNNER_STATE_DIR RUNNER_CGROUP_ROOT)
 
 # load_host_env -> 1 when this box has no usable host.env. RUNNER_HOST_ENV
 # names another file; only the test suite does that.
@@ -101,12 +102,14 @@ load_host_env() {
   # shellcheck source=/dev/null
   . "$f" || return 1
 
-  # Three roots a box's host.env never names, so on a box they are always the
+  # Five roots a box's host.env never names, so on a box they are always the
   # real ones. The test suite names them, to run these scripts as non-root
   # against a scratch tree laid out like a box.
   RUNNER_HOME_ROOT="${RUNNER_HOME_ROOT:-/home}"
   RUNNER_RUN_ROOT="${RUNNER_RUN_ROOT:-/run}"
   RUNNER_SYSTEMD_DIR="${RUNNER_SYSTEMD_DIR:-/etc/systemd/system}"
+  RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/runner-hardening}"
+  RUNNER_CGROUP_ROOT="${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}"
 
   RUNNER_FLAVOR="${RUNNER_FLAVOR:-}"
   RUNNER_SLICE="${RUNNER_SLICE:-}"
@@ -165,7 +168,11 @@ dropin_dir()       { printf '%s/%s.d\n' "${RUNNER_SYSTEMD_DIR:-/etc/systemd/syst
 # the count of cycles that ran no job. tmpfs, root-only, one directory per unit
 # name (/run/gha-runner, /run/azp-agent).
 run_dir()          { printf '%s/%s\n' "${RUNNER_RUN_ROOT:-/run}" "$RUNNER_UNIT"; }
-ensure_run_dir()   { install -d -m 0711 -o root -g root "$(run_dir)"; }
+# What must survive a reboot, root-only: /var/lib/runner-hardening.
+state_dir()        { printf '%s\n' "${RUNNER_STATE_DIR:-/var/lib/runner-hardening}"; }
+# ensure_root_dir <dir> <mode> - root:root, whatever was there before
+ensure_root_dir()  { install -d -m "$2" -o root -g root "$1"; }
+ensure_run_dir()   { ensure_root_dir "$(run_dir)" 0711; }
 
 # as_runner <n> cmd... - runs cmd as runner <n>'s user, never as root, with the
 # environment its jobs have. Everything these scripts delete is job-writable,
@@ -179,6 +186,41 @@ as_runner() {
   setpriv --reuid="$u" --regid="$u" --init-groups -- \
     env HOME="$(runner_home "$n")" XDG_RUNTIME_DIR="/run/user/${uid}" \
         DOCKER_HOST="unix:///run/user/${uid}/docker.sock" "$@"
+}
+
+# A file under a runner's home, its tree or its tool cache is one a job can
+# have written - or replaced with a link to any file root can read, the admin
+# PAT among them. Printed by a root `cat`, that link would put the file in the
+# output of verify, diagnose or audit, which every converge shows. So such a
+# file is only ever read as its runner's user, and never through a link at its
+# end; find it with `find -type f`, which does not follow links either.
+
+# instance_of_path <path> -> the instance whose home, tree or tool cache <path>
+# lies in; status 1 when it lies in none of them
+instance_of_path() {
+  local p="$1" root rest n
+  [[ -n "${RUNNER_USER_PREFIX:-}" && -n "${RUNNER_BASE:-}" ]] || return 1
+  for root in "${RUNNER_HOME_ROOT:-/home}/${RUNNER_USER_PREFIX}" "${RUNNER_BASE}/" \
+              "${RUNNER_TOOLCACHE_PREFIX:-/opt/hostedtoolcache-}${RUNNER_USER_PREFIX}"; do
+    [[ "$p" == "$root"* ]] || continue
+    rest="${p#"$root"}"; n="${rest%%/*}"
+    if [[ "$n" =~ ^[1-9][0-9]*$ && "$rest" == "${n}/"* ]]; then
+      printf '%s\n' "$n"; return 0
+    fi
+  done
+  return 1
+}
+
+# read_untrusted <file> -> its content: read as the runner whose home, tree or
+# tool cache it lies in (as the caller only outside all of them), and not at all
+# when its last component is a link
+read_untrusted() {
+  local n
+  if n=$(instance_of_path "$1"); then
+    as_runner "$n" dd if="$1" iflag=nofollow status=none
+  else
+    dd if="$1" iflag=nofollow status=none
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -206,24 +248,35 @@ existing_instances() {
 
 # Is runner <n> executing a job? Its listener runs the whole time a unit is up,
 # so that proves nothing; the worker (RUNNER_WORKER_PATTERN: Runner.Worker,
-# Agent.Worker) exists only while a job is actually running. Each runner owns
-# its own UNIX user, which is what makes this answerable per instance without
-# asking the service it is registered with.
+# Agent.Worker) exists only while a job is actually running. That is answerable
+# per instance without asking the service the runner is registered with.
+#
+# Looked for in the unit's own cgroup, and nowhere else. Matching every process
+# of the runner's user (pgrep -u) counted whatever a job left behind under a
+# worker's name - in a rootless container, or a service of its user manager -
+# so a job could make its runner look busy for good, and hold every reboot off
+# and every drain to its full budget. Nothing in the unit's cgroup outlives the
+# unit: a job's processes there end with the job.
 #
 # runner_busy <n> -> 0 busy, 1 idle, 2 cannot tell. Whatever acts on "idle" -- a
 # reboot, a restart -- has to see a 1, not merely "not 0".
 runner_busy() {
-  local u rc=0
+  local cg dir pid cmd
   [[ -n "${RUNNER_WORKER_PATTERN:-}" ]] || return 2
-  u=$(runner_user "$1")
-  pgrep -u "$u" -f "$RUNNER_WORKER_PATTERN" >/dev/null 2>&1 || rc=$?
-  # pgrep exits 2 for a user that does not exist, the status it gives a real
-  # error too. Nothing can run as a user that does not exist: that one is idle.
-  if (( rc > 1 )) && ! id -u "$u" >/dev/null 2>&1; then
-    return 1
-  fi
-  if (( rc > 1 )); then return 2; fi
-  return "$rc"
+  cg=$(systemctl show -p ControlGroup --value "$(unit_of "$1")" 2>/dev/null) || return 2
+  # No cgroup is a unit that runs nothing at all: a stopped one, or one that is
+  # not there. Nothing of it can be busy.
+  [[ -n "$cg" ]] || return 1
+  dir="${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}${cg}"
+  [[ -d "$dir" ]] || return 1
+  [[ -r "${dir}/cgroup.procs" ]] || return 2
+  while read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # The command line as pgrep -f matches it: the arguments, space-separated.
+    cmd=$( { tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null ) || continue
+    if [[ "$cmd" =~ $RUNNER_WORKER_PATTERN ]]; then return 0; fi
+  done < <(find "$dir" -name cgroup.procs -type f -exec cat {} + 2>/dev/null)
+  return 1
 }
 
 # unit_prop <n> <Property> -> what systemd says, "?" when it cannot say

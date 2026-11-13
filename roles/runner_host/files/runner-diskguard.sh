@@ -43,7 +43,8 @@ export LC_ALL=C
 # shellcheck source=lib.sh
 . "${RUNNER_LIB_DIR:-/usr/local/lib/runner-hardening}/lib.sh" || exit 0
 
-# All a reset keeps of $HOME: the rootless daemon's user unit, the link that
+# All a reset keeps of $HOME: the rootless daemon's user unit (put back from a
+# root-owned copy before every untrusted job: see restore_unit), the link that
 # enables it, and its data root (emptied through Docker, never with rm under a
 # running daemon). Nothing broader. A job can write anywhere in $HOME, and a
 # Docker CLI plugin, a credential helper, a user unit beside the daemon's or a
@@ -299,17 +300,88 @@ LRU_STEPS=(
   home:reset_home
 )
 
+# ---- the rootless daemon's user unit ----------------------------------------
+# A reset keeps the unit the rootless daemon runs from, and that unit lives in
+# $HOME, where a job can write: a fork PR could add an ExecStartPre= to it, or
+# put a directory of its own first in the daemon's PATH, and either would run
+# again after every job and every reboot. So for an untrusted runner the unit
+# is never taken on trust. A root-owned copy of each runner's unit is kept in
+# the state directory: taken the first time the guard runs for that runner,
+# which is before its first job, and never overwritten (the runner_host role
+# may write the same file itself, as soon as it creates the unit). Before every
+# untrusted job the unit is put back from that copy when the two differ, and
+# the daemon is restarted from it, whatever it was running from until then.
+UNIT_REL=".config/systemd/user/docker.service"
+WANTS_REL=".config/systemd/user/default.target.wants/docker.service"
+
+unit_reference() { printf '%s/rootless/%s.docker.service\n' "$(state_dir)" "$(runner_user "$N")"; }
+
+# keep_unit_reference - takes the reference copy, when there is none yet and
+# the runner has a unit to take it from. Read as the runner's user, never
+# through a link (read_untrusted, lib.sh); written by root, into root's own.
+keep_unit_reference() {
+  local ref tmp
+  ref=$(unit_reference)
+  [[ -e "$ref" ]] && return 0
+  [[ -f "${H}/${UNIT_REL}" && ! -L "${H}/${UNIT_REL}" ]] || return 0
+  ensure_root_dir "${ref%/*}" 0700
+  tmp="${ref}.new"
+  if (umask 077; read_untrusted "${H}/${UNIT_REL}" > "$tmp") 2>/dev/null && [[ -s "$tmp" ]]; then
+    mv -f "$tmp" "$ref"
+    log "kept the rootless daemon's user unit as ${ref}, to put it back from before every untrusted job"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# restore_unit - puts the unit back from its reference copy when they differ,
+# keeps it enabled, and restarts the daemon from it
+restore_unit() {
+  local ref dir
+  ref=$(unit_reference)
+  if [[ ! -s "$ref" ]]; then
+    log "no reference copy of the rootless daemon's user unit at ${ref} - left as it is"
+    return 0
+  fi
+  dir="${H}/.config/systemd/user"
+  if ! cmp -s "$ref" <(read_untrusted "${H}/${UNIT_REL}" 2>/dev/null); then
+    # Written by the runner's user, from the root-owned copy on its stdin, and
+    # renamed into place: over a link or a directory a job put there, never
+    # through it.
+    as_runner "$N" sh -c 'rm -rf -- "$1/docker.service" "$1/.docker.service.new" && mkdir -p -- "$1" &&
+      cat > "$1/.docker.service.new" && mv -f -- "$1/.docker.service.new" "$1/docker.service"' \
+      _ "$dir" < "$ref" 2>/dev/null
+    log "put the rootless daemon's user unit back from ${ref}: a job had changed it"
+  fi
+  if [[ ! -L "${H}/${WANTS_REL}" ]]; then
+    as_runner "$N" sh -c 'rm -rf -- "$2" && mkdir -p -- "${2%/*}" && ln -s -- "$1" "$2"' \
+      _ "${H}/${UNIT_REL}" "${H}/${WANTS_REL}" 2>/dev/null
+  fi
+  # Whatever the files say now, the daemon still running may be one a job
+  # started some other way, or from a unit it changed and changed back.
+  as_runner "$N" systemctl --user daemon-reload >/dev/null 2>&1
+  as_runner "$N" timeout 120 systemctl --user restart docker.service >/dev/null 2>&1 \
+    || log "the rootless daemon did not restart - see: journalctl --user -u docker.service -M $(runner_user "$N")@"
+  return 0
+}
+
 # An untrusted runner has no cache worth keeping warm, only what a fork PR
 # could leave for the next job: a ~/.gitconfig hook, a poisoned build cache, a
-# Docker CLI plugin, a tampered image. So it gets every step, before every job,
-# whatever the disk says, and whatever its work policy: _work goes entirely.
-# The wrapper's own post-job wipe cannot be the only defence: it runs as the
-# job's own user, so a job can kill it before its EXIT trap ever fires.
+# Docker CLI plugin, a tampered image or daemon unit. So it gets every step,
+# before every job, whatever the disk says, and whatever its work policy: _work
+# goes entirely. The wrapper's own post-job wipe cannot be the only defence: it
+# runs as the job's own user, so a job can kill it before its EXIT trap fires.
+#
+# The home goes before the daemon restarts, so nothing a job left beside its
+# unit (a drop-in, an environment.d file) is read by that restart; and Docker is
+# pruned after it, through a daemon started from the unit just checked.
 reset_runner() {
   drop_leftover_work
-  prune_docker
   wipe_toolcache
   reset_home
+  restore_unit
+  prune_docker
   log "reset to its installed state before the next job (trust=${RUNNER_TRUST:-unset})"
 }
 
@@ -354,6 +426,10 @@ guard_init() {
 main() {
   [[ "${1:-}" =~ ^[0-9]+$ ]] || { echo "usage: ${0##*/} <runner-number>" >&2; exit 0; }
   guard_init "$1" || exit 0
+  # For every runner, whatever its trust: on a box installed with this guard
+  # that is before its first job, so a box later made untrusted has a copy no
+  # job could have touched.
+  keep_unit_reference
 
   if ! runner_trusted; then
     reset_runner

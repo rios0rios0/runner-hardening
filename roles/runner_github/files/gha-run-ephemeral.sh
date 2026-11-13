@@ -22,6 +22,8 @@ set -euo pipefail
 # reset before the next job is what an untrusted runner really relies on: this
 # runs as the job's own user, and a job can kill it before it fires.
 cleanup() {
+  # The registration is spent: nothing after the job needs it in its environment.
+  unset ACTIONS_RUNNER_INPUT_JITCONFIG
   docker ps -aq       2>/dev/null | xargs -r docker rm -f          >/dev/null 2>&1 || true
   docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f   >/dev/null 2>&1 || true
   if runner_trusted; then
@@ -46,13 +48,28 @@ main() {
 
   trap cleanup EXIT
 
+  # The registration is a credential, and an argument is not private: every
+  # process on the box can read /proc/<pid>/cmdline, and ProtectProc=invisible
+  # hides it only inside the runner units, not from another runner's user
+  # services. A process's environment is its owner's alone. Runner.Listener
+  # takes any ACTIONS_RUNNER_INPUT_<name> as the argument --<name>, masks it in
+  # its logs when it is a secret, and removes it from its own environment before
+  # the worker and the job start (actions/runner, CommandSettings.cs).
+  export ACTIONS_RUNNER_INPUT_JITCONFIG="$jit"
+
   # Deliberately NOT exec: exec replaces this shell, which discards the EXIT
   # trap and silently skips every post-job cleanup above. Run it as a child,
   # forward SIGTERM so the runner drains its job, then let the trap fire.
-  ./run.sh --jitconfig "$jit" &
+  ./run.sh &
   RUNNER_PID=$!
   trap 'kill -TERM "$RUNNER_PID" 2>/dev/null || true' TERM INT
   wait "$RUNNER_PID" || rc=$?
+  # A trapped signal ends that wait at once, with the runner still winding its
+  # job down; wait for it, so the cleanup runs after it and the status is its own.
+  while kill -0 "$RUNNER_PID" 2>/dev/null; do
+    rc=0
+    wait "$RUNNER_PID" || rc=$?
+  done
   exit "$rc"
 }
 

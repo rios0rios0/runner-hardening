@@ -158,7 +158,7 @@ reap_probe() {
   (
     # shellcheck source=../../roles/runner_github/files/gha-jitreap.sh
     . "${GITHUB_FILES}/gha-jitreap.sh"
-    ensure_run_dir() { mkdir -p "$(run_dir)"; }
+    ensure_root_dir() { mkdir -p "$1"; }
     main 1
   )
 }
@@ -241,7 +241,9 @@ echo "the one-job wrapper"
 
 # A runner tree whose run.sh stands in for the runner's own: it records what it
 # was handed and from where, leaves something in _work the way a job does, and
-# with RUNSH_SLEEP set waits until it is told to stop.
+# with RUNSH_SLEEP set waits until it is told to stop. Told to stop, it winds
+# its job down for a moment, the way the runner does, notes whether anything
+# was cleaned up under it in the meantime, and exits 7.
 wrapper_tree() {
   local r="$BOX/opt/actions-runner/1"
   mkdir -p "$r"
@@ -250,13 +252,22 @@ wrapper_tree() {
 log="${STANDIN_STATE:?}/run.log"
 {
   printf 'args=%s\n' "$*"
+  printf 'jitenv=%s\n' "${ACTIONS_RUNNER_INPUT_JITCONFIG-unset}"
   printf 'ppid=%s\n' "$PPID"
   printf 'work-entries=%s\n' "$(find _work -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
   printf 'toolsdir=%s\n' "${AGENT_TOOLSDIRECTORY-unset}"
 } >> "$log"
 mkdir -p _work/left-by-this-job && : > _work/left-by-this-job/out
+winddown() {
+  echo "got=TERM" >> "$log"
+  kill "$sleeper" 2>/dev/null
+  sleep 0.3
+  printf 'work-at-exit=%s\n' "$( [[ -d _work ]] && echo yes || echo no )" >> "$log"
+  printf 'cleaned-before-exit=%s\n' "$( [[ -e "${STANDIN_STATE}/docker.log" ]] && echo yes || echo no )" >> "$log"
+  exit 7
+}
 if [[ -n "${RUNSH_SLEEP:-}" ]]; then
-  trap 'echo "got=TERM" >> "$log"; kill "$sleeper" 2>/dev/null; exit 143' TERM
+  trap winddown TERM
   sleep "$RUNSH_SLEEP" & sleeper=$!
   echo "ready" >> "$log"
   wait "$sleeper"
@@ -290,7 +301,9 @@ it_runs_exactly_one_job_in_a_fresh_workspace_and_cleans_up_after_it() {
   # workspace, as a child rather than exec'd; the job's status is the
   # wrapper's; and after it nothing of the job is left
   assert_eq "should start the runner exactly once" "1" "$(grep -c '^args=' <<<"$log")"
-  assert_contains "should hand the runner this cycle's single-use registration" "$log" "args=--jitconfig fixture-jit-placeholder"
+  assert_contains "should hand the runner this cycle's single-use registration in its environment" \
+    "$log" "jitenv=fixture-jit-placeholder"
+  assert_eq "should never put the registration on the runner's command line" "args=" "$(grep '^args=' <<<"$log")"
   assert_contains "should start the job in an emptied workspace" "$log" "work-entries=0"
   assert_contains "should run the runner as its child, never exec it" "$log" "ppid=${WRAPPER_PID}"
   assert_eq "should exit with the job's own status" "3" "$rc"
@@ -318,25 +331,29 @@ it_wipes_docker_whole_after_an_untrusted_runners_job() {
 }
 it_wipes_docker_whole_after_an_untrusted_runners_job
 
-it_forwards_a_stop_to_the_runner_and_still_cleans_up() {
+it_forwards_a_stop_to_the_runner_and_cleans_up_only_after_it() {
   # given a runner in the middle of a job
   new_box; wrapper_tree
   run_wrapper RUNSH_SLEEP=5
-  local _
+  local _ rc=0 log
   for _ in $(seq 1 100); do grep -qx ready "$BOX/state/run.log" 2>/dev/null && break; sleep 0.05; done
 
-  # when systemd stops the unit
+  # when systemd stops the unit, and the runner takes a moment to wind down
   kill -TERM "$WRAPPER_PID"
-  wait "$WRAPPER_PID"
-  for _ in $(seq 1 100); do grep -qx 'got=TERM' "$BOX/state/run.log" 2>/dev/null && break; sleep 0.05; done
+  wait "$WRAPPER_PID" || rc=$?
+  log=$(cat "$BOX/state/run.log" 2>/dev/null)
 
-  # then the runner hears the stop itself, so it can wind its job down, and
-  # the post-job cleanup still runs
-  assert_contains "should forward the stop to the runner" "$(cat "$BOX/state/run.log" 2>/dev/null)" "got=TERM"
+  # then the runner hears the stop itself; nothing is cleaned up from under it
+  # while it winds its job down; the cleanup still runs once it has exited;
+  # and the status is the runner's own, not the signal's
+  assert_contains "should forward the stop to the runner" "$log" "got=TERM"
+  assert_contains "should leave the workspace in place until the runner has exited" "$log" "work-at-exit=yes"
+  assert_contains "should not clean up Docker until the runner has exited" "$log" "cleaned-before-exit=no"
+  assert_eq "should exit with the runner's own status" "7" "$rc"
   assert_eq "should still remove the workspace" "no" "$(exists "$BOX/opt/actions-runner/1/_work")"
   assert_contains "should still remove the job's containers" "$(cat "$BOX/state/docker.log" 2>/dev/null)" "docker rm -f c1 c2"
 }
-it_forwards_a_stop_to_the_runner_and_still_cleans_up
+it_forwards_a_stop_to_the_runner_and_cleans_up_only_after_it
 
 echo
 echo "vendor hooks"
@@ -350,6 +367,8 @@ vendor_probe() {
     . "${RUNNER_LIB_DIR}/lib.sh"
     load_host_env || { echo "load_host_env failed"; exit 1; }
     load_vendor
+    # The privilege drop, root-only: run as whoever runs the suite, recorded.
+    as_runner() { printf '%s\n' "$*" >> "$BOX/state/as_runner.log"; shift; "$@"; }
     eval "$1"
   )
 }
@@ -424,5 +443,90 @@ it_names_the_likely_cause_only_when_a_runner_is_down() {
   assert_eq "should not reach the network with no token stored" "no" "$(exists "$BOX/state/curl.log")"
 }
 it_names_the_likely_cause_only_when_a_runner_is_down
+
+it_never_prints_a_file_through_a_link_planted_as_the_runner_version() {
+  # given runner 1's tree, where a job replaced bin/runnerversion with a link
+  # to a file only root may read
+  new_box
+  printf '%s\n' "fixture-secret-placeholder" > "$BOX/secret"; chmod 0600 "$BOX/secret"
+  mkdir -p "$BOX/opt/actions-runner/1/bin"
+  ln -s "$BOX/secret" "$BOX/opt/actions-runner/1/bin/runnerversion"
+
+  # when diagnose shows the runner binary, and then once the file is real
+  local planted real
+  planted=$(vendor_probe 'vendor_diagnose' 2>&1)
+  rm -f "$BOX/opt/actions-runner/1/bin/runnerversion"
+  printf '2.338.2\n' > "$BOX/opt/actions-runner/1/bin/runnerversion"
+  real=$(vendor_probe 'vendor_diagnose' 2>&1)
+
+  # then the link is never followed, and the real file is read as the runner's user
+  assert_not_contains "should never print what a planted link points at" "$planted" "fixture-secret-placeholder"
+  assert_contains "should show the version a real file holds" "$real" "2.338.2"
+  assert_contains "should read it as the runner's user" "$(cat "$BOX/state/as_runner.log" 2>/dev/null)" \
+    "1 dd if=$BOX/opt/actions-runner/1/bin/runnerversion iflag=nofollow"
+}
+it_never_prints_a_file_through_a_link_planted_as_the_runner_version
+
+echo
+echo "which registrations are this host's"
+
+# host_runners -> GitHub's runner list as a box named build-1 sees it, beside
+# a box named build-10: GH_RUNNERS for vendor_probe
+host_runners() {
+  local now old young
+  now=$(date +%s); old=$(( now - 3600 )); young=$(( now - 30 ))
+  cat <<EOF
+[{"id":1,"name":"build-1-1-${old}","status":"offline"},
+ {"id":2,"name":"build-1-2-${young}","status":"offline"},
+ {"id":3,"name":"build-10-2-${old}","status":"offline"},
+ {"id":4,"name":"build-10-1-${young}","status":"offline"},
+ {"id":5,"name":"build-1","status":"offline"},
+ {"id":6,"name":"build-1-3-${old}","status":"online"},
+ {"id":7,"name":"other-build-1-1-${old}","status":"offline"}]
+EOF
+}
+
+it_reaps_only_this_hosts_own_leaked_registrations() {
+  # given GitHub's list seen from build-1: its own runners, offline and online,
+  # minted an hour ago and seconds ago, beside build-10's and another host's
+  # whose name holds build-1
+  if ! command -v jq >/dev/null; then
+    printf 'skip  reaping by host name: jq is not installed\n'; return
+  fi
+  new_box
+  local runners doomed orphans
+  runners=$(host_runners)
+
+  # when reap and the janitor each pick what to delete
+  doomed=$(vendor_probe "GH_RUNNERS='${runners}'; gh_doomed build-1 \$(date +%s) | cut -f1 | tr '\n' ' '")
+  orphans=$(vendor_probe "GH_RUNNERS='${runners}'; gh_orphans build-1 \$(date +%s) | tr '\n' ' '")
+
+  # then each takes only build-1's own: never build-10's, which merely starts
+  # the same way, never one minted in the last five minutes - still
+  # connecting - and never an online one; the janitor, asking nobody, takes no
+  # old static registration
+  assert_eq "should reap only this host's offline registrations older than five minutes" "1 5 " "$doomed"
+  assert_eq "should let the janitor reap only this host's old JIT registrations" "1 " "$orphans"
+}
+it_reaps_only_this_hosts_own_leaked_registrations
+
+it_counts_only_this_hosts_runners_in_verify() {
+  # given the same list, seen from build-1
+  if ! command -v jq >/dev/null; then
+    printf 'skip  counting by host name: jq is not installed\n'; return
+  fi
+  new_box
+  local runners all online
+  runners=$(host_runners)
+
+  # when verify counts this host's runners, and those online
+  all=$(vendor_probe "GH_RUNNERS='${runners}'; gh_count build-1")
+  online=$(vendor_probe "GH_RUNNERS='${runners}'; gh_count build-1 online")
+
+  # then build-10's and the other host's are not counted as build-1's
+  assert_eq "should count only this host's registrations" "4" "$all"
+  assert_eq "should count only this host's online runners" "1" "$online"
+}
+it_counts_only_this_hosts_runners_in_verify
 
 finish
