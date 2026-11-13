@@ -19,10 +19,13 @@
             | map(attribute='_runner_host_n') | list) }}
 
 # A user manager takes its environment from PAM, and pam_env reads
-# /etc/environment: an image that sets XDG_RUNTIME_DIR there for its own login
-# user hands that one directory to every account's manager, so each runner's
-# rootless daemon refuses to start ("XDG_RUNTIME_DIR needs to be set and
-# writable"). Pinned per user, root-owned, for every user's docker.service.
+# /etc/environment: an image that sets the XDG base directories there for its
+# own login user hands them to every account's manager. Each runner's rootless
+# daemon then refuses to start ("XDG_RUNTIME_DIR needs to be set and
+# writable"), reads another user's daemon.json (XDG_CONFIG_HOME), or would put
+# its whole data root in another home (XDG_DATA_HOME). So for every user's
+# docker.service, root-owned: the runtime directory is pinned to the user's own,
+# and the other base directories are unset, which falls back to $HOME.
 # /run/user/%U, not %t: %t expands to that same inherited value.
 - name: 'Create the drop-in directory for every user docker.service'
   ansible.builtin.file:
@@ -39,6 +42,7 @@
       # Managed by rios0rios0.runner_hardening (runner_host). See rootless.yaml.
       [Service]
       Environment=XDG_RUNTIME_DIR=/run/user/%U
+      UnsetEnvironment=XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_CONFIG_DIRS XDG_DATA_DIRS
     owner: 'root'
     group: 'root'
     mode: '0644'
