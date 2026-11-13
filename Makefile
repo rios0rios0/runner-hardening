@@ -11,8 +11,7 @@ COMMON_MK := $(SCRIPTS_DIR)/makefiles/common.mk
 # Every script that ships to a box, plus the suites that drive them. Runtime
 # scripts carry a .sh suffix in the repository (the roles drop it on install)
 # so that the shared ShellCheck target, which only lints *.sh, covers them.
-SHELL_SOURCES := $(sort $(shell find roles test -name '*.sh' -type f 2>/dev/null) \
-                        $(wildcard harden-gha-runners.sh fleet.sh))
+SHELL_SOURCES := $(sort $(shell find roles test -name '*.sh' -type f 2>/dev/null))
 PLAYBOOKS     := $(sort $(wildcard playbooks/*.yaml))
 
 # The collection is the repository root itself. Ansible only finds a collection
@@ -70,10 +69,9 @@ test: collection
 	@for f in $(SHELL_SOURCES); do \
 		bash -n "$$f" && echo "  ok  $$f parses" || exit 1; \
 	done
-	@if [ -f test/bootstrap_test.sh ]; then bash test/bootstrap_test.sh; fi
-	@if [ -f test/runtime/run.sh ]; then bash test/runtime/run.sh; fi
+	@bash test/runtime/run.sh
 	@for t in test/ansible/policy.yaml test/ansible/templates.yaml; do \
-		if [ -f "$$t" ]; then ansible-playbook "$$t" || exit 1; fi; \
+		ansible-playbook "$$t" || exit 1; \
 	done
 	@for p in $(PLAYBOOKS); do \
 		ansible-playbook --syntax-check -i localhost, "$$p" >/dev/null \
