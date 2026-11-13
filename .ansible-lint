@@ -1,0 +1,18 @@
+---
+profile: 'production'
+exclude_paths:
+  # ansible-lint installs a copy of the collection here; linting it reports every file twice.
+  - '.ansible/'
+  - 'build/'
+  - '.changes/'
+  - '.github/'
+  - 'inventory/local/'
+  - 'reports/'
+
+skip_list:
+  # The collection's variables are one public namespace shared by its three
+  # roles on purpose: `runner_*` is the host contract every vendor role reads
+  # and sets, `runner_github_*` and `runner_azp_*` are the vendor answers. A
+  # per-role prefix (`runner_host_*`, `runner_azure_devops_*`) would split one
+  # interface across three spellings an inventory has to know apart.
+  - 'var-naming[no-role-prefix]'
