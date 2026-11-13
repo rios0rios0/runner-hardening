@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed `--check` failing on a first converge that installs `runner_extra_binaries`: a dry run creates no download cache, so the download into it is now skipped until a real run has created it'
+time: '2026-11-13T06:33:49.607913922Z'
