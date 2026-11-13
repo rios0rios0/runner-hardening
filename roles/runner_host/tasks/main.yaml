@@ -1,0 +1,18 @@
+---
+# This role is not applied on its own. A vendor role sets the flavour first and
+# then includes it three times, in order:
+#
+#   tasks_from: prepare   preflight, users, rootless Docker, prerequisites
+#   tasks_from: finish    the unit, the memory policy, timers, verify
+#   tasks_from: retire    runners above the count, drained and removed
+#
+# and tasks_from: summary at the very end (runner_summary_lines adds the
+# vendor's own lines). The neutral playbooks (verify, diagnose, drain,
+# uninstall) use tasks_from: host_env, require_admin and uninstall.
+- name: 'Explain how this role is used'
+  ansible.builtin.fail:
+    msg: >-
+      rios0rios0.runner_hardening.runner_host is driven by a vendor role.
+      Apply rios0rios0.runner_hardening.runner_github or
+      rios0rios0.runner_hardening.runner_azure_devops (playbooks/github.yaml,
+      playbooks/azure_devops.yaml) instead of this role.

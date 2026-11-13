@@ -1,0 +1,180 @@
+---
+# Settles the files of instance _runner_azp_n on every converge: its tree's
+# owner and mode, its credentials' modes, the links a self-update leaves, and
+# the PATH and environment the agent starts with. Compare-then-write
+# throughout, so a converge that changes nothing reports nothing.
+#
+# Every file here is in a tree its agent's jobs can write, so none is followed
+# if it is a link, and the one that is read, .env, is read as the agent user.
+# A dry run only reads: every write below is left out of check mode.
+
+- name: "Look at the files of agent {{ _runner_azp_n }}"
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_dir }}/{{ _runner_azp_file }}"
+    follow: false
+    get_checksum: false
+  loop: ['.', '.agent', '.credentials', '.credentials_rsaparams', '.service', 'bin', 'externals']
+  loop_control:
+    loop_var: '_runner_azp_file'
+  register: '_runner_azp_files'
+
+- name: "Settle agent {{ _runner_azp_n }}"
+  when: "_runner_azp_stat['.'].exists"
+  vars:
+    _runner_azp_stat: >-
+      {{ dict(_runner_azp_files.results | map(attribute='_runner_azp_file')
+              | zip(_runner_azp_files.results | map(attribute='stat'))) }}
+  block:
+    - name: "Pin the owner and mode of the tree of agent {{ _runner_azp_n }}"
+      ansible.builtin.file:
+        path: "{{ _runner_azp_dir }}"
+        state: 'directory'
+        owner: "{{ _runner_azp_user }}"
+        group: "{{ _runner_azp_user }}"
+        mode: '0750'
+      when: "not ansible_check_mode"
+
+    # .agent is kept byte for byte, and only its owner is pinned.
+    - name: "Pin the owner of the registration of agent {{ _runner_azp_n }}"
+      ansible.builtin.file:
+        path: "{{ _runner_azp_dir }}/.agent"
+        state: 'file'
+        owner: "{{ _runner_azp_user }}"
+        group: "{{ _runner_azp_user }}"
+        follow: false
+      when:
+        - "not ansible_check_mode"
+        - "_runner_azp_stat['.agent'].exists"
+
+    # The agent writes .credentials with whatever umask it ran under. With the
+    # RSA key beside it, it is everything another account would need to serve
+    # this agent's jobs from anywhere.
+    - name: "Keep the credentials 0600 and the agent user's, for instance {{ _runner_azp_n }}"
+      ansible.builtin.file:
+        path: "{{ _runner_azp_dir }}/{{ _runner_azp_cred }}"
+        state: 'file'
+        owner: "{{ _runner_azp_user }}"
+        group: "{{ _runner_azp_user }}"
+        mode: '0600'
+        follow: false
+      loop: ['.credentials', '.credentials_rsaparams']
+      loop_control:
+        loop_var: '_runner_azp_cred'
+      when:
+        - "not ansible_check_mode"
+        - "_runner_azp_stat[_runner_azp_cred].exists"
+
+    # Names the svc.sh unit, removed in prepare. Gone, svc.sh no longer finds
+    # one to start, and `config.sh remove` -- which refuses to run while one
+    # is recorded -- can de-register the agent.
+    - name: "Drop the old service record of agent {{ _runner_azp_n }}"
+      ansible.builtin.file:
+        path: "{{ _runner_azp_dir }}/.service"
+        state: 'absent'
+      when:
+        - "not ansible_check_mode"
+        - "_runner_azp_stat['.service'].exists"
+
+    # A self-update renames bin and externals to <name>.<version> and links the
+    # names to the new version by ABSOLUTE path, so an adopted agent that ever
+    # updated itself still points into its old directory, and cannot start.
+    - name: "Point the self-update links inside the tree, for instance {{ _runner_azp_n }}"
+      ansible.builtin.file:
+        src: "{{ _runner_azp_dir }}/{{ _runner_azp_stat[_runner_azp_link].lnk_target | basename }}"
+        dest: "{{ _runner_azp_dir }}/{{ _runner_azp_link }}"
+        state: 'link'
+        force: true
+        owner: "{{ _runner_azp_user }}"
+        group: "{{ _runner_azp_user }}"
+        follow: false
+      loop: ['bin', 'externals']
+      loop_control:
+        loop_var: '_runner_azp_link'
+      when:
+        - "not ansible_check_mode"
+        - "_runner_azp_stat[_runner_azp_link].islnk | default(false)"
+        - "_runner_azp_stat[_runner_azp_link].lnk_target is match('^/')"
+        - "_runner_azp_stat[_runner_azp_link].lnk_target is not match('^' ~ (_runner_azp_dir | regex_escape) ~ '/')"
+      notify: 'Restart idle runners'
+
+    # run.sh does not read .path; azp-run-once applies it, as the agent's own
+    # runsvc.sh does. Jobs install their own tools in ~/.local/bin, so it comes
+    # first, and nothing of another account's home -- the one an adopted agent
+    # was configured from included -- is on it at all.
+    - name: "Write the PATH of agent {{ _runner_azp_n }}"
+      ansible.builtin.copy:
+        content: "/home/{{ _runner_azp_user }}/.local/bin:{{ _runner_azp_system_path }}\n"
+        dest: "{{ _runner_azp_dir }}/.path"
+        owner: "{{ _runner_azp_user }}"
+        group: "{{ _runner_azp_user }}"
+        mode: '0644'
+      # The diff would read the old file as root, through whatever link a job
+      # put in its place, and print it: --diff must not show a root-only file.
+      diff: false
+      when: "not ansible_check_mode"
+      notify: 'Restart idle runners'
+
+    # As the agent user: a .env that a job replaced with a link to a root-only
+    # file must not have that file read, filtered and written back where the
+    # job can read it. Not logged: a value can be a proxy password.
+    - name: "Read the agent environment as the agent user, for instance {{ _runner_azp_n }}"
+      ansible.builtin.command:
+        argv: ['setpriv', "--reuid={{ _runner_azp_user }}", "--regid={{ _runner_azp_user }}", '--init-groups', '--', 'cat', '--', "{{ _runner_azp_dir }}/.env"]
+      register: '_runner_azp_env_now'
+      changed_when: false
+      failed_when: false
+      # Read-only (cat, as the agent user), so it runs in a dry run as well.
+      check_mode: false
+      no_log: true
+
+    # env.sh snapshots whatever environment config.sh ran in, and the agent
+    # applies .env OVER its unit's environment at every start. So a key the
+    # unit owns goes (a stale DOCKER_HOST or AGENT_TOOLSDIRECTORY would win),
+    # and so does a value that reaches into another account's home.
+    - name: "Work out which agent environment stays, for instance {{ _runner_azp_n }}"
+      ansible.builtin.set_fact:
+        _runner_azp_env_kept: "{{ _kept }}"
+        _runner_azp_env_dropped: "{{ _lines | difference(_kept) | map('regex_replace', '=.*$', '') | unique | list }}"
+      vars:
+        _lines: >-
+          {{ ((_runner_azp_env_now.stdout | default('') if _runner_azp_env_now.rc | default(1) == 0 else '')
+              | string).splitlines() | select('match', '^[^=\s]+=') | list }}
+        _owned_rx: >-
+          ^({{ (_runner_azp_env_owned + (runner_heavy_env | dict2items | map(attribute='key') | list))
+               | map('regex_escape') | join('|') }})=
+        _homes: >-
+          {{ (ansible_facts['getent_passwd'] | default({}) | dict2items
+              | rejectattr('key', 'equalto', _runner_azp_user)
+              | selectattr('value.1', 'match', _runner_azp_login_uid_rx)
+              | map(attribute='value.4') | list)
+             + (runner_azp_adopt | default({}) | dict2items | map(attribute='value') | map('string') | list)
+             + ([runner_azp_adopt_home | string] if (runner_azp_adopt_home | default('')) | length > 0 else [])
+             | reject('in', ['', '/', '/home/' ~ _runner_azp_user]) | unique | list }}
+        _foreign_rx: >-
+          {{ (_runner_azp_env_value_rx_head ~ (_homes | map('regex_escape') | join('|')) ~ _runner_azp_env_value_rx_tail)
+             if _homes | length > 0 else '(?!)' }}
+        _kept: "{{ _lines | reject('match', _owned_rx) | reject('search', _foreign_rx) | list }}"
+      no_log: true
+
+    - name: "Write the environment of agent {{ _runner_azp_n }}"
+      ansible.builtin.copy:
+        content: "{{ (_runner_azp_env_kept + _missing) | join('\n') ~ '\n' }}"
+        dest: "{{ _runner_azp_dir }}/.env"
+        owner: "{{ _runner_azp_user }}"
+        group: "{{ _runner_azp_user }}"
+        mode: '0600'
+      vars:
+        _set: "{{ _runner_azp_env_kept | map('regex_replace', '=.*$', '') | list }}"
+        _missing: "{{ _runner_azp_env_defaults | reject('match', '^(' ~ (_set | map('regex_escape') | join('|')) ~ ')=') | list }}"
+      # As for .path; and the new content may hold a proxy password.
+      diff: false
+      no_log: true
+      when: "not ansible_check_mode"
+      notify: 'Restart idle runners'
+
+    - name: "Report what left the environment of agent {{ _runner_azp_n }}"
+      ansible.builtin.debug:
+        msg: >-
+          Removed from {{ _runner_azp_dir }}/.env, which the agent would apply over its unit's environment:
+          {{ _runner_azp_env_dropped | join(', ') }} (a key the unit sets, or a value in another account's home).
+      when: "_runner_azp_env_dropped | length > 0"

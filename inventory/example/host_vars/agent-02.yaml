@@ -1,0 +1,33 @@
+---
+# An Azure Pipelines agent registered by hand, the documented way, adopted as
+# instance 1 instead of registered again, so no PAT is needed. Its old
+# vsts.agent.* unit is stopped and removed first. Its directory then moves to
+# /opt/azure-pipelines-agent/1 (a rename, so it must sit on the same filesystem
+# as /opt), is handed to azp1, and keeps .agent, .credentials and
+# .credentials_rsaparams: the pool sees the same agent name and id as before.
+# Its .agent must name a relative workFolder (the default, _work), so the work
+# directory moves with it, and it must not be an account's home, hold an .ssh,
+# or be writable by every account. The agent's pool and agent ids are then
+# recorded root-side, in /var/lib/runner-hardening/azp/1.json, which a later
+# removal from the pool goes by. Keys are instance numbers, read as integers:
+# 1: and '1': both work, and naming one instance both ways is refused.
+runner_azp_adopt:
+  1: '/home/agent/myagent'
+
+# One instance, the adopted one. While an adoption is pending the count must be
+# a number covering every key, not auto. Raising it registers new agents beside
+# the adopted one, which needs runner_azp_pat.
+runner_count: 1
+
+# The account the agent ran as, so .env values pointing into its home are
+# dropped. With runner_home_seed it can also hand each agent user what that
+# account installed (its caches are wiped first, since it is de-privileged
+# below):
+runner_azp_adopt_home: '/home/agent'
+# runner_home_seed:
+#   '.local/bin': "{{ runner_azp_adopt_home }}/.local/bin"
+
+# The account that ran the agent was put in the docker group so its jobs could
+# build images, which made it root-equivalent: de-privilege it like any other.
+runner_old_users:
+  - 'agent'

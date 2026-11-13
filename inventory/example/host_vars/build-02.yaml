@@ -1,0 +1,8 @@
+---
+# A smaller box, and the one very large compiles are sent to. Two runners, and
+# the heavy one (runner 1) may grow to the whole gha.slice budget instead of the
+# usual 85% of what the box has left after its reserve. The slice still caps
+# both runners together, so a job beside the lifted one can be reclaimed or
+# OOM-killed sooner: see the README's Memory section.
+runner_count: 2
+runner_slice_ceiling: 'heavy'

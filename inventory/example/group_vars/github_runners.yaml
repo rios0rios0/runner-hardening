@@ -1,0 +1,39 @@
+---
+# GitHub Actions runner hosts: the variables of the runner_github role.
+
+runner_github_scope: 'org'           # org | repo
+runner_github_org: 'your-org'        # the organisation, or the owner when scope is repo
+# runner_github_repo: 'your-repo'    # required only when scope is repo
+runner_github_group_id: 1            # 1 is "Default"; use a dedicated group when you can
+runner_github_labels: 'self-hosted,linux,x64,internal'   # comma-separated, no spaces
+# runner_github_version: 'latest'    # or a pinned actions/runner release, such as '2.338.2'
+
+# The admin PAT. Never write it here in clear text, and never pass it as
+# -e name=value: a command line is readable through /proc by every account on
+# the controller.
+# Given, it is checked against the GitHub API and stored root-only on each
+# host, replacing the PAT stored there. Undefined or empty, each host reuses the
+# PAT it already stores in /etc/github-runner/pat, which is all a re-deploy
+# needs.
+#
+# From the environment of the shell that runs ansible-playbook:
+#   read -rs RUNNER_GITHUB_PAT && export RUNNER_GITHUB_PAT
+# Left unset, `undef()` keeps the variable undefined rather than empty, so a
+# re-deploy needs no copy of the token on the controller at all.
+runner_github_pat: "{{ lookup('ansible.builtin.env', 'RUNNER_GITHUB_PAT', default=undef()) }}"
+#
+# Or from 1Password. That lookup comes from the community.general collection,
+# which the controller then needs (this collection depends on nothing beyond
+# ansible.builtin), together with a signed-in `op` CLI:
+# runner_github_pat: "{{ lookup('community.general.onepassword', 'your-item', field='credential', vault='your-vault') }}"
+#
+# Or from Ansible Vault: `ansible-vault encrypt_string --stdin-name runner_github_pat`
+# reads the token from stdin, never from argv, and prints the block to paste
+# here in place of the lookup. Run the playbooks with --ask-vault-pass.
+
+# runner_github_validate_pat: true   # check the PAT against the API before anything changes
+
+# The replacement token, read only by playbooks/rotate_github_pat.yaml, which
+# checks it on each host before it swaps it in:
+#   read -rs RUNNER_GITHUB_NEW_PAT && export RUNNER_GITHUB_NEW_PAT
+runner_github_new_pat: "{{ lookup('ansible.builtin.env', 'RUNNER_GITHUB_NEW_PAT', default=undef()) }}"

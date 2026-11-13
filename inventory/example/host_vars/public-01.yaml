@@ -1,0 +1,15 @@
+---
+# Runs fork pull requests, so nothing survives a job here: before every one,
+# the runner's home, tool cache, Docker state and workspace are reset. Its
+# runners carry their own label and sit in a runner group of their own; keep
+# that group away from the repositories your internal runners serve, and still
+# require approval for outside contributors (Settings > Actions > General).
+runner_trust: 'untrusted'
+runner_github_labels: 'self-hosted,linux,x64,untrusted'
+runner_github_group_id: 4
+runner_count: 1
+
+# Leave runner_home_keep_extra and runner_home_seed unset here: the paths they
+# name survive every reset, so what one job leaves there reaches the next (the
+# converge warns when either is set on an untrusted host). Seed nothing into
+# .local/bin above all: it is first on every runner's PATH.

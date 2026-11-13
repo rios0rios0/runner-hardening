@@ -1,0 +1,179 @@
+---
+# One runner_extra_binaries entry: {name, url, sha256, member, links}.
+#
+#   no member           the download is the binary: /usr/local/bin/<name>
+#   member              that file of the archive:   /usr/local/bin/<name>
+#   member + links      that directory of the archive, as a tool tree in
+#                       /usr/local/lib/runner-hardening/tools/<name>, and one
+#                       /usr/local/bin/<link> symlink per links entry
+#
+# A file is compared by checksum on every converge. A tool tree is replaced
+# only when the pinned sha256 changes, which a marker inside it records.
+
+- name: "Download {{ _runner_host_binary.name }}"
+  ansible.builtin.get_url:
+    url: "{{ _runner_host_binary.url }}"
+    dest: "{{ _runner_host_download }}"
+    checksum: "sha256:{{ _runner_host_binary.sha256 | lower }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0600'
+
+# Outside check mode the download is always there by now; a dry run fetched
+# nothing, so it stops at what it would have downloaded.
+- name: "Look for the download of {{ _runner_host_binary.name }}"
+  ansible.builtin.stat:
+    path: "{{ _runner_host_download }}"
+  register: '_runner_host_downloaded'
+
+- name: "Install the bare binary {{ _runner_host_binary.name }}"
+  ansible.builtin.copy:
+    src: "{{ _runner_host_download }}"
+    dest: "/usr/local/bin/{{ _runner_host_binary.name }}"
+    remote_src: true
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+  when:
+    - "_runner_host_member | length == 0"
+    - "_runner_host_downloaded.stat.exists"
+
+- name: "Install from its archive: {{ _runner_host_binary.name }}"
+  when:
+    - "_runner_host_member | length > 0"
+    - "_runner_host_binary.links | default({}) | length == 0"
+    - "_runner_host_downloaded.stat.exists"
+  block:
+    # A directory of its own that persists, so unpacking an archive that did
+    # not change reports nothing either.
+    - name: "Create the unpack directory of {{ _runner_host_binary.name }}"
+      ansible.builtin.file:
+        path: "{{ _runner_host_unpacked }}"
+        state: 'directory'
+        owner: 'root'
+        group: 'root'
+        mode: '0700'
+
+    - name: "Unpack the archive of {{ _runner_host_binary.name }}"
+      ansible.builtin.unarchive:
+        src: "{{ _runner_host_download }}"
+        dest: "{{ _runner_host_unpacked }}"
+        remote_src: true
+
+    - name: "Look for the member of {{ _runner_host_binary.name }}"
+      ansible.builtin.stat:
+        path: "{{ _runner_host_unpacked }}/{{ _runner_host_member }}"
+      register: '_runner_host_member_stat'
+
+    - name: "Check that the member is a file: {{ _runner_host_binary.name }}"
+      ansible.builtin.assert:
+        that: "_runner_host_member_stat.stat.isreg | default(false)"
+        fail_msg: >-
+          {{ _runner_host_member }} is not a file in {{ _runner_host_binary.url }}. A directory
+          member needs links, naming the commands it provides.
+        quiet: true
+
+    - name: "Install into /usr/local/bin: {{ _runner_host_binary.name }}"
+      ansible.builtin.copy:
+        src: "{{ _runner_host_unpacked }}/{{ _runner_host_member }}"
+        dest: "/usr/local/bin/{{ _runner_host_binary.name }}"
+        remote_src: true
+        owner: 'root'
+        group: 'root'
+        mode: '0755'
+
+- name: "Install the tool tree {{ _runner_host_binary.name }}"
+  when:
+    - "_runner_host_member | length > 0"
+    - "_runner_host_binary.links | default({}) | length > 0"
+    - "_runner_host_downloaded.stat.exists"
+  vars:
+    _runner_host_tool_dir: "{{ _runner_host_lib_dir }}/tools/{{ _runner_host_binary.name }}"
+    _runner_host_tool_marker: "{{ _runner_host_lib_dir }}/tools/{{ _runner_host_binary.name }}/.runner-hardening.sha256"
+  block:
+    - name: "Read the version marker of {{ _runner_host_binary.name }}"
+      ansible.builtin.slurp:
+        src: "{{ _runner_host_tool_marker }}"
+      register: '_runner_host_tool_installed'
+      failed_when: false
+
+    - name: "Replace the tool tree of {{ _runner_host_binary.name }}"
+      when: >-
+        (_runner_host_tool_installed.content | default('') | b64decode | trim)
+        != (_runner_host_binary.sha256 | lower)
+      block:
+        - name: "Create the unpack directory of {{ _runner_host_binary.name }}"
+          ansible.builtin.file:
+            path: "{{ _runner_host_unpacked }}"
+            state: 'directory'
+            owner: 'root'
+            group: 'root'
+            mode: '0700'
+
+        - name: "Unpack the archive of {{ _runner_host_binary.name }}"
+          ansible.builtin.unarchive:
+            src: "{{ _runner_host_download }}"
+            dest: "{{ _runner_host_unpacked }}"
+            remote_src: true
+
+        - name: "Look for the member of {{ _runner_host_binary.name }}"
+          ansible.builtin.stat:
+            path: "{{ _runner_host_unpacked }}/{{ _runner_host_member }}"
+          register: '_runner_host_member_stat'
+
+        - name: "Check that the member is a directory: {{ _runner_host_binary.name }}"
+          ansible.builtin.assert:
+            that: "_runner_host_member_stat.stat.isdir | default(false)"
+            fail_msg: "{{ _runner_host_member }} is not a directory in {{ _runner_host_binary.url }}; drop links for a file member."
+            quiet: true
+
+        - name: "Remove the previous tool tree of {{ _runner_host_binary.name }}"
+          ansible.builtin.file:
+            path: "{{ _runner_host_tool_dir }}"
+            state: 'absent'
+
+        - name: 'Create the tools directory'
+          ansible.builtin.file:
+            path: "{{ _runner_host_lib_dir }}/tools"
+            state: 'directory'
+            owner: 'root'
+            group: 'root'
+            mode: '0755'
+
+        # The trailing slash copies the member's contents; modes are kept and
+        # the owner is made root throughout.
+        - name: "Copy the tool tree of {{ _runner_host_binary.name }}"
+          ansible.builtin.copy:
+            src: "{{ _runner_host_unpacked }}/{{ _runner_host_member }}/"
+            dest: "{{ _runner_host_tool_dir }}/"
+            remote_src: true
+            owner: 'root'
+            group: 'root'
+            mode: 'preserve'
+
+        - name: "Record the version of {{ _runner_host_binary.name }}"
+          ansible.builtin.copy:
+            content: "{{ _runner_host_binary.sha256 | lower }}\n"
+            dest: "{{ _runner_host_tool_marker }}"
+            owner: 'root'
+            group: 'root'
+            mode: '0644'
+
+        # The tree is copied out, so the unpacked archive only costs disk.
+        - name: "Remove the unpacked archive of {{ _runner_host_binary.name }}"
+          ansible.builtin.file:
+            path: "{{ _runner_host_unpacked }}"
+            state: 'absent'
+
+    - name: "Link the commands into /usr/local/bin: {{ _runner_host_binary.name }}"
+      ansible.builtin.file:
+        src: "{{ _runner_host_tool_dir }}/{{ _runner_host_link.value }}"
+        dest: "/usr/local/bin/{{ _runner_host_link.key }}"
+        state: 'link'
+        owner: 'root'
+        group: 'root'
+        force: true
+      loop: "{{ _runner_host_binary.links | dict2items }}"
+      loop_control:
+        loop_var: '_runner_host_link'
+        label: "{{ _runner_host_link.key }}"

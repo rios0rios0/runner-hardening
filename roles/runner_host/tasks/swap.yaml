@@ -1,0 +1,132 @@
+---
+# MemoryHigh throttles by reclaiming pages. With zero swap there is nothing to
+# reclaim to, so the ceiling degrades into a hard OOM kill and a job dies with
+# a useless error instead of just running slowly.
+
+- name: 'Look for an existing swapfile'
+  ansible.builtin.stat:
+    path: '/swapfile'
+  register: '_runner_host_swapfile'
+
+- name: 'Look for an earlier attempt that could not add swap'
+  ansible.builtin.stat:
+    path: "{{ _runner_host_state_dir }}/no-swap"
+  register: '_runner_host_no_swap'
+
+# What df -BG reports free on the filesystem that holds /opt, rounded up.
+- name: 'Work out the free disk and the swapfile size'
+  ansible.builtin.set_fact:
+    _runner_host_disk_gb: "{{ ((_mount.size_available | default(0) | int) + 1073741823) // 1073741824 }}"
+  vars:
+    _mount: >-
+      {{ ansible_facts['mounts'] | selectattr('mount', 'in', ['/', '/opt'])
+         | sort(attribute='mount') | last | default({}) }}
+
+- name: 'Warn that the disk is small'
+  ansible.builtin.debug:
+    msg: "WARNING: only {{ _runner_host_disk_gb }} GB free on /opt - image layers will fill this fast."
+  when: "_runner_host_disk_gb | int < 20"
+
+- name: 'Leave an inactive swapfile alone'
+  ansible.builtin.debug:
+    msg: 'WARNING: /swapfile already exists but is not active - leaving it alone.'
+  when:
+    - "ansible_facts['swaptotal_mb'] | int < 1024"
+    - "_runner_host_swapfile.stat.exists"
+
+- name: 'Skip the swapfile on a disk this small'
+  ansible.builtin.debug:
+    msg: "WARNING: only {{ _runner_host_disk_gb }} GB free - skipping swap creation."
+  when:
+    - "ansible_facts['swaptotal_mb'] | int < 1024"
+    - "not _runner_host_swapfile.stat.exists"
+    - "_runner_host_disk_gb | int < 12"
+
+- name: 'Add a swapfile'
+  when:
+    - "ansible_facts['swaptotal_mb'] | int < 1024"
+    - "not _runner_host_swapfile.stat.exists"
+    - "not _runner_host_no_swap.stat.exists"
+    - "_runner_host_disk_gb | int >= 12"
+  vars:
+    _runner_host_swap_mb: "{{ 2048 if _runner_host_disk_gb | int < 40 else 4096 }}"
+  block:
+    - name: 'Allocate the swapfile'
+      ansible.builtin.command:
+        argv: ['fallocate', '-l', "{{ _runner_host_swap_mb }}M", '/swapfile']
+        creates: '/swapfile'
+      register: '_runner_host_fallocate'
+      failed_when: false
+
+    - name: 'Allocate the swapfile the slow way where fallocate cannot'
+      ansible.builtin.command:
+        argv: ['dd', 'if=/dev/zero', 'of=/swapfile', 'bs=1M', "count={{ _runner_host_swap_mb }}", 'status=none']
+      register: '_runner_host_dd'
+      changed_when: "_runner_host_dd.rc == 0"
+      when: "_runner_host_fallocate.rc | default(0) != 0"
+
+    - name: 'Restrict the swapfile to root'
+      ansible.builtin.file:
+        path: '/swapfile'
+        owner: 'root'
+        group: 'root'
+        mode: '0600'
+
+    - name: 'Format the swapfile'
+      ansible.builtin.command:
+        argv: ['mkswap', '/swapfile']
+      register: '_runner_host_mkswap'
+      changed_when: "_runner_host_mkswap.rc == 0"
+
+    - name: 'Turn the swapfile on'
+      ansible.builtin.command:
+        argv: ['swapon', '/swapfile']
+      register: '_runner_host_swapon'
+      changed_when: "_runner_host_swapon.rc == 0"
+
+    - name: 'Persist the swapfile across reboots'
+      ansible.builtin.lineinfile:
+        path: '/etc/fstab'
+        regexp: '^/swapfile\s'
+        line: '/swapfile none swap sw 0 0'
+
+    - name: 'Keep swap for real memory pressure'
+      ansible.builtin.template:
+        src: 'sysctl-swappiness.conf.j2'
+        dest: "/etc/sysctl.d/99-{{ runner_sbin_prefix }}-swappiness.conf"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+
+    - name: 'Apply the swappiness'
+      ansible.builtin.command:
+        argv: ['sysctl', '-q', '-w', 'vm.swappiness=10']
+      register: '_runner_host_swappiness'
+      changed_when: "_runner_host_swappiness.rc == 0"
+
+    - name: 'Report the new swap'
+      ansible.builtin.debug:
+        msg: "Swap active: {{ _runner_host_swap_mb }} MB at /swapfile, persisted in /etc/fstab, swappiness 10."
+
+  rescue:
+    # A box that cannot have swap still runs jobs; it just OOM-kills sooner.
+    - name: 'Remove a swapfile that could not be set up'
+      ansible.builtin.file:
+        path: '/swapfile'
+        state: 'absent'
+
+    # Remembered, so every later converge does not try, fail and report a
+    # change again. Delete the marker to have it retried.
+    - name: 'Remember that this host cannot take a swapfile'
+      ansible.builtin.copy:
+        content: "{{ ansible_failed_result.msg | default('swap setup failed') }}\n"
+        dest: "{{ _runner_host_state_dir }}/no-swap"
+        owner: 'root'
+        group: 'root'
+        mode: '0600'
+
+    - name: 'Warn that the swapfile could not be set up'
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: could not set up /swapfile ({{ ansible_failed_result.msg | default('') }}); continuing
+          without swap. Delete {{ _runner_host_state_dir }}/no-swap to try again.

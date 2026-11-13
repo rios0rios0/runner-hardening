@@ -1,0 +1,58 @@
+---
+# Security updates without anyone present, and without a blind reboot: the
+# reboot guard applies a pending reboot only when no runner is busy.
+
+- name: 'Configure unattended security upgrades'
+  when: "runner_unattended_upgrades | bool"
+  block:
+    - name: 'Install unattended-upgrades'
+      ansible.builtin.apt:
+        name: 'unattended-upgrades'
+        state: 'present'
+      environment:
+        NEEDRESTART_MODE: 'a'
+        NEEDRESTART_SUSPEND: '1'
+
+    - name: 'Turn the periodic apt runs on'
+      ansible.builtin.template:
+        src: 'auto-upgrades.j2'
+        dest: '/etc/apt/apt.conf.d/20auto-upgrades'
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+
+    # 52* sorts after the shipped 50unattended-upgrades, so these win.
+    - name: 'Limit upgrades to the security pockets, without a reboot'
+      ansible.builtin.template:
+        src: 'unattended.conf.j2'
+        dest: "/etc/apt/apt.conf.d/52{{ runner_sbin_prefix }}-unattended"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+
+    - name: 'Look for needrestart'
+      ansible.builtin.stat:
+        path: '/etc/needrestart/conf.d'
+      register: '_runner_host_needrestart'
+
+    - name: 'Keep needrestart from restarting services under a running job'
+      ansible.builtin.template:
+        src: 'needrestart.conf.j2'
+        dest: "/etc/needrestart/conf.d/90-{{ runner_sbin_prefix }}.conf"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      when: "_runner_host_needrestart.stat.isdir | default(false)"
+
+    # A dry run on an image without the package installs none to enable.
+    - name: 'Read the unattended-upgrades service'
+      ansible.builtin.systemd_service:
+        name: 'unattended-upgrades.service'
+      register: '_runner_host_unattended_unit'
+
+    - name: 'Enable unattended-upgrades'
+      ansible.builtin.systemd_service:
+        name: 'unattended-upgrades.service'
+        enabled: true
+        state: 'started'
+      when: "not ansible_check_mode or _runner_host_unattended_unit.status.LoadState | default('not-found') != 'not-found'"

@@ -1,0 +1,264 @@
+---
+# The runner binaries: one extracted actions/runner tree per instance, owned by
+# that instance's user. A tree is replaced only when the release it holds is
+# not the one wanted, so a converge that changes nothing else never takes a
+# runner out of service. The installer re-extracted every tree on every
+# install, which drained the whole box each time.
+
+- name: 'Ask GitHub which runner release is the latest'
+  ansible.builtin.uri:
+    url: "{{ _runner_github_api }}/repos/actions/runner/releases/latest"
+    method: 'GET'
+    headers:
+      Accept: 'application/vnd.github+json'
+      X-GitHub-Api-Version: "{{ _runner_github_api_version }}"
+    timeout: 30
+  register: '_runner_github_release'
+  failed_when: false
+  check_mode: false
+  when: "runner_github_version | string == 'latest'"
+
+- name: 'Settle the runner release to install'
+  ansible.builtin.set_fact:
+    _runner_github_version: >-
+      {{ ((_runner_github_release.json | default({})).tag_name | default('')
+          if runner_github_version | string == 'latest'
+          else runner_github_version) | string | regex_replace('^v', '') }}
+
+- name: 'Require a runner release to install'
+  ansible.builtin.assert:
+    that: "_runner_github_version is match('^[0-9]+[.][0-9]+[.][0-9]+$')"
+    fail_msg: >-
+      could not determine the latest runner version (HTTP {{ _runner_github_release.status | default('?') }}:
+      {{ (_runner_github_release.json | default({})).message | default(_runner_github_release.msg | default('no response')) }}).
+      Pin runner_github_version to a release such as 2.338.2 to skip the lookup.
+    quiet: true
+
+- name: 'Name the cached copy of the release'
+  ansible.builtin.set_fact:
+    _runner_github_tarball: "/var/cache/actions-runner-{{ _runner_github_version }}.tar.gz"
+
+- name: 'Look for the release in the cache'
+  ansible.builtin.stat:
+    path: "{{ _runner_github_tarball }}"
+    get_checksum: false
+  register: '_runner_github_tarball_stat'
+
+# Fetched only when no non-empty copy is cached, as the installer did. Given
+# an existing file and no checksum, get_url asks the server again on every
+# run, which costs a converge that changes nothing a request, and a full
+# download from any server that ignores If-Modified-Since.
+- name: 'Download the runner release'
+  ansible.builtin.get_url:
+    url: "{{ _runner_github_download }}/v{{ _runner_github_version }}/actions-runner-linux-x64-{{ _runner_github_version }}.tar.gz"
+    dest: "{{ _runner_github_tarball }}"
+    force: true
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+    timeout: 120
+  register: '_runner_github_downloaded'
+  retries: 3
+  delay: 5
+  until: "_runner_github_downloaded is succeeded"
+  when: "not (_runner_github_tarball_stat.stat.exists and _runner_github_tarball_stat.stat.size > 0)"
+
+# Applied to a cached copy as well, not only after a download: one left by an
+# earlier run may be 0600.
+- name: 'Keep the cached release readable'
+  ansible.builtin.file:
+    path: "{{ _runner_github_tarball }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  when: "not ansible_check_mode or _runner_github_tarball_stat.stat.exists"
+
+# Every converge, not only after a download: a cached copy can be as truncated
+# as a fresh one. unarchive cannot test an archive without extracting it.
+- name: 'Prove the release is a whole archive'
+  when: "not ansible_check_mode"
+  block:
+    - name: 'List the archive without extracting it'
+      ansible.builtin.shell: "tar -tzf {{ _runner_github_tarball | quote }} >/dev/null" # noqa: command-instead-of-module
+      changed_when: false
+  rescue:
+    - name: 'Drop the corrupt release'
+      ansible.builtin.file:
+        path: "{{ _runner_github_tarball }}"
+        state: 'absent'
+    - name: 'Stop on a corrupt release'
+      ansible.builtin.fail:
+        msg: >-
+          runner tarball {{ _runner_github_tarball }} is corrupt; it has been removed, so
+          the next converge downloads it again.
+
+- name: 'Find the runner releases in the cache'
+  ansible.builtin.find:
+    paths: '/var/cache'
+    patterns: 'actions-runner-*.tar.gz'
+    file_type: 'any'
+  register: '_runner_github_cached'
+
+# Only now that this release is proven good: every converge that meets a new
+# release downloads it, and nothing else removes the one before (about 220 MB
+# each).
+- name: 'Remove the older runner releases'
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: 'absent'
+  loop: "{{ _runner_github_cached.files | map(attribute='path') | reject('equalto', _runner_github_tarball) | list }}"
+
+# systemd chdirs into WorkingDirectory as the runner user. Every component of
+# the path must be traversable by that user, or the unit dies at step CHDIR
+# with exit=200 and restart-loops. Pin the base explicitly instead of relying
+# on whatever created it.
+- name: 'Keep the runner base directory traversable'
+  ansible.builtin.file:
+    path: "{{ runner_base_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+- name: 'Start from an empty plan for the trees'
+  ansible.builtin.set_fact:
+    _runner_github_tree_plan: []
+
+- name: 'Work out what each tree needs'
+  ansible.builtin.include_tasks: 'tree_state.yaml'
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_github_n'
+
+- name: 'Sort the trees by what they need'
+  ansible.builtin.set_fact:
+    _runner_github_extract: "{{ _runner_github_tree_plan | selectattr('need', 'in', ['install', 'replace']) | map(attribute='n') | list }}"
+    _runner_github_stale: "{{ _runner_github_tree_plan | selectattr('need', 'equalto', 'replace') | map(attribute='n') | list }}"
+
+- name: 'Report the plan for the trees'
+  ansible.builtin.debug:
+    msg: >-
+      actions/runner {{ _runner_github_version }}:
+      {% for _runner_github_t in _runner_github_tree_plan %}runner {{ _runner_github_t.n }} {{ _runner_github_t.need
+      }}{{ '' if loop.last else ', ' }}{% endfor %}
+
+# Recorded before draining: a drain that fails halfway has already taken some
+# runners out, and the rescue in main.yaml puts back exactly these.
+- name: 'Remember the runners about to be drained'
+  ansible.builtin.set_fact:
+    _runner_github_drained: "{{ _runner_github_stale }}"
+  when: "_runner_github_stale | length > 0"
+
+# One call for all of them, so the wait for running jobs is bounded once by
+# runner_drain_timeout, as the installer's drain was, not once per runner:
+# Restart=no first, then wait while busy, then stop. Each runner finishes the
+# job it is on and takes no other; finish starts it again on the new tree.
+- name: 'Drain the runners whose tree holds another release'
+  ansible.builtin.command:
+    argv: "{{ [_runner_github_admin, 'drain'] + (_runner_github_stale | map('string') | list) }}"
+  register: '_runner_github_drain'
+  # Only reached when there is something to drain, so success is a change.
+  changed_when: "_runner_github_drain.rc == 0"
+  when: "_runner_github_stale | length > 0"
+
+# Not in check mode: the plan above already says which trees would change, and
+# there is no staging copy to extract into without making one.
+- name: 'Install the trees that are missing or hold another release'
+  ansible.builtin.include_tasks: 'tree_extract.yaml'
+  vars:
+    _runner_github_tree_dir: "{{ runner_base_dir }}/{{ _runner_github_n }}"
+    _runner_github_staging: "{{ runner_base_dir }}/.{{ _runner_github_n }}.staging"
+    _runner_github_retired: "{{ runner_base_dir }}/.{{ _runner_github_n }}.retired"
+    _runner_github_user: "{{ runner_user_prefix }}{{ _runner_github_n }}"
+  loop: "{{ _runner_github_extract }}"
+  loop_control:
+    loop_var: '_runner_github_n'
+  when: "not ansible_check_mode"
+
+- name: 'Look up the runner users'
+  ansible.builtin.getent:
+    database: 'passwd'
+
+- name: 'Keep each tree private to its runner user'
+  ansible.builtin.file:
+    path: "{{ runner_base_dir }}/{{ item }}"
+    state: 'directory'
+    owner: "{{ runner_user_prefix }}{{ item }}"
+    group: "{{ runner_user_prefix }}{{ item }}"
+    mode: '0750'
+  loop: "{{ runner_instances }}"
+
+# diff: false on both copies below, and on any copy or template that writes
+# into a tree a job can write. To show a diff, copy reads the destination back
+# as root and follows a link a job planted there, so `.runner-version ->
+# /etc/github-runner/pat` would print the PAT as the diff's "before" on a
+# --diff run. Without the diff, copy replaces such a link rather than reading
+# or writing through it.
+
+# Root-owned: the runner user can delete it, which only makes the next converge
+# read the release from the binaries, but cannot rewrite it in place.
+- name: 'Record the release each tree holds'
+  ansible.builtin.copy:
+    content: "{{ _runner_github_version }}\n"
+    dest: "{{ runner_base_dir }}/{{ item }}/.runner-version"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  diff: false
+  loop: "{{ runner_instances }}"
+
+# The runner reads .env from its own directory into every job's environment.
+- name: 'Point each runner at its own rootless Docker'
+  ansible.builtin.copy:
+    content: |
+      DOCKER_HOST=unix:///run/user/{{ _runner_github_uid }}/docker.sock
+      XDG_RUNTIME_DIR=/run/user/{{ _runner_github_uid }}
+      DOCKER_BUILDKIT=1
+    dest: "{{ runner_base_dir }}/{{ item }}/.env"
+    owner: "{{ runner_user_prefix }}{{ item }}"
+    group: "{{ runner_user_prefix }}{{ item }}"
+    mode: '0600'
+  diff: false
+  vars:
+    _runner_github_uid: "{{ ansible_facts['getent_passwd'][runner_user_prefix ~ item][1] }}"
+  loop: "{{ runner_instances }}"
+  notify: 'Restart idle runners'
+
+# Exactly what systemd does at step CHDIR. Checking it here turns a silent
+# restart loop (which leaks a runner registration per attempt) into a clear
+# error before any unit is started.
+- name: 'Check that each runner user can enter its tree'
+  ansible.builtin.command:
+    argv:
+      - 'runuser'
+      - '-u'
+      - "{{ runner_user_prefix }}{{ item }}"
+      - '--'
+      - 'test'
+      - '-x'
+      - "{{ runner_base_dir }}/{{ item }}"
+      - '-a'
+      - '-r'
+      - "{{ runner_base_dir }}/{{ item }}/run.sh"
+  register: '_runner_github_chdir'
+  changed_when: false
+  failed_when: false
+  loop: "{{ runner_instances }}"
+
+- name: 'Show where the path to a tree stops being traversable'
+  ansible.builtin.command:
+    argv: ['namei', '-l', "{{ runner_base_dir }}/{{ item }}/run.sh"]
+  register: '_runner_github_namei'
+  changed_when: false
+  failed_when: false
+  loop: "{{ _runner_github_chdir.results | rejectattr('skipped', 'defined') | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+
+- name: 'Refuse to start the runners into a restart loop'
+  ansible.builtin.fail:
+    msg: >-
+      runner(s) {{ _runner_github_namei.results | map(attribute='item') | join(', ') }} cannot
+      enter their tree as their own user - systemd would fail at step CHDIR (exit 200)
+      and restart-loop. Every component of the path must be traversable by the
+      runner user: look for the first one without o+x, or not owned by that user, in
+      {{ _runner_github_namei.results | map(attribute='stdout', default='') | join(' | ') }}
+  when: "_runner_github_namei.results | default([]) | length > 0"

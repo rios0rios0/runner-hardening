@@ -1,0 +1,184 @@
+---
+# One entry of runner_azp_adopt: _runner_azp_n, the directory _runner_azp_src
+# and the instance's own _runner_azp_dest. Reads only. An adoption is pending
+# while the directory still holds a registration and the instance holds none;
+# once the directory has moved, the instance holds it and the entry is done.
+#
+# Nothing in the directory is read as root. It is the old agent's tree, which
+# its jobs could write: a file there can be a link to anything on the box.
+
+- name: "Look for an agent already at instance {{ _runner_azp_n }}"
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_dest }}/.agent"
+    get_checksum: false
+  register: '_runner_azp_dest_agent'
+
+- name: "Look at the directory to adopt for instance {{ _runner_azp_n }}"
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_src }}"
+    follow: false
+    get_checksum: false
+  register: '_runner_azp_src_dir'
+
+- name: "Look for the registration in the directory to adopt for instance {{ _runner_azp_n }}"
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_src }}/{{ _runner_azp_file }}"
+    follow: false
+    get_checksum: false
+  loop: ['.agent', '.credentials', '.credentials_rsaparams', '.ssh']
+  loop_control:
+    loop_var: '_runner_azp_file'
+  register: '_runner_azp_src_files'
+  when: "_runner_azp_src_dir.stat.isdir | default(false)"
+
+# Only regular files count: a link where a registration file should be is a
+# tree some job has tampered with, and would make the move carry whatever it
+# points at.
+- name: "Note what the directory to adopt holds, for instance {{ _runner_azp_n }}"
+  ansible.builtin.set_fact:
+    _runner_azp_src_has: >-
+      {{ _found | selectattr('stat.isreg') | map(attribute='_runner_azp_file') | reject('equalto', '.ssh') | list }}
+    _runner_azp_src_links: >-
+      {{ _found | selectattr('stat.islnk') | map(attribute='_runner_azp_file') | list }}
+    _runner_azp_src_ssh: "{{ '.ssh' in (_found | map(attribute='_runner_azp_file') | list) }}"
+  vars:
+    _found: >-
+      {{ _runner_azp_src_files.results | default([]) | selectattr('stat', 'defined')
+         | selectattr('stat.exists') | list }}
+
+# Both would answer to the same agent id with the same key, and the pool would
+# be served by whichever happened to connect last.
+- name: "Refuse two copies of a registration for instance {{ _runner_azp_n }}"
+  ansible.builtin.assert:
+    that: "_runner_azp_src == _runner_azp_dest or '.agent' not in _runner_azp_src_has"
+    fail_msg: >-
+      Both {{ _runner_azp_src }} and {{ _runner_azp_dest }} hold an agent registration. Instance
+      {{ _runner_azp_n }} already has one: remove {{ _runner_azp_src }}, or the runner_azp_adopt entry
+      for it, then converge again.
+    quiet: true
+  when: "_runner_azp_dest_agent.stat.exists"
+
+- name: "Read the agent to adopt for instance {{ _runner_azp_n }}"
+  when: "not _runner_azp_dest_agent.stat.exists"
+  block:
+    - name: "Check that there is a registered agent to adopt for instance {{ _runner_azp_n }}"
+      ansible.builtin.assert:
+        that:
+          - "_runner_azp_src_dir.stat.isdir | default(false)"
+          - "not (_runner_azp_src_dir.stat.islnk | default(false))"
+          - "_runner_azp_src_links | length == 0"
+          - "_runner_azp_src_has | length == 3"
+        fail_msg: >-
+          runner_azp_adopt[{{ _runner_azp_n }}] is {{ _runner_azp_src }}, which is
+          {{ 'not a directory (a link, or missing)' if not (_runner_azp_src_dir.stat.isdir | default(false))
+                                                       or (_runner_azp_src_dir.stat.islnk | default(false))
+             else ('a tree in which these are links, not files: ' ~ (_runner_azp_src_links | join(', ')))
+                  if _runner_azp_src_links | length > 0
+             else 'no registered agent: it lacks ' ~ (['.agent', '.credentials', '.credentials_rsaparams']
+                  | difference(_runner_azp_src_has) | join(', ')) }}, and {{ _runner_azp_dest }} holds no
+          agent either. Point the entry at the agent's real directory, or drop it and let runner_azp_pat
+          register a new agent.
+        quiet: true
+
+    # The move takes the whole directory: a home would carry its owner's SSH
+    # keys, shell profile and everything else along into an agent's tree.
+    - name: "Refuse to adopt a home directory for instance {{ _runner_azp_n }}"
+      ansible.builtin.assert:
+        that:
+          - "not _runner_azp_src_ssh"
+          - "_runner_azp_src not in _homes"
+          - "_homes | select('match', '^' ~ (_runner_azp_src | regex_escape) ~ '/') | list | length == 0"
+          - "not (_runner_azp_src_dir.stat.woth | default(false))"
+        fail_msg: >-
+          {{ _runner_azp_src }} is {{ "an account's home, or holds one"
+          if not _runner_azp_src_ssh else 'a directory with an .ssh in it' }}, or writable by every account:
+          adopting it would move all of that into an agent's tree. Point runner_azp_adopt[{{ _runner_azp_n }}]
+          at the agent's own directory, such as /home/agent/myagent.
+        quiet: true
+      vars:
+        _homes: >-
+          {{ ansible_facts['getent_passwd'] | default({}) | dict2items | map(attribute='value.4')
+             | map('regex_replace', '/+$', '') | reject('equalto', '') | list }}
+
+    # As the account that owns the directory, never as root: a .agent swapped
+    # for a link after the check above can then reach only what that account
+    # could read anyway. A root-owned directory is read as nobody.
+    - name: "Read the registration of the agent to adopt, as its owner, for instance {{ _runner_azp_n }}"
+      ansible.builtin.command:
+        argv:
+          - 'setpriv'
+          - "--reuid={{ _owner_uid }}"
+          - "--regid={{ _owner_gid }}"
+          - '--clear-groups'
+          - '--'
+          - 'cat'
+          - '--'
+          - "{{ _runner_azp_src }}/.agent"
+      register: '_runner_azp_src_agent'
+      changed_when: false
+      failed_when: "_runner_azp_src_agent.rc | default(1) != 0 or _runner_azp_src_agent.stdout | default('') is not match('^\\s*\\{')"
+      # Read-only (cat, as the file's owner), so it runs in a dry run as well.
+      check_mode: false
+      vars:
+        _owner_uid: "{{ 65534 if _runner_azp_src_dir.stat.uid == 0 else _runner_azp_src_dir.stat.uid }}"
+        _owner_gid: "{{ 65534 if _runner_azp_src_dir.stat.uid == 0 else _runner_azp_src_dir.stat.gid }}"
+
+    # The agent stores the URL as the server resolved it (a trailing slash; a
+    # visualstudio.com organisation keeps that name), so both sides are
+    # normalised. An absolute work folder is the one value that ties a
+    # registration to its old place, and .agent is kept byte for byte.
+    - name: "Check that the agent to adopt belongs to this pool, for instance {{ _runner_azp_n }}"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (_agent.serverUrl | default('') | string | lower | regex_replace('/+$', '')
+            | regex_replace(_runner_azp_vs_url_rx, _runner_azp_vs_url_to))
+            == (runner_azp_url | string | lower | regex_replace('/+$', '')
+            | regex_replace(_runner_azp_vs_url_rx, _runner_azp_vs_url_to))
+          - "(_agent.poolName | default('') | string | lower) == (runner_azp_pool | string | lower)"
+          - "_agent.workFolder | default('_work') | string is not match('^/')"
+          - "_agent.poolId | default('') is number and _agent.agentId | default('') is number"
+        fail_msg: >-
+          {{ _runner_azp_src }} holds agent '{{ _agent.agentName | default('?') }}' (id
+          {{ _agent.agentId | default('?') }}), registered to pool '{{ _agent.poolName | default('?') }}'
+          (id {{ _agent.poolId | default('?') }}) at {{ _agent.serverUrl | default('?') }} with work
+          folder '{{ _agent.workFolder | default('?') }}'. Adopting it into pool '{{ runner_azp_pool }}' at
+          {{ runner_azp_url }} needs the same organisation and pool, a work folder inside the agent, and
+          the ids its registration names (re-register it with --work _work, or set runner_azp_url and
+          runner_azp_pool to match).
+        quiet: true
+      vars:
+        _agent: "{{ _runner_azp_src_agent.stdout | default('{}', true) | from_json }}"
+
+    # The move is a rename, which cannot be half done: a copy across
+    # filesystems could, and would leave the credentials in two places.
+    # The base itself once it exists, its parent (where it will be made) until then.
+    - name: "Find the filesystem the agents live on, for instance {{ _runner_azp_n }}"
+      ansible.builtin.stat:
+        path: "{{ _runner_azp_fs_path }}"
+        get_checksum: false
+      loop: ["{{ runner_base_dir }}", "{{ runner_base_dir | dirname }}"]
+      loop_control:
+        loop_var: '_runner_azp_fs_path'
+      register: '_runner_azp_base_fs'
+
+    - name: "Check that a rename can move the agent to adopt, for instance {{ _runner_azp_n }}"
+      ansible.builtin.assert:
+        that: >-
+          _runner_azp_src_dir.stat.dev
+          == (_runner_azp_base_fs.results | selectattr('stat.exists') | first).stat.dev
+        fail_msg: >-
+          {{ _runner_azp_src }} is on another filesystem than {{ runner_base_dir }}, so it cannot be moved
+          by a rename. Stop it, move it to {{ _runner_azp_dest }} yourself (mv keeps its files as they
+          are), then converge again: an agent already in place is adopted where it is.
+        quiet: true
+
+    - name: "Record the adoption pending for instance {{ _runner_azp_n }}"
+      ansible.builtin.set_fact:
+        _runner_azp_pending: >-
+          {{ _runner_azp_pending + [{'n': _runner_azp_n | int, 'src': _runner_azp_src,
+                                     'name': _agent.agentName | default('?'),
+                                     'id': _agent.agentId,
+                                     'pool_id': _agent.poolId}] }}
+      vars:
+        _agent: "{{ _runner_azp_src_agent.stdout | default('{}', true) | from_json }}"

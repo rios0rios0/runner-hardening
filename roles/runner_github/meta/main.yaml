@@ -1,0 +1,26 @@
+---
+galaxy_info:
+  role_name: 'runner_github'
+  namespace: 'rios0rios0'
+  author: 'rios0rios0'
+  description: >-
+    GitHub Actions flavour of the hardened runner host: ephemeral JIT runners,
+    one unprivileged user and one rootless Docker per runner, and an admin PAT
+    no job can read.
+  license: 'MIT'
+  min_ansible_version: '2.16'
+  platforms:
+    - name: 'Ubuntu'
+      versions:
+        - 'all'
+  galaxy_tags:
+    - 'github'
+    - 'actions'
+    - 'runner'
+    - 'ci'
+    - 'hardening'
+
+# runner_host is included from tasks/main.yaml, never declared here. Its
+# prepare, finish and retire entry points run around this role's own steps,
+# and that order is the design: a meta dependency would run all of it first.
+dependencies: []

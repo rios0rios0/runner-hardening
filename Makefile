@@ -8,9 +8,24 @@ COMMON_MK := $(SCRIPTS_DIR)/makefiles/common.mk
 
 -include $(COMMON_MK)
 
-SHELL_SOURCES := harden-gha-runners.sh fleet.sh test/bootstrap_test.sh
+# Every script that ships to a box, plus the suites that drive them. Runtime
+# scripts carry a .sh suffix in the repository (the roles drop it on install)
+# so that the shared ShellCheck target, which only lints *.sh, covers them.
+SHELL_SOURCES := $(sort $(shell find roles test -name '*.sh' -type f 2>/dev/null))
+PLAYBOOKS     := $(sort $(wildcard playbooks/*.yaml))
 
-.PHONY: lint test setup sast codeql semgrep hadolint shellcheck gitleaks
+# The collection is the repository root itself. Ansible only finds a collection
+# under <path>/ansible_collections/<namespace>/<name>, so development resolves
+# it through this link -- the same fully qualified names a consumer uses.
+COLLECTION_LINK := build/collections/ansible_collections/rios0rios0/runner_hardening
+
+.PHONY: lint test setup sast codeql semgrep hadolint shellcheck gitleaks collection
+
+collection: $(COLLECTION_LINK)
+
+$(COLLECTION_LINK):
+	@mkdir -p "$(dir $@)"
+	@ln -sfn ../../../.. "$@"
 
 ifeq ($(wildcard $(COMMON_MK)),)
 
@@ -25,7 +40,7 @@ setup:
 	@mkdir -p "$(dir $(SCRIPTS_DIR))"
 	@git clone --depth 1 "$(PIPELINES_REPO)" "$(SCRIPTS_DIR)"
 
-lint sast codeql semgrep hadolint shellcheck gitleaks:
+lint sast codeql semgrep hadolint shellcheck gitleaks ansible-lint:
 	@echo "'$@' comes from the shared pipeline scripts, which are not present at:"
 	@echo "    $(SCRIPTS_DIR)"
 	@echo
@@ -39,20 +54,26 @@ lint sast codeql semgrep hadolint shellcheck gitleaks:
 
 else
 
-# `sast` already runs ShellCheck, but `lint` is the target every other project
-# here exposes; a contributor should not have to know this one happens to be
-# pure shell to find it.
-lint: shellcheck
+# `sast` already runs ShellCheck; `lint` adds ansible-lint for the roles and
+# playbooks. Both come from the shared scripts, never from a local binary.
+lint: shellcheck ansible-lint
 
 endif
 
-# Nothing in this repository can be unit-tested the way a library can: every
-# code path either changes system state or talks to the GitHub API. What IS
-# testable without a VM is that the scripts parse, and that fleet.sh builds a
-# remote bootstrap that round-trips the installer and the answers intact --
-# which is the one piece of machinery with no other way to catch a regression.
-test:
+# What is testable without a VM: every script parses, the runtime scripts
+# behave (driven against scratch trees, as non-root), the resource-policy math
+# and the rendered units hold their invariants, and every playbook parses.
+# Anything that changes a real box is exercised by the converge workflow on a
+# disposable VM, and nowhere else.
+test: collection
 	@for f in $(SHELL_SOURCES); do \
 		bash -n "$$f" && echo "  ok  $$f parses" || exit 1; \
 	done
-	@bash test/bootstrap_test.sh
+	@bash test/runtime/run.sh
+	@for t in test/ansible/policy.yaml test/ansible/templates.yaml; do \
+		ansible-playbook "$$t" || exit 1; \
+	done
+	@for p in $(PLAYBOOKS); do \
+		ansible-playbook --syntax-check -i localhost, "$$p" >/dev/null \
+			&& echo "  ok  $$p syntax" || exit 1; \
+	done

@@ -1,0 +1,42 @@
+---
+# runner_home_seed: each source is copied once into every runner home that
+# does not have that path yet; a home that has it is never touched again.
+# Every key is also in RUNNER_HOME_KEEP, so a home reset keeps it.
+
+- name: 'Look for the seed sources'
+  ansible.builtin.stat:
+    path: "{{ _runner_host_seed.value }}"
+  loop: "{{ runner_home_seed | dict2items }}"
+  loop_control:
+    loop_var: '_runner_host_seed'
+    label: "{{ _runner_host_seed.key }}"
+  register: '_runner_host_seed_sources'
+
+- name: 'Warn about the seed sources that are missing'
+  ansible.builtin.debug:
+    msg: "WARNING: {{ _runner_host_seed.value }} does not exist; nothing is seeded at ~/{{ _runner_host_seed.key }}."
+  loop: "{{ _runner_host_seed_sources.results | rejectattr('stat.exists') | map(attribute='_runner_host_seed') | list }}"
+  loop_control:
+    loop_var: '_runner_host_seed'
+    label: "{{ _runner_host_seed.key }}"
+
+- name: 'Copy each seed into the runner homes that lack it'
+  ansible.builtin.command:
+    argv:
+      - '/bin/bash'
+      - '-c'
+      - "{{ _runner_host_seed_script }}"
+      - 'seed'
+      - "{{ _runner_host_seed_pair[0].value }}"
+      - "{{ _home }}/{{ _runner_host_seed_pair[0].key }}"
+      - "{{ runner_user_prefix }}{{ _runner_host_seed_pair[1] }}"
+      - "{{ _home }}"
+    creates: "{{ _home }}/{{ _runner_host_seed_pair[0].key }}"
+  loop: >-
+    {{ _runner_host_seed_sources.results | selectattr('stat.exists') | map(attribute='_runner_host_seed') | list
+       | product(runner_instances) | list }}
+  loop_control:
+    loop_var: '_runner_host_seed_pair'
+    label: "{{ runner_user_prefix }}{{ _runner_host_seed_pair[1] }}: ~/{{ _runner_host_seed_pair[0].key }}"
+  vars:
+    _home: "/home/{{ runner_user_prefix }}{{ _runner_host_seed_pair[1] }}"

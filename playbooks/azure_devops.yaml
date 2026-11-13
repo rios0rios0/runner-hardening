@@ -1,0 +1,22 @@
+---
+# Converge the Azure Pipelines agent hosts: per-agent unprivileged users with
+# rootless Docker, one job per agent process, the disk guard and the memory
+# policy, around agents that are adopted where they already exist and
+# registered where they do not. Every step is idempotent, so a second run on a
+# converged host changes nothing.
+#
+#   ansible-playbook rios0rios0.runner_hardening.azure_devops
+#   ansible-playbook rios0rios0.runner_hardening.azure_devops -e runner_serial=3
+#
+# One host at a time by default: adopting a host's agents stops its old ones
+# first, and a rolling converge keeps the rest of the pool taking jobs
+# meanwhile. The play also stops at the first host that fails, because that
+# host is then the whole batch. serial is read before any host is chosen, so
+# inventory variables cannot set it: raise it with -e.
+- name: 'Converge the hardened Azure Pipelines agent hosts'
+  hosts: 'azure_devops_agents'
+  become: true
+  gather_facts: true
+  serial: "{{ runner_serial | default(1) }}"
+  roles:
+    - role: 'rios0rios0.runner_hardening.runner_azure_devops'

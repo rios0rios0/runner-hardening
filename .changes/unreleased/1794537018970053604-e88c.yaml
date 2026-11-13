@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added Azure Pipelines support with the `runner_azure_devops` role: one job per agent process (`run.sh --once`) under the same disk guard, restart backoff, slice and rootless Docker as GitHub runners; adoption of agents that are already registered, which needs no PAT; fresh registration with the PAT passed as `VSTS_AGENT_INPUT_TOKEN`, never as an argument; and an `lru` work policy that keeps each pipeline working directory between jobs and evicts the stale ones'
+time: '2026-11-13T02:30:18.969997085Z'

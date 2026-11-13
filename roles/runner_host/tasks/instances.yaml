@@ -1,0 +1,32 @@
+---
+# Reads the host only. Every instance number something of ours still names: a
+# unit systemd knows about, a drop-in directory, or a runner tree. Not the
+# count: a converge that lowered it still has to retire the runners above it.
+# A retirement removes the tree last, so one interrupted halfway is found
+# again by the next converge.
+
+- name: 'List the systemd services on this host'
+  ansible.builtin.service_facts:
+
+- name: 'Find the instance drop-in directories'
+  ansible.builtin.find:
+    paths: "{{ _runner_host_systemd_dir }}"
+    patterns: "{{ runner_unit }}@*.service.d"
+    file_type: 'directory'
+  register: '_runner_host_dropin_dirs'
+
+- name: 'Find the runner trees'
+  ansible.builtin.find:
+    paths: "{{ runner_base_dir }}"
+    patterns: '*'
+    file_type: 'directory'
+  register: '_runner_host_trees'
+
+- name: 'Collect what was found'
+  ansible.builtin.set_fact:
+    _runner_host_found_units: "{{ ansible_facts['services'] | default({}) | list }}"
+    _runner_host_found_dropins: "{{ _runner_host_dropin_dirs.files | map(attribute='path') | map('basename') | list }}"
+    _runner_host_found_trees: "{{ _runner_host_trees.files | map(attribute='path') | map('basename') | list }}"
+
+- name: 'Work out the existing and the surplus instances'
+  ansible.builtin.import_tasks: 'surplus.yaml'

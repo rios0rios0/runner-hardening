@@ -1,0 +1,28 @@
+---
+# runner_extra_binaries: CLIs a project's jobs call that no apt source ships
+# (see binary.yaml for the three forms an entry takes).
+# Hand-installed into a job-writable ~/.local/bin, one job could swap them for
+# the next; here each is root-owned in /usr/local/bin and shared by every
+# runner. The download is checked against its sha256, so it is fetched again
+# only when the pinned checksum changes, and the install compares checksums,
+# so a converge that changes nothing reports nothing.
+
+- name: 'Create the download cache'
+  ansible.builtin.file:
+    path: "{{ _runner_host_cache_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+  when: "runner_extra_binaries | length > 0"
+
+- name: 'Install each extra binary'
+  ansible.builtin.include_tasks: 'binary.yaml'
+  loop: "{{ runner_extra_binaries }}"
+  loop_control:
+    loop_var: '_runner_host_binary'
+    label: "{{ _runner_host_binary.name }}"
+  vars:
+    _runner_host_download: "{{ _runner_host_cache_dir }}/{{ _runner_host_binary.name }}.download"
+    _runner_host_unpacked: "{{ _runner_host_cache_dir }}/{{ _runner_host_binary.name }}.d"
+    _runner_host_member: "{{ _runner_host_binary.member | default('', true) | string }}"

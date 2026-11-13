@@ -1,0 +1,3 @@
+kind: 'Security'
+body: 'kept a job from leaving code behind for the jobs after it: with `runner_trust: untrusted` the disk guard restores a root-owned copy of the runner rootless Docker unit before every job, and the single-use JIT configuration now reaches the runner in `ACTIONS_RUNNER_INPUT_JITCONFIG` instead of on its command line'
+time: '2026-11-13T03:36:56.656441953Z'

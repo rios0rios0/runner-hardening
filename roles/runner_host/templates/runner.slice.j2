@@ -1,0 +1,22 @@
+# {{ _runner_host_managed }}
+[Unit]
+Description={{ _runner_host_flavor_noun[runner_flavor] }}s (aggregate resource boundary)
+Before=slices.target
+
+[Slice]
+# Individual runners are deliberately uncapped so a lone job can use the whole
+# machine. THIS is what stops all of them together from exhausting the host,
+# and it keeps any OOM kill inside CI instead of letting the global OOM killer
+# choose a victim from every process on the box.
+MemoryAccounting=yes
+MemoryMax={{ runner_rp_aggregate }}M
+CPUAccounting=yes
+CPUWeight=100
+IOAccounting=yes
+IOWeight=100
+# No ManagedOOM* policy, on purpose. systemd-oomd ships as its own package on
+# current Ubuntu and a server install lacks it, so such a policy never acted.
+# Where oomd does run, it SIGKILLs a runner's whole unit, which the CI service
+# reports as a runner that lost communication. The kernel's OOM killer,
+# confined to this slice, kills one process, and the runner reports the step
+# it failed.

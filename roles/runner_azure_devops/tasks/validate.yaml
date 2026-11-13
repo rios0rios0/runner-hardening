@@ -1,0 +1,100 @@
+---
+# Pure: checks the inventory's answers and touches nothing. A wrong answer
+# found after prepare has already stopped the old agents and de-privileged
+# their account, so everything that can be checked from the answers alone is
+# checked here.
+
+- name: 'Check the organisation URL'
+  ansible.builtin.assert:
+    that:
+      - "runner_azp_url | default('') | string is match('^https?://[^/\\s]+(/\\S*)?$')"
+      - "runner_azp_url | default('') | string is not search(_runner_azp_unsafe_rx)"
+    fail_msg: >-
+      Set runner_azp_url to your organisation's URL, https://dev.azure.com/<org>
+      (got '{{ runner_azp_url | default('') }}').
+    quiet: true
+
+- name: 'Check the agent pool'
+  ansible.builtin.assert:
+    that:
+      - "runner_azp_pool | default('') | string | trim | length > 0"
+      - "runner_azp_pool | default('') | string is not search(_runner_azp_unsafe_rx)"
+    fail_msg: >-
+      Set runner_azp_pool to the agent pool these agents join, as Organization
+      settings > Agent pools names it (no quotes, $, backquotes or backslashes).
+    quiet: true
+
+- name: 'Check the agent version'
+  ansible.builtin.assert:
+    that: "runner_azp_version | default('latest') | string is match('^(latest|[0-9]+\\.[0-9]+\\.[0-9]+)$')"
+    fail_msg: >-
+      runner_azp_version is 'latest' or a release such as '4.264.2' (got
+      '{{ runner_azp_version | default('') }}').
+    quiet: true
+
+# A string too: `-e runner_azp_skip_registration=true` arrives as one.
+- name: 'Check the switches'
+  ansible.builtin.assert:
+    that: >-
+      _runner_azp_switch is boolean or _runner_azp_switch | string | lower in ['true', 'false']
+    fail_msg: >-
+      runner_azp_adopt_keep_work and runner_azp_skip_registration are true or false
+      (got '{{ _runner_azp_switch }}').
+    quiet: true
+  loop:
+    - "{{ runner_azp_adopt_keep_work | default(false) }}"
+    - "{{ runner_azp_skip_registration | default(false) }}"
+  loop_control:
+    loop_var: '_runner_azp_switch'
+
+# Shown in no output: neither the expressions nor the message carry the value.
+- name: 'Check the PAT, when one is given'
+  ansible.builtin.assert:
+    that: "runner_azp_pat | string is not search('\\s')"
+    fail_msg: 'runner_azp_pat holds whitespace or a line break: paste the token alone.'
+    quiet: true
+  when: "(runner_azp_pat | default('')) | length > 0"
+
+- name: 'Check the agents to adopt'
+  ansible.builtin.assert:
+    that:
+      - "runner_azp_adopt | default({}) is mapping"
+      - "_keys | reject('match', '^[1-9][0-9]*$') | list | length == 0"
+      # YAML gives `1:` as an integer key and `'1':` as a string: both name
+      # instance 1, so the two together name it twice.
+      - "_keys | map('int') | unique | list | length == _keys | length"
+      - "_dirs | reject('match', '^/[^\\n]*[^/\\n]$') | list | length == 0"
+      - "_dirs | unique | length == _dirs | length"
+      - "_dirs | select('search', _runner_azp_unsafe_rx) | list | length == 0"
+    fail_msg: >-
+      runner_azp_adopt maps an instance number (1, 2, ...; an integer or a
+      string key, once each) to the absolute directory of an agent already
+      registered, written without a trailing slash, each directory once:
+      {1: '/home/agent/myagent'}.
+    quiet: true
+  vars:
+    _keys: "{{ runner_azp_adopt | default({}) | dict2items | map(attribute='key') | map('string') | list }}"
+    _dirs: "{{ runner_azp_adopt | default({}) | dict2items | map(attribute='value') | map('string') | list }}"
+
+# Inside the base, only at the instance's own place: an agent moved there by
+# hand. Anywhere else under it is another instance's tree.
+- name: 'Check that no agent to adopt sits inside another instance'
+  ansible.builtin.assert:
+    that: >-
+      (_runner_azp_adopt_item.value | string) is not match('^' ~ (runner_base_dir | regex_escape) ~ '(/|$)')
+      or (_runner_azp_adopt_item.value | string) == runner_base_dir ~ '/' ~ (_runner_azp_adopt_item.key | int)
+    fail_msg: >-
+      runner_azp_adopt[{{ _runner_azp_adopt_item.key }}] is {{ _runner_azp_adopt_item.value }}, inside
+      {{ runner_base_dir }} but not instance {{ _runner_azp_adopt_item.key }}'s own directory.
+    quiet: true
+  loop: "{{ runner_azp_adopt | default({}) | dict2items }}"
+  loop_control:
+    loop_var: '_runner_azp_adopt_item'
+    label: "{{ _runner_azp_adopt_item.key }}"
+
+- name: 'Check the old home'
+  ansible.builtin.assert:
+    that: "runner_azp_adopt_home | string is match('^/\\S*[^/]$')"
+    fail_msg: "runner_azp_adopt_home is an absolute path without a trailing slash, such as '/home/agent'."
+    quiet: true
+  when: "(runner_azp_adopt_home | default('')) | length > 0"

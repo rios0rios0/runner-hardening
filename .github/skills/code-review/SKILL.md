@@ -1,23 +1,25 @@
 ---
 name: code-review
-description: 'Review a pull request against rios0rios0/runner-hardening; reach for this skill whenever judging any change to the repository — the installer, the fleet driver, their generated artefacts, the tests, or the configuration and documentation files.'
+description: 'Review a pull request against rios0rios0/runner-hardening; reach for this skill whenever judging any change to the repository — the Ansible roles, their runtime scripts and templates, the playbooks, the example inventory, the tests and workflows, or the configuration and documentation files.'
 ---
 
 # Code review — runner-hardening
 
 ## When to use this skill
 
-Use it when reviewing any change to this repository: `harden-gha-runners.sh`,
-`fleet.sh`, the config/documentation files, or `test/bootstrap_test.sh`. It
-teaches how a change here is *judged*; `.github/copilot-instructions.md` teaches
-how the code *works*. Read that file first for context, then apply the checklist
-below.
+Use it when reviewing any change to this repository: the roles under `roles/`
+(tasks, templates, defaults, handlers, and the runtime scripts in `files/`),
+the playbooks, `inventory/example`, `test/`, the workflows, or the
+configuration and documentation files. It teaches how a change here is
+*judged*; `.github/copilot-instructions.md` teaches how the code *works*. Read
+that file first for context, then apply the checklist below.
 
 ## Source of truth and precedence
 
 When guidance conflicts, earlier wins over later:
 
-1. The code as it actually runs (Bash semantics under `set -Eeuo pipefail`).
+1. The code as it actually runs (Bash semantics under `set -Eeuo pipefail`,
+   Ansible semantics on the supported `ansible-core` releases).
 2. This skill's repo-specific checklist.
 3. `.github/copilot-instructions.md` and `AGENTS.md`.
 4. The shared [Development Guide](https://github.com/rios0rios0/guide/wiki) and
@@ -30,91 +32,141 @@ flag the drift, do not demand the code change to match stale prose.
 ## How to run the review
 
 ```bash
-make test    # parse check + the test suite (~3s, no VM needed)
-make lint    # ShellCheck — needs `make setup` first
+make test    # bash -n, the runtime suite, the Ansible test playbooks, syntax checks
+make lint    # ShellCheck + ansible-lint (production) — needs `make setup` first
 make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks — needs `make setup`
 ```
 
-`make test` is the only gate that runs on a bare clone. `make lint` and
-`make sast` read the shared configuration from a local checkout of
-`rios0rios0/pipelines`, so they need `make setup` (or a `SCRIPTS_DIR=` override)
-first. Never invoke `shellcheck`, `semgrep` or `gitleaks` directly — the
-Makefile targets load the shared config the whole fleet standardises on.
-Anything that changes system state cannot be tested here; it has to be run on a
-disposable Ubuntu VM. Do not approve such a change as "verified" on `make test`
-alone — say it needs VM exercise.
+`make test` needs only `bash` and `ansible-core`. `make lint` and `make sast`
+read the shared configuration from a local checkout of `rios0rios0/pipelines`,
+so they need `make setup` (or a `SCRIPTS_DIR=` override) first. Never invoke
+`shellcheck`, `ansible-lint`, `semgrep` or `gitleaks` directly — the Makefile
+targets load the shared config every repository standardises on. The converge
+workflow is the only check that touches a real box, and it never starts or
+registers a runner: do not approve a change to registration, the job loop or a
+reboot path as "verified" on CI alone — say it needs a disposable VM.
 
 ## Repo-specific checklist
 
-- **The ephemeral loop must stay intact.** `gha-runner@N` runs exactly one job:
-  `ExecStartPre` mints a single-use JIT config (root, PAT unseen by the runner
-  user), `ExecStart` wipes `_work` and runs one job, `ExecStopPost` reaps the
-  registration, `Restart=always` loops. Flag anything that lets `run.sh` survive
-  a second job, or that makes the wrapper `exec ./run.sh` — `exec` discards the
-  EXIT trap and skips cleanup, silently restoring a long-lived runner.
-- **The disk guard keeps its place and its privilege drop.** `gha-diskguard`
-  must stay the `ExecStartPre` that runs before `gha-jitconfig`: an unregistered
-  runner cannot be handed a job, which is the only thing that makes deleting its
+- **The ephemeral loop must stay intact.** `gha-runner@N` and `azp-agent@N` run
+  exactly one job per start: the disk guard's `ExecStartPre` first, then the
+  vendor's (`gha-jitconfig` mints a single-use JIT config as root, PAT unseen by
+  the runner user; `azp-cycle pre` waits out the backoff and marks the start),
+  then the root-owned wrapper in `/usr/local/libexec/runner-hardening` runs one
+  job (`run.sh` with the JIT config in `ACTIONS_RUNNER_INPUT_JITCONFIG`,
+  `run.sh --once`), `ExecStopPost` counts a job-less cycle (and on GitHub reaps
+  the registration), `Restart=always` loops. Flag anything that lets `run.sh`
+  survive a second job, that makes a wrapper `exec ./run.sh` — `exec` discards
+  the EXIT trap and skips cleanup, silently restoring a long-lived runner — that
+  puts the JIT config back on `run.sh`'s command line, that lets the wrapper's
+  cleanup run before `run.sh` has finished on a stop, or that moves a wrapper
+  back into the tree a job can write. The wrapper still runs as the job's user,
+  so a job can kill it before its trap fires: flag any change that relies on
+  the wrapper's cleanup to keep one job's state from the next. That is the root
+  disk guard's reset, which with `trust=untrusted` also puts back the root-owned
+  copy of the runner's rootless user unit and restarts its Docker daemon; flag
+  a change that drops that restore.
+- **Busy means a worker inside the unit's own cgroup.** `runner_busy` in `lib.sh`
+  is what the drain, the reboot guard and `restart-idle` ask. Flag a busy check
+  that matches any process of the runner's uid, which a job can start outside
+  its unit.
+- **Root never reads a job-writable file through a link.** Flag a root read
+  under a runner's home or tree that does not go through `read_untrusted`, and
+  a task that writes into a job-writable tree without `diff: false`: the diff
+  reads the old file as root, and a job can have made it a link to a root-only
+  one.
+- **Trust fails safe.** `runner_trusted` in `lib.sh` is true only for an exact
+  `internal` in `host.env`. Flag a trust check that treats a missing, empty or
+  unknown value as trusted.
+- **The disk guard keeps its place and its privilege drop.** Its `ExecStartPre`
+  must stay first, ahead of every vendor pre line: a runner not yet running
+  cannot be handed a job, which is the only thing that makes deleting its
   caches safe. Every deletion goes through `as_runner` (`setpriv` to the runner
   user) because every path it clears is job-writable; flag a deletion moved to
-  root. Anything a change puts in a runner's `$HOME` must join the guard's
-  `KEEP` list, or the first reset under disk pressure deletes it.
+  root. Anything a change puts in a runner's `$HOME` must join the keep list
+  (`RUNNER_HOME_KEEP`), or the first reset under disk pressure deletes it.
 - **`StartLimitIntervalSec=0` is deliberate.** systemd's start limit counts
   *attempts*; a healthy runner finishing many quick jobs would trip a nonzero
   limit. Do not flag it as a missing safeguard, and flag any change that removes
   it.
 - **No `RestartSteps`/`RestartMaxDelaySec`, for the same reason.** They count
   every restart and every job ends in one, so they idled healthy runners for
-  minutes after each job. The backoff lives in `gha-jitconfig`, keyed on cycles
-  that ran no job; flag a change that brings systemd's back, or that keys the
-  backoff on the exit status (run-helper exits 0 even on a terminated error).
-  `restart_backoff_delay`, `cycle_ran_a_job` and `runner_labels` are spliced
-  into the generated helpers with `declare -f`: flag a change that makes any of
-  them call another installer function or read an installer global.
-- **`harden-gha-runners.sh` stays self-contained.** It is copied onto machines
-  alone, so a new `source` of another repo file is a defect even though the
-  helper is duplicated in `fleet.sh` on purpose.
-- **Heredoc quoting is load-bearing.** `<<EOF` bakes installer-side values
-  (`${d}`, `${uid}`, `${USER_PREFIX}`) into the generated artefact, so every
-  runtime `$` inside it must be escaped (`\$JIT`, `\$RUNNER_PID`); `<<'EOF'`
-  ships its body verbatim. Getting it backwards yields a valid script that reads
-  an empty variable at job time. A new generated script must keep a `bash -n` check like
-  the one `phase_runners` runs on the wrapper it writes.
+  minutes after each job. The backoff lives in `lib.sh`
+  (`restart_backoff_delay`, `cycle_ran_a_job`), keyed on cycles that ran no job;
+  flag a change that brings systemd's back, that keys the backoff on the exit
+  status (run-helper exits 0 even on a terminated error), or that lets the two
+  flavours' backoffs diverge.
 - **No secret may become a command-line argument.** `/proc/<pid>/cmdline` is
-  world-readable. The SSH bootstrap streams its env file on stdin; every `curl`
-  passes the token with `-H @file`. Flag any `-H "Authorization: Bearer ..."`,
-  any token in argv, and any `curl -K -` substitute (its unquoted value form
-  drops a malformed header silently and sends the request unauthenticated).
-- **`load_config` is a default, never an override.** It saves caller `GHA_*`
-  answers, sources `/etc/github-runner/env`, then restores them, falling back to
-  `/etc/github-runner/pat` only when no `GHA_PAT` was supplied. A change to a
-  plain `. "$ENV_FILE"` breaks unattended runs (they report success while
-  changing nothing) and `fleet.sh --no-pat install`.
-- **`die` inside `$( )` only exits the subshell.** `build_bootstrap` assigns
-  `build_env`'s output to a variable so the failure propagates under `errexit`.
-  Flag a change that inlines the command substitution again.
+  world-readable. Flag a secret in `command`/`shell` arguments, in the
+  `environment:` keyword (Ansible renders it onto the remote command line), or
+  passed as `-e name=value` in a doc, a workflow or a test (a vars file given as
+  `-e @file` puts only its path in argv); flag a secret-bearing task
+  without `no_log: true`; flag a secret reaching a box any way other than the
+  `stdin` of an `install … /dev/stdin` into a root-only file or `uri`
+  `headers:` — `copy` `content:` leaves a temporary copy in `~/.ansible/tmp`.
+  In scripts, flag any `-H "Authorization: Bearer ..."`, any token in argv, any
+  `env VAR=secret cmd`, any secret handed to code a job can write (Azure DevOps
+  registers as root in a pristine, root-owned unpack for that reason), and any
+  `curl -K -` substitute (its unquoted value form drops a malformed header
+  silently and sends the request unauthenticated).
+- **Scripts are static.** A runtime script reads paths, prefixes and thresholds
+  from `/etc/runner-hardening/host.env` (or its vendor's env file) at runtime.
+  Flag a script turned into a template, a value baked in at install time, or a
+  script that would differ between two boxes.
+- **The `.sh` suffix and the `main` guard.** A runtime script without `.sh` in
+  the repository escapes ShellCheck silently; its install task must drop the
+  suffix. Flag a removed `if [[ "${BASH_SOURCE[0]}" == "${0}" ]]` guard — the
+  tests source the scripts through it.
+- **The GitHub flavour's names are fixed.** Users `gha<n>`,
+  `/opt/actions-runner`, `gha-runner@`, `gha.slice`, `/etc/github-runner` and
+  the format of `/etc/github-runner/env` and `pat` are the shell installer's.
+  Flag a rename, and a new key in `/etc/github-runner/env` the `0.1.0`
+  installer could not source harmlessly: both break converging an existing
+  fleet or rolling back to it.
+- **The stored PAT is a fallback, never a requirement.** An undefined
+  `runner_github_pat` must reuse `/etc/github-runner/pat`. Flag a code path that
+  needs the controller to hold the admin token for a host that already stores
+  one. Flag any Azure DevOps PAT written anywhere but the transient root-only
+  registration file.
+- **Idempotency.** A second converge must report `changed=0`. Flag a `command`
+  or `shell` task without `changed_when`, any `changed_when: true`, a write that
+  does not compare first, and a handler notified on every run.
+- **`runner_host_dedicated` gates destruction.** Flag a task that dismantles
+  Docker, de-privileges an account or deletes state without asserting it, and
+  any change to its `false` default.
+- **De-privileging is explicit.** Only the accounts `runner_old_users` names are
+  touched; detected candidates are reported. Flag a change that acts on a
+  detected account, that weakens the protections (uid 1000, a `NOPASSWD`
+  sudoer, an `authorized_keys` owner, an active session) without
+  `runner_force_deprivilege`, or that clears an account's caches as root rather
+  than as that account.
+- **A configuration change never kills a job.** Flag a change that restarts busy
+  runners, replaces a runner tree without a version change, lowers a runner's
+  `MemoryMax` or `MemoryLow` without draining it first (a reload applies the
+  limit to the running job at once), or drains without a `rescue` that
+  undrains.
+- **`ansible.builtin` only.** Flag any module or lookup from another collection
+  in the roles or playbooks (the example inventory may show `community.general`
+  lookups, labelled as optional), a module called without its FQCN, an unnamed
+  task, or a role variable without its role's prefix.
 - **`set -Eeuo pipefail` correctness.** A `[[ cond ]] && action` whose action can
-  fail needs `|| true` or an `if`. Watch for unset-variable hazards under `-u`.
-- **Idempotency.** Every mode must converge; a second consecutive run that
-  changes something is a bug.
-- **Cross-file sync.** A new mode must land in the `main()` `case`, the
-  `die "unknown mode ..."` list, the installer header USAGE block **and its
-  hardcoded `sed -n '2,30p'` `--help` range**, `VALID_MODES` in `fleet.sh`, and
-  the README. A new `fleet.conf` key must land in `KNOWN_KEYS`, `build_env`,
-  `fleet.conf.example`, and the README. A new `GHA_*` answer must land in
-  `CONFIG_ANSWERS`, the `save_config` heredoc, the wizard, and the README table.
-  A partial addition is a latent bug: an unknown `fleet.conf` key is a hard
-  parse error, not a warning.
-- **Every wizard prompt needs an environment answer.** `fleet.sh` drives the
-  installer with no pty, so an interactive-only question is unreachable to the
-  fleet.
+  fail needs `|| true` or an `if`. `exit` inside `$( )` only leaves the
+  subshell. Watch for unset-variable hazards under `-u`.
+- **Cross-file sync.** A new variable must land in its `defaults/main.yaml`, the
+  README's variable table and `inventory/example`; a new runtime script needs
+  its install task, a `test/runtime` case and its removal in
+  `playbooks/uninstall.yaml`; a new `<sbin>-admin` mode needs the README table; a
+  new playbook needs the README's playbook table. A partial addition is a latent
+  bug.
 - **Comments explain the surprising decision, not the obvious line.** Flag a new
-  comment that restates code; do not flag the existing ones that explain why a
-  systemd directive is deliberately unset.
-- **Tests.** New behaviour in a pure function the suite already exercises (the
-  `it_*` cases in `test/bootstrap_test.sh` show which) or in the disk guard that
-  `render_diskguard` emits should come with an `it_*` case. Do not ask for a
-  test that would require a VM.
+  comment that restates code, and a why-comment ported from the installer that a
+  change drops; do not flag the existing ones that explain why a systemd
+  directive is deliberately unset.
+- **Tests.** New behaviour in a runtime script should come with a
+  `test/runtime` case; a change to the resource policy, with
+  `test/ansible/policy.yaml` cases; a change to the unit template, with
+  `test/ansible/templates.yaml` assertions. Do not ask for a test that would
+  require a VM.
 
 ## Shared guide rules
 
@@ -122,10 +174,11 @@ A pull-request review does not have the author's global rules loaded, so restate
 the ones this stack depends on:
 
 - **Commits and PRs follow [Git-Flow](https://github.com/rios0rios0/guide/wiki/Git-Flow)**:
-  Conventional-Commit subjects, imperative mood, branch off and target `main`.
+  Conventional-Commit subjects, simple past tense, branch off and target `main`.
 - **Fail loudly.** Under `errexit` a silently swallowed error is worse than a
-  crash; prefer an explicit `die` with a cause over a bare `|| true` that hides
-  a real failure.
+  crash; prefer an explicit failure with a cause over a bare `|| true` that hides
+  a real failure. In a role, prefer `ansible.builtin.assert` with a `fail_msg`
+  that says what to supply.
 - **Every change carries a `chlog` fragment** under `.changes/unreleased/`
   (`kind` one of Added, Changed, Deprecated, Removed, Fixed, Security). Flag a
   behaviour change with no fragment, and flag a hand edit to the generated
@@ -139,24 +192,25 @@ the ones this stack depends on:
   the shape, not the value, so a placeholder that merely *looks* like a credential
   fails the pipeline. Use inert placeholders such as `fixture-token-placeholder`.
 - **Anonymity.** This repo is public and describes infrastructure. Flag any host
-  name, IP address, organisation name, or fleet size. Examples must use
-  `your-org`, `example`, and RFC 5737 / RFC 1918 addresses.
-- **Least privilege in generated units.** A new `ReadWritePaths` entry, a granted
+  name, IP address, organisation or pool name, or fleet size. Examples must use
+  `your-org`, `your-pool`, `example`, and RFC 5737 / RFC 1918 addresses.
+- **Least privilege in the units.** A new `ReadWritePaths` entry, a granted
   capability, or a relaxed sandbox directive needs a comment justifying it at the
   point it happens, as the AppArmor `unprivileged_userns` relaxation does.
 
 ## What not to flag
 
-- The deliberate duplication of helpers between the two scripts.
-- `StartLimitIntervalSec=0`, the absence of `RestartSteps`, or the wrapper's
+- `StartLimitIntervalSec=0`, the absence of `RestartSteps`, or a wrapper's
   avoidance of `exec` — all intentional and documented.
-- Missing unit tests for phases that change system state; there is no way to test
-  them without a VM here.
-- Style already fixed by ShellCheck and the shared config — do not re-litigate
-  what `make lint` enforces.
-- Modernising or restructuring stable, working Bash for its own sake: this is a
-  small, self-contained toolset, and churn on the invariants above costs more
-  than it saves. Suggest a rewrite only when it fixes a concrete defect.
+- The GitHub flavour's legacy names (`gha`, `/etc/github-runner`) — they are
+  fixed for compatibility with the existing fleet and the rollback.
+- Missing tests for tasks that change system state; there is no way to test
+  them without a VM here, beyond what the converge workflow does.
+- Style already fixed by ShellCheck, ansible-lint and the shared config — do not
+  re-litigate what `make lint` enforces.
+- Restructuring stable, working code for its own sake: churn on the invariants
+  above costs more than it saves. Suggest a rewrite only when it fixes a
+  concrete defect.
 
 ## Output format
 
@@ -169,7 +223,7 @@ plainly rather than manufacturing findings.
 
 | Severity | Use it for                                                                                     |
 |----------|------------------------------------------------------------------------------------------------|
-| Critical | Breaks the ephemeral loop, leaks a secret into argv/logs, or de-privileges/wipes the wrong account. |
-| High     | A mode stops being idempotent, `load_config` semantics regress, or a cross-file set falls out of sync. |
-| Medium   | A heredoc-quoting or `errexit` hazard that fails only at job time; a missing `chlog` fragment or README update. |
-| Low      | A comment restating code, an anonymity slip in an example, or a missing test for a pure function. |
+| Critical | Breaks the ephemeral loop, leaks a secret into argv, `environment:` or logs, or de-privileges/wipes the wrong account. |
+| High     | A converge stops being idempotent, a GitHub-flavour name or file format changes, the stored-PAT fallback regresses, or a cross-file set falls out of sync. |
+| Medium   | An `errexit` hazard that fails only at job time; a missing `chlog` fragment or README update.   |
+| Low      | A comment restating code, an anonymity slip in an example, or a missing test for a runtime function. |

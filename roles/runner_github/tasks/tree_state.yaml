@@ -1,0 +1,54 @@
+---
+# What tree _runner_github_n needs, appended to _runner_github_tree_plan:
+#   install  there is no tree yet
+#   current  its marker names the wanted release
+#   mark     no such marker, but its own binaries are the wanted release: the
+#            v0.1.0 installer wrote no marker, and a runner updates itself in
+#            place, turning bin into a link to bin.<version>
+#   replace  anything else
+#
+# Read with find, never slurp: find answers only whether a file names the
+# wanted release. The tree is its runner user's, so a job can swap any file in
+# it for a link to a root-only file, and root reading that back would carry
+# the file to the controller. find opens regular files only, and the size cap
+# keeps a planted giant file from being read into memory.
+
+- name: 'Look at the tree'
+  ansible.builtin.stat:
+    path: "{{ runner_base_dir }}/{{ _runner_github_n }}"
+    follow: false
+    get_checksum: false
+  register: '_runner_github_tree'
+
+- name: 'Look for a marker naming the wanted release'
+  ansible.builtin.find:
+    paths: "{{ runner_base_dir }}/{{ _runner_github_n }}"
+    patterns: '.runner-version'
+    hidden: true
+    size: '-1k'
+    contains: "^{{ _runner_github_version | regex_escape }}$"
+  register: '_runner_github_marker'
+  when: "_runner_github_tree.stat.isdir | default(false)"
+
+- name: 'Look at the release the binaries in the tree are'
+  ansible.builtin.find:
+    paths: "{{ runner_base_dir }}/{{ _runner_github_n }}/bin"
+    patterns: 'Runner.Listener.deps.json'
+    size: '-1m'
+    contains: >-
+      "Runner[.]Listener/{{ _runner_github_version | regex_escape }}"
+    read_whole_file: true
+  register: '_runner_github_binaries'
+  when:
+    - "_runner_github_tree.stat.isdir | default(false)"
+    - "_runner_github_marker.matched | default(0) == 0"
+
+- name: 'Record what the tree needs'
+  ansible.builtin.set_fact:
+    _runner_github_tree_plan: "{{ _runner_github_tree_plan + [{'n': _runner_github_n | int, 'need': _runner_github_need}] }}"
+  vars:
+    _runner_github_need: >-
+      {{ 'install' if not (_runner_github_tree.stat.isdir | default(false))
+         else 'current' if _runner_github_marker.matched | default(0) > 0
+         else 'mark' if _runner_github_binaries.matched | default(0) > 0
+         else 'replace' }}

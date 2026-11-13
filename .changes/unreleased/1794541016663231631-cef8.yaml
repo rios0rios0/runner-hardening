@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'made `--check --diff` complete on a host that has no runner users yet, changing nothing, so a dry run is the first step of every migration'
+time: '2026-11-13T03:36:56.663189364Z'

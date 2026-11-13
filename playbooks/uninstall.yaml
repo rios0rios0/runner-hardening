@@ -1,0 +1,22 @@
+---
+# Removes every runner, user and home this collection created on a host, and
+# every file it installed. Destructive, so it asks for an explicit yes:
+#
+#   ansible-playbook playbooks/uninstall.yaml --limit build-01 -e runner_uninstall_confirm=true
+#
+# The vendor configuration directory (on GitHub hosts it holds the admin PAT)
+# and /swapfile are left in place; the run says so.
+- name: 'Uninstall the runner hosts'
+  hosts: 'runner_hosts'
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 'Load the flavour of this host'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'host_env'
+
+    - name: 'Remove the runners and everything installed for them'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'uninstall'

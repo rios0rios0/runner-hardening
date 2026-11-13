@@ -1,0 +1,72 @@
+---
+# The Azure Pipelines vendor role. runner_host prepares the box, this role adds
+# what is Azure DevOps's -- the agents, adopted or registered, and the helpers
+# around every agent cycle -- and runner_host finishes and retires around it.
+# The order encodes dependencies: trace what each step assumes before moving
+# one.
+
+# runner_host reads these names for both vendor roles, so they carry no role
+# prefix (contract section 2).
+- name: 'Set the Azure DevOps flavour of the shared runner host'
+  ansible.builtin.set_fact:
+    runner_flavor: 'azure_devops'
+    runner_user_prefix: 'azp'
+    runner_base_dir: '/opt/azure-pipelines-agent'
+    runner_unit: 'azp-agent'
+    runner_slice: 'azp.slice'
+    runner_sbin_prefix: 'azp'
+    runner_config_dir: '/etc/azure-pipelines-agent'
+    runner_worker_pattern: 'Agent\.Worker'
+    # The work directory is kept between jobs: an agent's registration and its
+    # sources, task and tool caches are long-lived, and the disk guard evicts
+    # what goes cold instead.
+    runner_work_policy: 'lru'
+    runner_legacy_unit_globs: ['vsts.agent.*']
+    runner_unit_description: 'Ephemeral Azure Pipelines agent %i'
+    runner_unit_exec_start_pre: ['+/usr/local/sbin/azp-cycle pre %i']
+    runner_unit_exec_start: '/usr/local/libexec/runner-hardening/azp-run-once %i'
+    runner_unit_exec_stop_post: ['+/usr/local/sbin/azp-cycle post %i']
+    # Every variable in an agent's environment becomes one of its capabilities,
+    # so this is what a pipeline routes its heaviest job by: `demands: heavy`.
+    runner_heavy_env:
+      heavy: 'true'
+
+- name: 'Check every answer before anything touches the box'
+  ansible.builtin.import_tasks: 'validate.yaml'
+
+# Before prepare, which stops the old units and de-privileges the account
+# they ran as: a registration that cannot be adopted must stop the converge
+# while the old agent still works.
+- name: 'Look at the agents to adopt'
+  ansible.builtin.import_tasks: 'discover.yaml'
+
+# public: the steps below read runner_host's defaults (runner_count,
+# runner_trust, runner_heavy_runners, ...), which a private include_role hides
+# again as soon as prepare returns.
+- name: 'Prepare the host'
+  ansible.builtin.include_role:
+    name: 'rios0rios0.runner_hardening.runner_host'
+    tasks_from: 'prepare'
+    public: true
+
+- name: 'Install the agent helpers and hooks'
+  ansible.builtin.import_tasks: 'helpers.yaml'
+
+- name: 'Adopt, unpack and register the agents'
+  ansible.builtin.import_tasks: 'agents.yaml'
+
+- name: 'Finish the host'
+  ansible.builtin.include_role:
+    name: 'rios0rios0.runner_hardening.runner_host'
+    tasks_from: 'finish'
+
+- name: 'Take the agents above the count out of the pool'
+  ansible.builtin.import_tasks: 'surplus.yaml'
+
+- name: 'Retire the instances above the count'
+  ansible.builtin.include_role:
+    name: 'rios0rios0.runner_hardening.runner_host'
+    tasks_from: 'retire'
+
+- name: 'Summarise the host'
+  ansible.builtin.import_tasks: 'summary.yaml'

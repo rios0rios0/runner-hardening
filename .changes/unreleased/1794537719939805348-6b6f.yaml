@@ -1,0 +1,3 @@
+kind: 'Removed'
+body: '**BREAKING CHANGE:** removed `harden-gha-runners.sh`, `fleet.sh` and `fleet.conf.example`: hosts are converged by the collection playbooks, a fleet is an Ansible inventory instead of `fleet.conf`, and `git checkout 0.1.0` keeps the shell installer available as a rollback'
+time: '2026-11-13T02:41:59.939758698Z'

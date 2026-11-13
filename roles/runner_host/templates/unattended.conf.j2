@@ -1,0 +1,20 @@
+// {{ _runner_host_managed }}
+// Security pockets only. The Docker repo is deliberately absent: a docker-ce
+// upgrade restarts the rootless daemons and would kill containers mid-job.
+// Update Docker deliberately, during the reboot window below.
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+
+// /boot fills up and then apt breaks - on an unattended fleet this is the
+// single most common way these boxes die.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+
+// NEVER blind-reboot a CI box. {{ runner_sbin_prefix }}-reboot-if-idle does it safely instead.
+Unattended-Upgrade::Automatic-Reboot "false";
+
+// Apply in small steps so a shutdown mid-run leaves dpkg consistent.
+Unattended-Upgrade::MinimalSteps "true";

@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: 'runner_azure_devops'
+  namespace: 'rios0rios0'
+  author: 'rios0rios0'
+  description: >-
+    Azure Pipelines flavour of the hardened runner host: agents that run one
+    job per process, one unprivileged user and one rootless Docker per agent,
+    and agents registered the default way adopted rather than registered
+    again.
+  license: 'MIT'
+  min_ansible_version: '2.16'
+  platforms:
+    - name: 'Ubuntu'
+      versions:
+        - 'all'
+  galaxy_tags:
+    - 'azure'
+    - 'pipelines'
+    - 'agent'
+    - 'ci'
+    - 'hardening'
+
+# runner_host is included from tasks/main.yaml, never declared here. Its
+# prepare, finish and retire entry points run around this role's own steps,
+# and that order is the design: a meta dependency would run all of it first.
+dependencies: []

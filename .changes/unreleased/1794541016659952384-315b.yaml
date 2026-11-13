@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'changed the busy check to look only inside the runner unit own cgroup, so a process a job leaves behind can no longer hold off a reboot or a drain, and made a converge that lowers a runner memory limit drain that runner first, so a policy change never OOM-kills a job in flight'
+time: '2026-11-13T03:36:56.659904657Z'

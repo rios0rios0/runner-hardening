@@ -1,0 +1,207 @@
+---
+# One flavour: render everything with a sample 8 GB, three-runner box
+# (runner 1 heavy, slice_ceiling heavy, codeql auto), then check it.
+
+- name: "Set the flavour facts of {{ test_flavor.key }}"
+  ansible.builtin.set_fact:
+    runner_flavor: "{{ test_flavor.value.runner_flavor }}"
+    runner_user_prefix: "{{ test_flavor.value.runner_user_prefix }}"
+    runner_base_dir: "{{ test_flavor.value.runner_base_dir }}"
+    runner_unit: "{{ test_flavor.value.runner_unit }}"
+    runner_slice: "{{ test_flavor.value.runner_slice }}"
+    runner_sbin_prefix: "{{ test_flavor.value.runner_sbin_prefix }}"
+    runner_config_dir: "{{ test_flavor.value.runner_config_dir }}"
+    runner_worker_pattern: "{{ test_flavor.value.runner_worker_pattern }}"
+    runner_work_policy: "{{ test_flavor.value.runner_work_policy }}"
+    runner_legacy_unit_globs: "{{ test_flavor.value.runner_legacy_unit_globs }}"
+    runner_unit_description: "{{ test_flavor.value.runner_unit_description }}"
+    runner_unit_exec_start_pre: "{{ test_flavor.value.runner_unit_exec_start_pre }}"
+    runner_unit_exec_start: "{{ test_flavor.value.runner_unit_exec_start }}"
+    runner_unit_exec_stop_post: "{{ test_flavor.value.runner_unit_exec_stop_post }}"
+    runner_heavy_env: "{{ test_flavor.value.runner_heavy_env }}"
+    test_dir: "{{ test_scratch.path }}/{{ test_flavor.key }}"
+
+- name: "Create the scratch directory of {{ test_flavor.key }}"
+  ansible.builtin.file:
+    path: "{{ test_dir }}"
+    state: 'directory'
+    mode: '0700'
+
+- name: "Work out the sample memory policy for {{ test_flavor.key }}"
+  ansible.builtin.include_tasks: "{{ runner_host_dir }}/tasks/policy.yaml"
+  vars:
+    runner_count_resolved: 3
+    runner_mem_mb: 7936
+    runner_heavy_runners: 1
+    runner_codeql_ram: 'auto'
+    runner_slice_ceiling: 'heavy'
+
+- name: "Render the units of {{ test_flavor.key }}"
+  ansible.builtin.template:
+    src: "{{ runner_host_dir }}/templates/{{ test_file }}.j2"
+    dest: "{{ test_dir }}/{{ test_file }}"
+    mode: '0600'
+  loop: ['runner@.service', 'runner.slice', 'protect.conf', 'janitor.service', 'janitor.timer', 'reboot.service', 'reboot.timer']
+  loop_control:
+    loop_var: 'test_file'
+
+- name: "Render the trusted drop-ins of runners 1 and 2 of {{ test_flavor.key }}"
+  ansible.builtin.template:
+    src: "{{ runner_host_dir }}/templates/{{ test_dropin[0] }}.j2"
+    dest: "{{ test_dir }}/{{ test_dropin[0] }}-{{ test_dropin[1] }}"
+    mode: '0600'
+  loop: "{{ ['instance.conf', 'user-slice.conf'] | product([1, 2]) | list }}"
+  loop_control:
+    loop_var: 'test_dropin'
+  vars:
+    _runner_host_n: "{{ test_dropin[1] }}"
+    _runner_host_uid: "{{ 1000 + test_dropin[1] }}"
+    runner_trust: 'internal'
+
+- name: "Work out the policy with CodeQL off for {{ test_flavor.key }}"
+  ansible.builtin.include_tasks: "{{ runner_host_dir }}/tasks/policy.yaml"
+  vars:
+    runner_count_resolved: 3
+    runner_mem_mb: 7936
+    runner_heavy_runners: 1
+    runner_codeql_ram: 'off'
+    runner_slice_ceiling: 'heavy'
+
+- name: "Render the untrusted drop-in of runner 2, CodeQL off, of {{ test_flavor.key }}"
+  ansible.builtin.template:
+    src: "{{ runner_host_dir }}/templates/instance.conf.j2"
+    dest: "{{ test_dir }}/instance.conf-untrusted"
+    mode: '0600'
+  vars:
+    _runner_host_n: 2
+    _runner_host_uid: 1002
+    runner_trust: 'untrusted'
+
+- name: "Render the host configuration of {{ test_flavor.key }}"
+  ansible.builtin.template:
+    src: "{{ runner_host_dir }}/templates/host.env.j2"
+    dest: "{{ test_dir }}/host.env"
+    mode: '0600'
+  vars:
+    runner_count_resolved: 3
+    runner_trust: 'internal'
+    runner_disk_soft_pct: 75
+    runner_disk_hard_pct: 90
+    runner_stale_days: 7
+    runner_drain_timeout: 1800
+    runner_heavy_runners: 1
+    runner_home_keep_extra: ['.m2/repository']
+    runner_home_seed: {'.nuget/packages': '/srv/seed/nuget', '.m2/repository': '/srv/seed/m2'}
+    runner_old_users: ['ci-old']
+
+- name: "Read back what was rendered for {{ test_flavor.key }}"
+  ansible.builtin.slurp:
+    src: "{{ test_dir }}/{{ test_rendered }}"
+  loop:
+    - 'runner@.service'
+    - 'runner.slice'
+    - 'protect.conf'
+    - 'janitor.service'
+    - 'janitor.timer'
+    - 'reboot.service'
+    - 'reboot.timer'
+    - 'instance.conf-1'
+    - 'instance.conf-2'
+    - 'instance.conf-untrusted'
+    - 'user-slice.conf-1'
+    - 'user-slice.conf-2'
+    - 'host.env'
+  loop_control:
+    loop_var: 'test_rendered'
+  register: 'test_slurped'
+
+# Through a real shell, as every runtime script reads it.
+- name: "Source the host configuration of {{ test_flavor.key }}"
+  ansible.builtin.command:
+    argv:
+      - 'bash'
+      - '-c'
+      - >-
+        set -eu; . "$1";
+        printf '%s\n' "$RUNNER_FLAVOR" "$RUNNER_USER_PREFIX" "$RUNNER_BASE" "$RUNNER_UNIT" "$RUNNER_SLICE"
+        "$RUNNER_SBIN_PREFIX" "$RUNNER_CONFIG_DIR" "$RUNNER_COUNT" "$RUNNER_TRUST" "$RUNNER_WORKER_PATTERN"
+        "$RUNNER_WORK_POLICY" "$RUNNER_TOOLCACHE_PREFIX" "$RUNNER_DISK_SOFT" "$RUNNER_DISK_HARD"
+        "$RUNNER_STALE_DAYS" "$RUNNER_DRAIN_TIMEOUT" "$RUNNER_HEAVY_RUNNERS" "$RUNNER_HOME_KEEP" "$RUNNER_OLD_USERS"
+      - 'host-env'
+      - "{{ test_dir }}/host.env"
+  register: 'test_sourced'
+  changed_when: false
+
+# The neutral playbooks read the same file without a shell.
+- name: "Parse the host configuration as the neutral playbooks do, for {{ test_flavor.key }}"
+  ansible.builtin.include_tasks: "{{ runner_host_dir }}/tasks/host_env.yaml"
+  vars:
+    _runner_host_env_file: "{{ test_dir }}/host.env"
+
+- name: "Check the invariants of {{ test_flavor.key }}"
+  ansible.builtin.set_fact:
+    test_results: >-
+      {% set out = [] %}{% for check in _checks %}{% set _ = out.append(('  ok  ' if check[1] is sameas true else 'FAIL  ')
+      ~ test_flavor.key ~ ': ' ~ check[0]) %}{% endfor %}{{ test_results + out }}
+  vars:
+    _files: "{{ dict(test_slurped.results | map(attribute='test_rendered') | zip(test_slurped.results | map(attribute='content') | map('b64decode'))) }}"
+    _unit: "{{ _files['runner@.service'].splitlines() }}"
+    _pre: "{{ _unit | select('match', '^ExecStartPre=') | list }}"
+    _all: "{{ _files.values() | join('\n') }}"
+    _drop1: "{{ _files['instance.conf-1'].splitlines() }}"
+    _drop2: "{{ _files['instance.conf-2'].splitlines() }}"
+    _dropu: "{{ _files['instance.conf-untrusted'].splitlines() }}"
+    _uid: '/run/user/1001'
+    _required:
+      - 'StartLimitIntervalSec=0'
+      - 'Type=simple'
+      - 'Restart=always'
+      - 'RestartSec=1'
+      - 'TimeoutStartSec=15min'
+      - 'KillMode=control-group'
+      - 'TimeoutStopSec=300'
+      - 'OOMPolicy=continue'
+      - 'NoNewPrivileges=yes'
+      - 'PrivateTmp=yes'
+      - 'Environment=TMPDIR=/var/tmp'
+      - 'ProtectSystem=strict'
+      - 'ProtectHome=no'
+      - 'ProtectProc=invisible'
+      - 'ProtectKernelTunables=yes'
+      - 'ProtectControlGroups=yes'
+      - 'RemoveIPC=yes'
+      - 'CapabilityBoundingSet='
+      - 'AmbientCapabilities='
+      - 'SystemCallFilter='
+      - 'SystemCallErrorNumber=EPERM'
+      - 'TasksMax=4096'
+      - 'WantedBy=multi-user.target'
+    _checks:
+      - ['the disk guard is the first ExecStartPre, before the registration is minted', "{{ _pre[:1] == ['ExecStartPre=-+/usr/local/sbin/' ~ runner_sbin_prefix ~ '-diskguard %i'] }}"]
+      - ['the vendor pre-start lines follow the guard, in order', "{{ _pre[1:] == runner_unit_exec_start_pre | map('regex_replace', '^', 'ExecStartPre=') | list }}"]
+      - ['ExecStart is the vendor one-job wrapper, once', "{{ _unit | select('match', '^ExecStart=') | list == ['ExecStart=' ~ runner_unit_exec_start] }}"]
+      - ['the vendor post-stop lines are there, in order', "{{ _unit | select('match', '^ExecStopPost=') | list == runner_unit_exec_stop_post | map('regex_replace', '^', 'ExecStopPost=') | list }}"]
+      - ['a runner comes back one second after its job', "{{ _unit | select('match', '^RestartSec=') | list == ['RestartSec=1'] }}"]
+      - ['systemd never backs a healthy runner off (no RestartSteps or RestartMaxDelaySec)', "{{ _unit | select('match', '^[^#]*(RestartSteps|RestartMaxDelaySec)') | list | length == 0 }}"]
+      - ['an OOM kill fails the step, not the runner (OOMPolicy=continue, once)', "{{ _unit | select('equalto', 'OOMPolicy=continue') | list | length == 1 }}"]
+      - ['job temp files go to the private /var/tmp, once', "{{ _unit | select('match', '^Environment=TMPDIR=') | list == ['Environment=TMPDIR=/var/tmp'] }}"]
+      - ['PrivateTmp is on, once', "{{ _unit | select('match', '^PrivateTmp=') | list == ['PrivateTmp=yes'] }}"]
+      - ['the start limit is off, in [Unit]', "{{ _files['runner@.service'].split('[Service]')[0] is search('(?m)^StartLimitIntervalSec=0$') }}"]
+      - ['every hardening directive of the contract is set', "{{ _required | difference(_unit) | length == 0 }}"]
+      - ['the unit runs as the flavour user, in its own tree', "{{ ['User=' ~ runner_user_prefix ~ '%i', 'Group=' ~ runner_user_prefix ~ '%i', 'WorkingDirectory=' ~ runner_base_dir ~ '/%i', 'Description=' ~ runner_unit_description] | difference(_unit) | length == 0 }}"]
+      - ['no ManagedOOM policy anywhere outside comments', "{{ _all.splitlines() | select('match', '^[^#]*ManagedOOM') | list | length == 0 }}"]
+      - ['nothing is left unrendered', "{{ _all is not search('[{][{%#]|[%#}][}]') }}"]
+      - ['every rendered file ends with a newline', "{{ _files.values() | reject('match', '(?s).*\\n$') | list | length == 0 }}"]
+      - ['the slice caps every runner together at the aggregate', "{{ 'MemoryMax=6612M' in _files['runner.slice'].splitlines() and 'MemoryAccounting=yes' in _files['runner.slice'].splitlines() }}"]
+      - ['the OS keeps its floor', "{{ 'MemoryMin=512M' in _files['protect.conf'].splitlines() }}"]
+      - ['runner 1 runs in the slice, with its own paths and sockets', "{{ ['Slice=' ~ runner_slice, 'ReadWritePaths=' ~ runner_base_dir ~ '/1 /home/' ~ runner_user_prefix ~ '1 /opt/hostedtoolcache-' ~ runner_user_prefix ~ '1 ' ~ _uid, 'Environment=DOCKER_HOST=unix://' ~ _uid ~ '/docker.sock', 'Environment=XDG_RUNTIME_DIR=' ~ _uid, 'CPUWeight=100', 'IOWeight=100'] | difference(_drop1) | length == 0 }}"]
+      - ['runner 1, heavy and lifted, may grow to the slice; runner 2 keeps the usual ceiling', "{{ 'MemoryLow=2104M' in _drop1 and 'MemoryMax=6612M' in _drop1 and 'MemoryLow=2104M' in _drop2 and 'MemoryMax=5365M' in _drop2 }}"]
+      - ['every job sees the CodeQL budget', "{{ 'Environment=CODEQL_RAM=4564' in _drop1 and 'Environment=CODEQL_RAM=4564' in _drop2 }}"]
+      - ['a trusted runner keeps its own tool cache', "{{ ('Environment=AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache-' ~ runner_user_prefix ~ '2') in _drop2 }}"]
+      - ['the heavy environment reaches runner 1 only', "{{ (runner_heavy_env | dictsort | map('join', '=') | map('regex_replace', '^', 'Environment=') | list) | difference(_drop1) | length == 0 and _drop2 | select('match', '^Environment=(' ~ (runner_heavy_env.keys() | list + ['(?!)']) | join('|') ~ ')=') | list | length == 0 }}"]
+      - ['untrusted with CodeQL off: no CODEQL_RAM, no shared tool cache, still capped', "{{ _dropu | select('match', '^Environment=(CODEQL_RAM|AGENT_TOOLSDIRECTORY)=') | list | length == 0 and 'MemoryMax=5365M' in _dropu }}"]
+      - ['containers get the same budget in the user slice', "{{ ['MemoryLow=2104M', 'MemoryMax=6612M', 'TasksMax=8192'] | difference(_files['user-slice.conf-1'].splitlines()) | length == 0 and 'MemoryMax=5365M' in _files['user-slice.conf-2'].splitlines() }}"]
+      - ['the janitor runs daily and the reboot guard only in its window', "{{ ['OnCalendar=daily', 'RandomizedDelaySec=1h', 'Persistent=true'] | difference(_files['janitor.timer'].splitlines()) | length == 0 and ['OnCalendar=*-*-* 02..05:00:00', 'RandomizedDelaySec=20m', 'Persistent=true'] | difference(_files['reboot.timer'].splitlines()) | length == 0 }}"]
+      - ['the timers run the flavour scripts', "{{ ('ExecStart=/usr/local/sbin/' ~ runner_sbin_prefix ~ '-janitor') in _files['janitor.service'].splitlines() and ('ExecStart=/usr/local/sbin/' ~ runner_sbin_prefix ~ '-reboot-if-idle') in _files['reboot.service'].splitlines() }}"]
+      - ['host.env reads back, through bash, exactly as written', "{{ test_sourced.stdout_lines == [runner_flavor, runner_user_prefix, runner_base_dir, runner_unit, runner_slice, runner_sbin_prefix, runner_config_dir, '3', 'internal', runner_worker_pattern, runner_work_policy, '/opt/hostedtoolcache-', '75', '90', '7', '1800', '1', '.config/systemd/user/docker.service .config/systemd/user/default.target.wants/docker.service .local/share/docker .m2/repository .nuget/packages', 'ci-old'] }}"]
+      - ['the neutral playbooks parse host.env to what bash reads, and take the flavour from it', "{{ _runner_host_env.values() | list == test_sourced.stdout_lines and runner_flavor == test_flavor.value.runner_flavor and runner_sbin_prefix == test_flavor.value.runner_sbin_prefix and runner_count_resolved | int == 3 }}"]

@@ -1,0 +1,258 @@
+---
+# The unit template, the slice, the drop-ins, and then every instance up. A
+# changed definition reaches a busy runner when its job ends, and an idle one
+# through the restart handler, so nothing here waits on a drain or stops a job
+# - except when a runner is about to get LESS memory: the reload would apply
+# that to the job it is running at once, so that runner is drained first.
+
+- name: 'Record each runner uid'
+  ansible.builtin.import_tasks: 'uids.yaml'
+
+# Absent before the first converge, which in check mode is never written.
+- name: 'Look for the unit template'
+  ansible.builtin.stat:
+    path: "{{ _runner_host_systemd_dir }}/{{ runner_unit }}@.service"
+  register: '_runner_host_unit_present'
+
+# Root-owned files under /etc, so reading them is safe. Every instance that
+# exists, the ones above the count included: a lower slice cap reaches them too.
+- name: 'Read the memory limits each runner runs under now'
+  ansible.builtin.slurp:
+    src: "{{ _runner_host_limit_file.path }}"
+  loop: >-
+    {%- set out = [] -%}
+    {%- for n in _runner_host_existing_instances | default([]) -%}
+    {%- set _ = out.append({'n': n, 'path': _runner_host_systemd_dir ~ '/' ~ runner_unit ~ '@' ~ n ~ '.service.d/10-instance.conf'}) -%}
+    {%- set user = runner_user_prefix ~ n -%}
+    {%- if (ansible_facts['getent_passwd'][user] | default(none)) is not none -%}
+    {%- set _ = out.append({'n': n, 'path': _runner_host_systemd_dir ~ '/user-' ~ ansible_facts['getent_passwd'][user][1]
+                                          ~ '.slice.d/10-' ~ runner_sbin_prefix ~ '-limits.conf'}) -%}
+    {%- endif -%}
+    {%- endfor -%}
+    {{ out }}
+  loop_control:
+    loop_var: '_runner_host_limit_file'
+    label: "{{ _runner_host_limit_file.path }}"
+  register: '_runner_host_limit_reads'
+  failed_when: false
+
+- name: 'Read the slice the runners run in now'
+  ansible.builtin.slurp:
+    src: "{{ _runner_host_systemd_dir }}/{{ runner_slice }}"
+  register: '_runner_host_slice_read'
+  failed_when: false
+
+- name: 'Work out which runners are about to get less memory'
+  ansible.builtin.include_tasks: 'lowered.yaml'
+  vars:
+    _runner_host_current_limits: >-
+      {%- set out = [] -%}
+      {%- for read in _runner_host_limit_reads.results | default([]) if read.content is defined -%}
+      {%- set _ = out.append({'n': read._runner_host_limit_file.n, 'text': read.content | b64decode}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _runner_host_current_slice: "{{ _runner_host_slice_read.content | default('') | b64decode }}"
+
+- name: 'Write the definitions and bring every runner up'
+  block:
+    - name: 'Report the runners drained before their memory is lowered'
+      ansible.builtin.debug:
+        msg: >-
+          Runner(s) {{ _runner_host_lowered_instances | join(', ') }} get less memory: each finishes the job
+          it is on before the lower limit applies.
+      when: "_runner_host_lowered_instances | length > 0"
+
+    # The admin tool's normal budget (runner_drain_timeout, in host.env).
+    - name: 'Let the runners whose memory is lowered finish their jobs, then stop them'
+      ansible.builtin.command:
+        argv: "{{ ['/usr/local/sbin/' ~ runner_sbin_prefix ~ '-admin', 'drain'] + (_runner_host_lowered_instances | map('string') | list) }}"
+      register: '_runner_host_lowering_drain'
+      changed_when: "_runner_host_lowering_drain.stdout is search('(?m)runner [0-9]+ drained$')"
+      when: "_runner_host_lowered_instances | length > 0"
+
+    - name: 'Write the runner unit template'
+      ansible.builtin.template:
+        src: 'runner@.service.j2'
+        dest: "{{ _runner_host_systemd_dir }}/{{ runner_unit }}@.service"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      register: '_runner_host_unit_file'
+      notify: ['Reload systemd', 'Restart idle runners']
+
+    - name: 'Write the aggregate slice of all runners'
+      ansible.builtin.template:
+        src: 'runner.slice.j2'
+        dest: "{{ _runner_host_systemd_dir }}/{{ runner_slice }}"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      register: '_runner_host_slice_file'
+      notify: ['Reload systemd', 'Restart idle runners']
+
+    - name: 'Create the drop-in directories'
+      ansible.builtin.file:
+        path: "{{ _runner_host_dropin_dir }}"
+        state: 'directory'
+        owner: 'root'
+        group: 'root'
+        mode: '0755'
+      loop: >-
+        {{ [_runner_host_systemd_dir ~ '/system.slice.d']
+           + (runner_instances | map('regex_replace', '^(.*)$', _runner_host_systemd_dir ~ '/' ~ runner_unit ~ '@\1.service.d') | list)
+           + (runner_instances | map('string') | map('extract', _runner_host_uids)
+              | map('regex_replace', '^(.*)$', _runner_host_systemd_dir ~ '/user-\1.slice.d') | list) }}
+      loop_control:
+        loop_var: '_runner_host_dropin_dir'
+
+    # Protect the OS so the box stays reachable no matter what CI does.
+    - name: 'Write the memory floor that keeps the OS reachable'
+      ansible.builtin.template:
+        src: 'protect.conf.j2'
+        dest: "{{ _runner_host_systemd_dir }}/system.slice.d/10-{{ runner_sbin_prefix }}-protect.conf"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      register: '_runner_host_protect_file'
+      notify: 'Reload systemd'
+
+    - name: 'Write each runner own drop-in'
+      ansible.builtin.template:
+        src: 'instance.conf.j2'
+        dest: "{{ _runner_host_systemd_dir }}/{{ runner_unit }}@{{ _runner_host_n }}.service.d/10-instance.conf"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      loop: "{{ runner_instances }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+      vars:
+        _runner_host_uid: "{{ _runner_host_uids[_runner_host_n | string] }}"
+      register: '_runner_host_instance_files'
+      notify: ['Reload systemd', 'Restart idle runners']
+
+    - name: 'Write each runner container memory drop-in'
+      ansible.builtin.template:
+        src: 'user-slice.conf.j2'
+        dest: "{{ _runner_host_systemd_dir }}/user-{{ _runner_host_uids[_runner_host_n | string] }}.slice.d/10-{{ runner_sbin_prefix }}-limits.conf"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      loop: "{{ runner_instances }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+      register: '_runner_host_user_slice_files'
+      notify: 'Reload systemd'
+
+    - name: 'Remove the drop-ins left by sandbox experiments'
+      ansible.builtin.file:
+        path: "{{ _runner_host_systemd_dir }}/{{ runner_unit }}@{{ _runner_host_stale[0] }}.service.d/{{ _runner_host_stale[1] }}"
+        state: 'absent'
+      loop: "{{ runner_instances | product(_runner_host_stale_dropins) | list }}"
+      loop_control:
+        loop_var: '_runner_host_stale'
+      notify: ['Reload systemd', 'Restart idle runners']
+
+    # A drain override outranks the unit file, so one left behind by an
+    # interrupted run would bring its runner back with Restart=no, to serve
+    # exactly one more job. Every instance, not only those the count names.
+    # This also lifts the drain above: the runners it stopped start below.
+    - name: 'Find the drain overrides left behind'
+      ansible.builtin.find:
+        paths: "{{ _runner_host_systemd_dir }}"
+        patterns: '40-drain.conf'
+        recurse: true
+        depth: 2
+      register: '_runner_host_drain_overrides'
+
+    - name: 'Remove the drain overrides'
+      ansible.builtin.file:
+        path: "{{ _runner_host_drain_override }}"
+        state: 'absent'
+      loop: >-
+        {{ _runner_host_drain_overrides.files | map(attribute='path')
+           | select('match', '^' ~ (_runner_host_systemd_dir ~ '/' ~ runner_unit | regex_escape) ~ '@[0-9]+[.]service[.]d/')
+           | list }}
+      loop_control:
+        loop_var: '_runner_host_drain_override'
+      notify: ['Reload systemd', 'Restart idle runners']
+
+    - name: 'Note whether the memory policy changed'
+      ansible.builtin.set_fact:
+        _runner_host_policy_changed: >-
+          {{ (_runner_host_unit_file.changed or _runner_host_slice_file.changed or _runner_host_protect_file.changed
+              or (_runner_host_instance_files.results | selectattr('changed') | list | length > 0)
+              or (_runner_host_user_slice_files.results | selectattr('changed') | list | length > 0)) | bool }}
+
+    # A backoff earned under the old configuration says nothing about the new one.
+    - name: 'Find the restart backoff counters'
+      ansible.builtin.find:
+        paths: "/run/{{ runner_unit }}"
+        patterns: '*.fails'
+      register: '_runner_host_backoff'
+      when: "_runner_host_policy_changed | bool"
+
+    - name: 'Reset the restart backoff counters'
+      ansible.builtin.file:
+        path: "{{ _runner_host_fails }}"
+        state: 'absent'
+      loop: "{{ _runner_host_backoff.files | default([]) | map(attribute='path') | list }}"
+      loop_control:
+        loop_var: '_runner_host_fails'
+
+    # Now, not at the end of the play: the reload must precede enabling, and the
+    # idle runners restart onto the new definitions before the stopped ones start.
+    - name: 'Apply the new definitions'
+      ansible.builtin.meta: 'flush_handlers'
+
+    # A dry run of a first converge has no unit template on disk to enable.
+    - name: 'Enable every runner'
+      ansible.builtin.systemd_service:
+        name: "{{ runner_unit }}@{{ _runner_host_n }}.service"
+        enabled: true
+      loop: "{{ runner_instances }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+      register: '_runner_host_enabled'
+      when: "not ansible_check_mode or _runner_host_unit_present.stat.exists"
+
+    # Only a runner that is down. One caught deactivating is between two jobs, its
+    # post-stop hook still running, and Restart=always brings it back: starting
+    # it here would race that, and report a change a quiet box never had.
+    - name: 'Start every runner that is down'
+      ansible.builtin.systemd_service:
+        name: "{{ runner_unit }}@{{ _runner_host_unit._runner_host_n }}.service"
+        state: 'started'
+      loop: "{{ _runner_host_enabled.results | default([]) }}"
+      loop_control:
+        loop_var: '_runner_host_unit'
+        label: "{{ runner_unit }}@{{ _runner_host_unit._runner_host_n }}"
+      register: '_runner_host_started'
+      when:
+        - "runner_start_units | bool"
+        - "_runner_host_unit.status is defined"
+        - "_runner_host_unit.status.ActiveState | default('inactive') in ['inactive', 'failed']"
+
+  # The drain's own undo, as the installer's EXIT trap was: without it, a
+  # failure after the drain would leave those runners with Restart=no and out
+  # of the pool, which is worse than the failure itself.
+  rescue:
+    - name: 'Put back the runners drained for their lower memory'
+      ansible.builtin.command:
+        argv: "{{ ['/usr/local/sbin/' ~ runner_sbin_prefix ~ '-admin', 'undrain'] + (_runner_host_lowered_instances | map('string') | list) }}"
+      register: '_runner_host_lowering_undrain'
+      changed_when: "_runner_host_lowering_undrain.rc == 0"
+      failed_when: false
+      when: "_runner_host_lowered_instances | length > 0"
+
+    - name: 'Fail with the step that failed'
+      ansible.builtin.fail:
+        msg: >-
+          {{ ansible_failed_task.name | default('a step') }} failed:
+          {{ ansible_failed_result.msg | default('see the task above') }}
+          {%- if _runner_host_lowered_instances | length > 0 %}.
+          Runner(s) {{ _runner_host_lowered_instances | join(', ') }} were drained for their lower memory and
+          {{ 'have been put back' if (_runner_host_lowering_undrain.rc | default(1)) == 0
+             else 'could NOT be put back: run /usr/local/sbin/' ~ runner_sbin_prefix ~ '-admin undrain '
+                  ~ (_runner_host_lowered_instances | join(' ')) }}
+          {%- endif %}

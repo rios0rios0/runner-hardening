@@ -1,0 +1,15 @@
+---
+# For the neutral playbooks that drive the admin tool: a host the old
+# installer hardened, or one never converged, has none yet.
+- name: 'Look for the admin tool'
+  ansible.builtin.stat:
+    path: "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+  register: '_runner_host_admin_tool'
+
+- name: 'Check that this host has the admin tool'
+  ansible.builtin.assert:
+    that: "_runner_host_admin_tool.stat.exists"
+    fail_msg: >-
+      {{ inventory_hostname }} has no /usr/local/sbin/{{ runner_sbin_prefix }}-admin yet:
+      converge it with playbooks/github.yaml or playbooks/azure_devops.yaml first.
+    quiet: true

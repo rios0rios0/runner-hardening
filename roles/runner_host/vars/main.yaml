@@ -1,0 +1,181 @@
+---
+# Fixed paths and lists. Not tunables: everything tunable is in defaults.
+
+_runner_host_managed: 'Managed by the rios0rios0.runner_hardening runner_host role. Change the inventory, not this file.'
+
+_runner_host_lib_dir: '/usr/local/lib/runner-hardening'
+_runner_host_libexec_dir: '/usr/local/libexec/runner-hardening'
+_runner_host_etc_dir: '/etc/runner-hardening'
+_runner_host_env_file: '/etc/runner-hardening/host.env'
+_runner_host_state_dir: '/var/lib/runner-hardening'
+_runner_host_wipe_marker: '/var/lib/runner-hardening/wiped'
+_runner_host_toolcache_prefix: '/opt/hostedtoolcache-'
+_runner_host_systemd_dir: '/etc/systemd/system'
+_runner_host_cache_dir: '/var/cache/runner-hardening'
+
+# All a home reset keeps of $HOME: the rootless daemon's user unit, the link
+# that enables it, and its data root. runner_home_keep_extra and the
+# runner_home_seed keys are added to it in host.env.
+_runner_host_home_keep_base:
+  - '.config/systemd/user/docker.service'
+  - '.config/systemd/user/default.target.wants/docker.service'
+  - '.local/share/docker'
+
+# unzip is not optional: actions/cache, actions/download-artifact and every
+# action that ships a .zip release shell out to it, and a fresh Ubuntu server
+# image does not have it. Without it those steps fail mid-job with a bare
+# "unzip: command not found" that reads like a broken action. make and
+# python3-venv are the same trap one step later: jobs call make directly, and
+# tools that build their own virtualenv (semgrep) need ensurepip, which Ubuntu
+# ships only in python3-venv.
+_runner_host_base_packages:
+  - 'curl'
+  - 'jq'
+  - 'unzip'
+  - 'make'
+  - 'python3'
+  - 'python3-venv'
+  - 'ca-certificates'
+  - 'gnupg'
+  - 'uidmap'
+  - 'dbus-user-session'
+  - 'fuse-overlayfs'
+  - 'slirp4netns'
+  - 'iptables'
+  - 'acl'
+  - 'libicu-dev'
+  - 'util-linux'
+
+_runner_host_docker_packages:
+  - 'docker-ce'
+  - 'docker-ce-cli'
+  - 'containerd.io'
+  - 'docker-buildx-plugin'
+  - 'docker-compose-plugin'
+  - 'docker-ce-rootless-extras'
+
+_runner_host_docker_key_url: 'https://download.docker.com/linux/ubuntu/gpg'
+_runner_host_docker_repo_url: 'https://download.docker.com/linux/ubuntu'
+# The rootless extras ship this. Present means Docker is already installed,
+# by this role or another way, and its apt source is left alone.
+_runner_host_rootless_tool: '/usr/bin/dockerd-rootless-setuptool.sh'
+
+# The groups an old account is stripped of, and the ones whose members are
+# reported as candidates for de-privileging.
+_runner_host_privileged_groups: ['sudo', 'admin', 'wheel', 'adm', 'docker', 'lxd', 'disk', 'shadow']
+_runner_host_candidate_groups: ['docker', 'sudo', 'lxd']
+
+# What the one-time wipe clears from an old account's home.
+_runner_host_old_user_caches:
+  - '.cache'
+  - '.npm'
+  - '.docker'
+  - '.gradle'
+  - '.m2'
+  - '.cargo/registry'
+  - '.nuget'
+  - '.gem'
+  - '.yarn'
+  - '.pnpm-store'
+  - '.local/share/virtualenvs'
+  - '.config/gh'
+  - '.config/systemd/user'
+
+# Drop-ins from earlier sandbox experiments outrank the base unit and would
+# silently persist across a converge. 50-tmpdir.conf carried the TMPDIR line
+# before the unit did; left behind, it would override any change to it.
+_runner_host_stale_dropins:
+  - '20-sandbox-relax.conf'
+  - '30-sandbox-off.conf'
+  - '50-tmpdir.conf'
+
+# The name a flavour's units and messages use for one runner.
+_runner_host_flavor_noun:
+  github: 'GitHub Actions runner'
+  azure_devops: 'Azure Pipelines agent'
+
+# The vendor-neutral playbooks (verify, diagnose, drain, uninstall) run without
+# a vendor role. They read the flavour from host.env; on a host that has none
+# yet, these are the vendor roles' own values (contract section 2), and they
+# must be kept identical to them.
+_runner_host_flavors:
+  github:
+    runner_flavor: 'github'
+    runner_user_prefix: 'gha'
+    runner_base_dir: '/opt/actions-runner'
+    runner_unit: 'gha-runner'
+    runner_slice: 'gha.slice'
+    runner_sbin_prefix: 'gha'
+    runner_config_dir: '/etc/github-runner'
+    runner_worker_pattern: 'Runner\.Worker'
+  azure_devops:
+    runner_flavor: 'azure_devops'
+    runner_user_prefix: 'azp'
+    runner_base_dir: '/opt/azure-pipelines-agent'
+    runner_unit: 'azp-agent'
+    runner_slice: 'azp.slice'
+    runner_sbin_prefix: 'azp'
+    runner_config_dir: '/etc/azure-pipelines-agent'
+    runner_worker_pattern: 'Agent\.Worker'
+
+# The vendor helpers uninstall removes, beside the neutral ones.
+_runner_host_vendor_sbin:
+  github: ['jitconfig', 'jitreap']
+  azure_devops: ['cycle', 'register']
+
+# Waits until no process matching a pattern lives in any of the given units'
+# cgroups, then stops each unit. One deadline for all of them, like the
+# installer's drain. A long-lived runner takes its next job seconds after the
+# last one, so it is polled every second and stopped the moment it is idle.
+# Arguments: <budget seconds> <worker pattern> <unit>...
+_runner_host_legacy_drain_script: |
+  set -uo pipefail
+  budget="$1" pattern="$2"
+  shift 2
+  deadline=$(( $(date +%s) + budget ))
+  unit_busy() {
+    local cg pid
+    cg=$(systemctl show -p ControlGroup --value "$1" 2>/dev/null)
+    [[ -n "$cg" && -d "/sys/fs/cgroup${cg}" ]] || return 1
+    while read -r pid; do
+      [[ -r "/proc/${pid}/cmdline" ]] || continue
+      tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -qE -- "$pattern" && return 0
+    done < <(find "/sys/fs/cgroup${cg}" -name cgroup.procs -exec cat {} + 2>/dev/null)
+    return 1
+  }
+  for unit in "$@"; do
+    if unit_busy "$unit"; then
+      echo "waiting: ${unit} is running a job"
+      while unit_busy "$unit"; do
+        if (( $(date +%s) >= deadline )); then
+          echo "drain budget spent and ${unit} is still working - stopping it anyway; that job will fail"
+          break
+        fi
+        sleep 1
+      done
+    fi
+    systemctl stop "$unit" 2>/dev/null && echo "stopped ${unit}"
+  done
+  exit 0
+
+# Copies one seed source into a runner home that does not have it yet. Read
+# as root, written as the runner user: the home is job-writable, so a job can
+# plant a symlink on the way to the destination, and as the runner user the
+# most that link can make the copy reach is what the job could write itself.
+# Arguments: <source> <destination> <user> <home>
+_runner_host_seed_script: |
+  set -euo pipefail
+  src="$1" dest="$2" user="$3" home="$4"
+  as_user() {
+    setpriv --reuid="$user" --regid="$user" --init-groups -- \
+      env -i HOME="$home" PATH=/usr/bin:/bin LC_ALL=C "$@"
+  }
+  as_user mkdir -p -- "$(dirname -- "$dest")"
+  if [[ -d "$src" ]]; then
+    as_user mkdir -- "$dest"
+    tar -C "$src" -cf - . | as_user tar -C "$dest" --no-same-owner -xpf -
+  else
+    mode=$(stat -c %a -- "$src")
+    # shellcheck disable=SC2016 # the inner sh expands its own arguments
+    as_user sh -c 'umask 077; cat > "$1" && chmod "$2" "$1"' seed "$dest" "$mode" < "$src"
+  fi

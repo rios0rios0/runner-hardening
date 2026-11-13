@@ -1,0 +1,184 @@
+---
+# needrestart's interactive service-restart prompt would hang an unattended
+# run, and it must not restart services under a running job either.
+
+# First, as the installer did: fetching the keys below needs a CA bundle.
+- name: 'Install the base packages'
+  ansible.builtin.apt:
+    name: "{{ _runner_host_base_packages }}"
+    state: 'present'
+    update_cache: true
+    cache_valid_time: 3600
+  environment:
+    NEEDRESTART_MODE: 'a'
+    NEEDRESTART_SUSPEND: '1'
+
+- name: 'Look for the rootless Docker extras'
+  ansible.builtin.stat:
+    path: "{{ _runner_host_rootless_tool }}"
+  register: '_runner_host_rootless_tool_stat'
+
+- name: 'Create the apt keyring directory'
+  ansible.builtin.file:
+    path: '/etc/apt/keyrings'
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+# Docker already installed (by an earlier run, or by hand) keeps the source it
+# came from: a second definition of the same repository with another key is a
+# hard apt error.
+- name: 'List the apt sources this role writes'
+  ansible.builtin.set_fact:
+    _runner_host_apt_sources: >-
+      {{ ([] if _runner_host_rootless_tool_stat.stat.exists else
+          [{'name': 'docker', 'key_url': _runner_host_docker_key_url,
+            'repo': 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] ' ~ _runner_host_docker_repo_url
+                    ~ ' ' ~ ansible_facts['distribution_release'] ~ ' stable'}])
+         + runner_extra_apt_repositories }}
+
+- name: 'Fetch the apt signing keys'
+  ansible.builtin.get_url:
+    url: "{{ _runner_host_apt_source.key_url }}"
+    dest: "/etc/apt/keyrings/{{ _runner_host_apt_source.name }}.asc"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  loop: "{{ _runner_host_apt_sources }}"
+  loop_control:
+    loop_var: '_runner_host_apt_source'
+    label: "{{ _runner_host_apt_source.name }}"
+
+# signed-by reads a key by its extension, and every key here is stored as
+# .asc: a binary (dearmored) key under that name is ignored by apt, which then
+# rejects the whole source as unsigned. Most vendors (Microsoft, pkgs.k8s.io)
+# serve armored keys; a source that serves a binary one is caught here.
+- name: 'Read the apt signing keys back'
+  ansible.builtin.slurp:
+    src: "/etc/apt/keyrings/{{ _runner_host_apt_source.name }}.asc"
+  loop: "{{ _runner_host_apt_sources }}"
+  loop_control:
+    loop_var: '_runner_host_apt_source'
+    label: "{{ _runner_host_apt_source.name }}"
+  register: '_runner_host_apt_keys'
+  failed_when: false
+
+# Outside check mode every key is on disk by now; a dry run fetched none.
+- name: 'Check that every apt signing key is ASCII-armored'
+  ansible.builtin.assert:
+    that: "(_runner_host_apt_key.content | b64decode) is search('BEGIN PGP PUBLIC KEY BLOCK')"
+    fail_msg: >-
+      {{ _runner_host_apt_key._runner_host_apt_source.key_url }} does not serve an ASCII-armored
+      key, which /etc/apt/keyrings/{{ _runner_host_apt_key._runner_host_apt_source.name }}.asc must hold.
+      Point key_url at the armored (.asc) form of the key.
+    quiet: true
+  loop: "{{ _runner_host_apt_keys.results }}"
+  loop_control:
+    loop_var: '_runner_host_apt_key'
+    label: "{{ _runner_host_apt_key._runner_host_apt_source.name }}"
+  when: "not ansible_check_mode or _runner_host_apt_key.content is defined"
+
+- name: 'Write the apt sources'
+  ansible.builtin.template:
+    src: 'apt-source.list.j2'
+    dest: "/etc/apt/sources.list.d/{{ _runner_host_apt_source.name }}.list"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  loop: "{{ _runner_host_apt_sources }}"
+  loop_control:
+    loop_var: '_runner_host_apt_source'
+    label: "{{ _runner_host_apt_source.name }}"
+  register: '_runner_host_apt_written'
+
+# A package list only an hour old can still predate a source written just now.
+- name: 'Refresh the package lists for the new sources'
+  ansible.builtin.apt:
+    update_cache: true
+  when: "_runner_host_apt_written.results | selectattr('changed') | list | length > 0"
+
+# After the sources: an extra package may come from one of them. A dry run
+# adds no source, so a package only a new source carries cannot be resolved.
+- name: 'Install Docker CE, the rootless extras and the extra packages'
+  ansible.builtin.apt:
+    name: "{{ _runner_host_docker_packages + runner_extra_packages }}"
+    state: 'present'
+  environment:
+    NEEDRESTART_MODE: 'a'
+    NEEDRESTART_SUSPEND: '1'
+  when: "not (ansible_check_mode and _runner_host_apt_written.results | selectattr('changed') | list | length > 0)"
+
+- name: 'Say why the dry run skips the packages of new sources'
+  ansible.builtin.debug:
+    msg: 'Check mode: the packages that come from a source this run adds are not resolved until that source exists.'
+  when: "ansible_check_mode and _runner_host_apt_written.results | selectattr('changed') | list | length > 0"
+
+# Only the rootless daemon is wanted. containerd too: the installer's wipe
+# disabled it on every run, and a one-time wipe runs before Docker is even
+# installed on a fresh box, so this is where it stays off.
+- name: 'Keep the rootful Docker daemon off'
+  ansible.builtin.systemd_service:
+    name: "{{ _runner_host_rootful_unit }}"
+    enabled: false
+    state: 'stopped'
+  # The socket first: stopped second, it could start the daemon again. A dry
+  # run of a first converge installs no Docker, so it only checks units there.
+  loop: >-
+    {{ (['docker.socket', 'docker.service'] + (['containerd.service'] if runner_dismantle_rootful_docker | bool else []))
+       | select('in', _present if ansible_check_mode else ['docker.socket', 'docker.service', 'containerd.service']) | list }}
+  loop_control:
+    loop_var: '_runner_host_rootful_unit'
+  vars:
+    _present: >-
+      {{ (ansible_facts['services'] | default({}) | list)
+         + (['docker.socket'] if 'docker.service' in (ansible_facts['services'] | default({})) else []) }}
+
+# Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor, which breaks
+# rootlesskit. Relaxing it is a genuine (small) reduction in 24.04's default
+# posture; the alternative is a per-binary AppArmor profile.
+- name: 'Look for the AppArmor user-namespace restriction'
+  ansible.builtin.stat:
+    path: '/proc/sys/kernel/apparmor_restrict_unprivileged_userns'
+  register: '_runner_host_userns_knob'
+
+- name: 'List the kernel settings rootless Docker needs'
+  ansible.builtin.set_fact:
+    _runner_host_sysctl_wanted: >-
+      {{ {'net.ipv4.ip_unprivileged_port_start': '80'}
+         | combine({'kernel.apparmor_restrict_unprivileged_userns': '0'} if _runner_host_userns_knob.stat.exists else {}) }}
+
+- name: 'Write the kernel settings rootless Docker needs'
+  ansible.builtin.template:
+    src: 'sysctl-rootless.conf.j2'
+    dest: "/etc/sysctl.d/99-{{ runner_sbin_prefix }}-rootless.conf"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+
+- name: 'Read the live kernel settings'
+  ansible.builtin.slurp:
+    src: "/proc/sys/{{ _runner_host_sysctl.key | replace('.', '/') }}"
+  loop: "{{ _runner_host_sysctl_wanted | dict2items }}"
+  loop_control:
+    loop_var: '_runner_host_sysctl'
+    label: "{{ _runner_host_sysctl.key }}"
+  register: '_runner_host_sysctl_live'
+
+# Compared with what the kernel runs rather than with the file, so a value
+# something else reset is put back too.
+- name: 'Apply the kernel settings'
+  ansible.builtin.command:
+    argv: ['sysctl', '-q', '-p', "/etc/sysctl.d/99-{{ runner_sbin_prefix }}-rootless.conf"]
+  register: '_runner_host_sysctl_apply'
+  changed_when: "_runner_host_sysctl_apply.rc == 0"
+  when: >-
+    (_runner_host_sysctl_live.results | map(attribute='content') | map('b64decode') | map('trim') | list)
+    != (_runner_host_sysctl_live.results | map(attribute='_runner_host_sysctl.value') | map('string') | list)
+
+- name: 'Warn that the AppArmor user-namespace restriction was relaxed'
+  ansible.builtin.debug:
+    msg: 'WARNING: relaxed kernel.apparmor_restrict_unprivileged_userns, which rootlesskit requires.'
+  when:
+    - "_runner_host_userns_knob.stat.exists"
+    - "_runner_host_sysctl_apply is not skipped"

@@ -1,0 +1,26 @@
+---
+# Azure Pipelines agent hosts: the variables of the runner_azure_devops role.
+
+runner_azp_url: 'https://dev.azure.com/your-org'
+runner_azp_pool: 'your-pool'
+# A new agent's name; n is its instance number. Keep it unique across hosts:
+# registration runs with --replace, which takes over a same-named agent.
+# runner_azp_agent_name: "{{ ansible_facts['hostname'] }}-{{ n }}"
+# runner_azp_version: 'latest'       # or a pinned release such as '4.264.2', which
+#                                    # needs no API call; fresh installs only
+
+# A PAT with the Agent Pools (Read & manage) scope. Only registering a new agent
+# or removing one needs it, and it is never stored on the box: the role writes
+# it to a root-only file, deleted straight after, for config.sh to read as root
+# in a pristine unpack no job can write. Adopted agents and re-deploys need
+# none, so leave it unset:
+#   read -rs RUNNER_AZP_PAT && export RUNNER_AZP_PAT
+runner_azp_pat: "{{ lookup('ansible.builtin.env', 'RUNNER_AZP_PAT', default=undef()) }}"
+# Or from 1Password, with community.general and a signed-in `op` CLI:
+# runner_azp_pat: "{{ lookup('community.general.onepassword', 'your-item', field='credential', vault='your-vault') }}"
+
+# Agents that are already registered, adopted instead of registered again: see
+# host_vars/agent-02.yaml.
+# runner_azp_adopt: {}
+# runner_azp_adopt_keep_work: false
+# runner_azp_adopt_home: ''

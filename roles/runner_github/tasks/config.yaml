@@ -1,0 +1,16 @@
+---
+# /etc/github-runner/env: the stored answers, which gha-jitconfig, gha-jitreap
+# and the vendor hooks source. Written after prepare because GHA_COUNT is the
+# count prepare resolved, as save_config stored it after the wizard resolved
+# `auto`. Not secret -- the PAT lives in its own file -- so --diff may show it.
+#
+# A change restarts the idle runners: one that registered under the old labels
+# or group keeps them until it takes a job, and may never be offered one.
+- name: 'Store the answers the runtime reads'
+  ansible.builtin.template:
+    src: 'env.j2'
+    dest: "{{ _runner_github_env_file }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0600'
+  notify: 'Restart idle runners'

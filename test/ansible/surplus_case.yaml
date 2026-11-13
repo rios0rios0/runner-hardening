@@ -1,0 +1,16 @@
+---
+- name: "Work out the surplus: {{ surplus_case.name }}"
+  ansible.builtin.include_tasks: "{{ runner_host_tasks }}/surplus.yaml"
+  vars:
+    _runner_host_found_units: "{{ surplus_case.units | default([]) }}"
+    _runner_host_found_dropins: "{{ surplus_case.dropins | default([]) }}"
+    _runner_host_found_trees: "{{ surplus_case.trees | default([]) }}"
+    runner_unit: "{{ surplus_case.unit }}"
+    runner_count_resolved: "{{ surplus_case.count }}"
+
+- name: "Compare it with the installer: {{ surplus_case.name }}"
+  ansible.builtin.set_fact:
+    test_results: "{{ test_results + [('  ok  ' if _passed else 'FAIL  ') ~ surplus_case.name ~ ('' if _passed else ': ' ~ _why)] }}"
+  vars:
+    _passed: "{{ runner_surplus_instances == surplus_case.surplus }}"
+    _why: "expected {{ surplus_case.surplus }}, got {{ runner_surplus_instances }} of {{ _runner_host_existing_instances }}"

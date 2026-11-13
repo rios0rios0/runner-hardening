@@ -1,0 +1,13 @@
+---
+- name: "Pick out the legacy services: {{ legacy_case.name }}"
+  ansible.builtin.include_tasks: "{{ runner_host_tasks }}/legacy_units.yaml"
+  vars:
+    _runner_host_found_units: "{{ legacy_units }}"
+    runner_legacy_unit_globs: "{{ legacy_case.globs }}"
+
+- name: "Compare it with systemctl: {{ legacy_case.name }}"
+  ansible.builtin.set_fact:
+    test_results: "{{ test_results + [('  ok  ' if _passed else 'FAIL  ') ~ legacy_case.name ~ ('' if _passed else ': ' ~ _why)] }}"
+  vars:
+    _passed: "{{ _runner_host_legacy_units == legacy_case.legacy }}"
+    _why: "expected {{ legacy_case.legacy }}, got {{ _runner_host_legacy_units }}"

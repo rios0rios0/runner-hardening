@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added `runner_extra_packages`, `runner_extra_apt_repositories` and `runner_extra_binaries`, so the tools a project expects its jobs to find are installed system-wide and root-owned, from a signed apt repository or a release download checked against its SHA-256, instead of by hand into a home every job can write'
+time: '2026-11-13T02:30:18.9538221Z'

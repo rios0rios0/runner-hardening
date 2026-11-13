@@ -1,0 +1,9 @@
+# {{ _runner_host_managed }}
+# Rootless Docker needs these. Ubuntu 24.04 blocks unprivileged user namespaces
+# via AppArmor, which breaks rootlesskit: relaxing it is a genuine (small)
+# reduction in 24.04's default posture, made deliberately; the alternative is a
+# per-binary AppArmor profile. The port floor lets a rootless daemon publish
+# ports from 80 up.
+{% for key, value in _runner_host_sysctl_wanted | dictsort %}
+{{ key }}={{ value }}
+{% endfor %}

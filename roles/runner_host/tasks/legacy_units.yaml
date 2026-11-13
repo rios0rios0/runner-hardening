@@ -1,0 +1,13 @@
+---
+# Pure: set_fact only, no host access (test/ansible/policy.yaml drives it).
+# Inputs: _runner_host_found_units (unit names) and runner_legacy_unit_globs.
+# The same glob systemctl applies, as a regex: actions.runner.* becomes
+# ^(actions\.runner\..*)$, so a dot matches only a dot.
+- name: 'List the legacy runner services'
+  ansible.builtin.set_fact:
+    _runner_host_legacy_units: >-
+      {{ _runner_host_found_units | select('match', '^(' ~ (_globs | join('|')) ~ ')$') | sort }}
+  vars:
+    _globs: >-
+      {{ runner_legacy_unit_globs | map('regex_escape') | map('replace', '\*', '.*') | map('replace', '\?', '.')
+         | list | default(['(?!)'], true) }}

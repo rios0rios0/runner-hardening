@@ -1,0 +1,43 @@
+---
+# The repository root IS the collection. In development it resolves through
+# the symlink `make collection` creates under build/collections, so playbooks
+# and roles always refer to each other by their fully qualified names, exactly
+# as a consumer that installed the collection from git does.
+namespace: 'rios0rios0'
+name: 'runner_hardening'
+# Bumped together with CHANGELOG.md in every bump/x.y.z pull request.
+version: '0.2.0'
+readme: 'README.md'
+authors:
+  - 'rios0rios0'
+description: >-
+  Hardened, ephemeral, rootless self-hosted CI runners on Ubuntu: GitHub
+  Actions runners and Azure Pipelines agents.
+license:
+  - 'MIT'
+# ansible-lint's galaxy[tags] requires one of Galaxy's category tags.
+tags:
+  - 'infrastructure'
+  - 'security'
+  - 'linux'
+  - 'ci'
+  - 'github'
+  - 'azure'
+  - 'runner'
+  - 'systemd'
+dependencies: {}
+repository: 'https://github.com/rios0rios0/runner-hardening'
+issues: 'https://github.com/rios0rios0/runner-hardening/issues'
+build_ignore:
+  # The private fleet definitions: a built collection must never ship host lists.
+  - 'fleet.conf'
+  - 'inventory/local'
+  - '.ansible'
+  - '.git'
+  - '.github'
+  - '.changes'
+  - '.fleet-logs'
+  - 'build'
+  - 'reports'
+  - 'test'
+  - '*.tar.gz'

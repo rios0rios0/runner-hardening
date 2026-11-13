@@ -1,0 +1,20 @@
+---
+- name: "Work out the policy: {{ policy_case.name }}"
+  ansible.builtin.include_tasks: "{{ runner_host_tasks }}/policy.yaml"
+  vars:
+    runner_count_resolved: "{{ policy_case.count }}"
+    runner_mem_mb: "{{ policy_case.mem }}"
+    runner_heavy_runners: "{{ policy_case.heavy | default(none) }}"
+    runner_codeql_ram: "{{ policy_case.codeql | default(none) }}"
+    runner_slice_ceiling: "{{ policy_case.slice | default(none) }}"
+
+- name: "Compare it with the installer: {{ policy_case.name }}"
+  ansible.builtin.set_fact:
+    test_results: "{{ test_results + [('  ok  ' if _passed else 'FAIL  ') ~ policy_case.name ~ ('' if _passed else ': ' ~ _why)] }}"
+  vars:
+    _expected: "{{ [policy_case.fair, policy_case.ceiling, policy_case.aggregate, policy_case.sysmin, policy_case.codeql_ram, policy_case.ceilings] }}"
+    _got: >-
+      {{ [runner_rp_fair | int, runner_rp_ceiling | int, runner_rp_aggregate | int, runner_rp_sysmin | int,
+          runner_rp_codeql | string, runner_rp_ceilings | map('int') | list] }}
+    _passed: "{{ _got == _expected }}"
+    _why: "expected [fair, ceiling, aggregate, sysmin, codeql, ceilings] = {{ _expected }}, got {{ _got }}"

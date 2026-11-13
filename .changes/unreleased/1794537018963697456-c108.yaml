@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'changed the reboot guard to judge whether a runner is busy from its own worker process instead of the GitHub API, so it needs no PAT and serves Azure Pipelines agents too; its journal tag is now `<prefix>-reboot-if-idle`'
+time: '2026-11-13T02:30:18.963642176Z'

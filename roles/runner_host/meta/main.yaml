@@ -1,0 +1,26 @@
+---
+galaxy_info:
+  role_name: 'runner_host'
+  namespace: 'rios0rios0'
+  author: 'rios0rios0'
+  description: >-
+    The vendor-neutral half of a hardened, ephemeral, rootless CI runner host:
+    per-runner users with rootless Docker, the hardened unit, the memory
+    policy and the housekeeping timers. Driven by runner_github or
+    runner_azure_devops.
+  license: 'MIT'
+  min_ansible_version: '2.16'
+  platforms:
+    - name: 'Ubuntu'
+      versions:
+        - 'jammy'
+        - 'noble'
+        - 'resolute'
+  galaxy_tags:
+    - 'ci'
+    - 'runner'
+    - 'systemd'
+    - 'hardening'
+    - 'docker'
+
+dependencies: []

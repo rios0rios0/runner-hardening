@@ -1,0 +1,36 @@
+---
+# Entry point 3 of 3. A converge that lowered the count leaves the instances
+# above it running until here: the next boot would start them again, each
+# minting a fresh registration on a box no longer sized for it, and their
+# users, homes and tool caches would keep their disk. Each is drained - its
+# job finished, not killed - and then removed completely. The vendor role has
+# already de-registered what it must before including this.
+
+- name: 'Retire the runners above the count'
+  when: "runner_surplus_instances | default([]) | length > 0"
+  block:
+    - name: 'Refuse to retire runners on a host that is not dedicated'
+      ansible.builtin.assert:
+        that: "runner_host_dedicated | bool"
+        fail_msg: 'runner_host_dedicated must be true before runners are removed.'
+        quiet: true
+
+    - name: 'Let the retiring runners finish their jobs, then stop them'
+      ansible.builtin.command:
+        argv: "{{ ['/usr/local/sbin/' ~ runner_sbin_prefix ~ '-admin', 'drain'] + (runner_surplus_instances | map('string') | list) }}"
+      register: '_runner_host_retire_drain'
+      changed_when: "_runner_host_retire_drain.stdout is search('(?m)runner [0-9]+ drained$')"
+
+    - name: 'Show the drain'
+      ansible.builtin.debug:
+        msg: "{{ (_runner_host_retire_drain.stdout_lines | default([])) + (_runner_host_retire_drain.stderr_lines | default([])) }}"
+
+    - name: 'Remove each retired runner'
+      ansible.builtin.include_tasks: 'retire_instance.yaml'
+      loop: "{{ runner_surplus_instances }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+
+    - name: 'Make systemd forget the retired runners'
+      ansible.builtin.systemd_service:
+        daemon_reload: true

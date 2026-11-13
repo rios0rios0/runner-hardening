@@ -1,0 +1,70 @@
+---
+# Reboots only in the 02:00-05:00 window, and only when no runner on the host
+# is executing a job: a missed reboot is cheap, a killed job is a flaky build
+# somebody has to chase. Turned off, the timer goes too, so nothing reboots
+# the box behind the operator's back.
+
+- name: 'Install the reboot guard'
+  when: "runner_reboot_guard | bool"
+  block:
+    - name: 'Install the reboot script'
+      ansible.builtin.copy:
+        src: 'runner-reboot-if-idle.sh'
+        dest: "/usr/local/sbin/{{ runner_sbin_prefix }}-reboot-if-idle"
+        owner: 'root'
+        group: 'root'
+        mode: '0700'
+        validate: '/bin/bash -n %s'
+
+    # Absent before the first converge, which in check mode is never written.
+    - name: 'Look for the reboot timer'
+      ansible.builtin.stat:
+        path: "{{ _runner_host_systemd_dir }}/{{ runner_sbin_prefix }}-reboot.timer"
+      register: '_runner_host_reboot_timer_file'
+
+    - name: 'Write the reboot service and timer'
+      ansible.builtin.template:
+        src: "reboot.{{ _runner_host_reboot_unit }}.j2"
+        dest: "{{ _runner_host_systemd_dir }}/{{ runner_sbin_prefix }}-reboot.{{ _runner_host_reboot_unit }}"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      loop: ['service', 'timer']
+      loop_control:
+        loop_var: '_runner_host_reboot_unit'
+      register: '_runner_host_reboot_units'
+
+    - name: 'Enable the reboot timer'
+      ansible.builtin.systemd_service:
+        name: "{{ runner_sbin_prefix }}-reboot.timer"
+        enabled: true
+        state: 'started'
+        daemon_reload: "{{ _runner_host_reboot_units.results | selectattr('changed') | list | length > 0 }}"
+      when: "not ansible_check_mode or _runner_host_reboot_timer_file.stat.exists"
+
+- name: 'Remove the reboot guard'
+  when: "not (runner_reboot_guard | bool)"
+  block:
+    - name: 'Read the reboot timer'
+      ansible.builtin.systemd_service:
+        name: "{{ runner_sbin_prefix }}-reboot.timer"
+      register: '_runner_host_reboot_timer'
+
+    - name: 'Stop the reboot timer'
+      ansible.builtin.systemd_service:
+        name: "{{ runner_sbin_prefix }}-reboot.timer"
+        enabled: false
+        state: 'stopped'
+      when: "_runner_host_reboot_timer.status.LoadState | default('not-found') != 'not-found'"
+
+    - name: 'Remove the reboot guard files'
+      ansible.builtin.file:
+        path: "{{ _runner_host_reboot_file }}"
+        state: 'absent'
+      loop:
+        - "{{ _runner_host_systemd_dir }}/{{ runner_sbin_prefix }}-reboot.timer"
+        - "{{ _runner_host_systemd_dir }}/{{ runner_sbin_prefix }}-reboot.service"
+        - "/usr/local/sbin/{{ runner_sbin_prefix }}-reboot-if-idle"
+      loop_control:
+        loop_var: '_runner_host_reboot_file'
+      notify: 'Reload systemd'

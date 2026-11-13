@@ -1,0 +1,37 @@
+---
+# What the runners register to. Each of these was a question in the
+# installer's wizard; the README's variable table maps the GHA_* names here.
+# The rest of the answers (count, trust, heavy runners, memory) belong to
+# runner_host and keep its runner_ prefix.
+
+# org registers at the organisation, which is what makes runner groups usable;
+# repo registers at a single repository.
+runner_github_scope: 'org'
+
+# Required: the organisation login, or the repository owner when scope is repo.
+runner_github_org: ''
+
+# Required only when scope is repo: the repository name, without the owner.
+runner_github_repo: ''
+
+# The runner group id; 1 is Default. Put trusted and untrusted fleets in
+# different groups, and restrict each group to the repositories allowed to use
+# it.
+runner_github_group_id: 1
+
+# Comma-separated, no spaces. Runners 1..runner_heavy_runners also register
+# with the label heavy, added at registration time.
+runner_github_labels: 'self-hosted,linux,x64,internal'
+
+# latest, or a pinned actions/runner release such as 2.338.2. A tree is
+# replaced only when the release it holds differs.
+runner_github_version: 'latest'
+
+# Check runner_github_pat against the GitHub API before it is stored. CI sets
+# false, because its dummy PAT cannot pass.
+runner_github_validate_pat: true
+
+# runner_github_pat is deliberately left undefined: it comes from a vault or
+# the environment. Undefined or empty both mean "not given", and the host then
+# keeps the PAT it already stores at /etc/github-runner/pat, which is what
+# `fleet.sh --no-pat install` did. A host with none stored fails clearly.

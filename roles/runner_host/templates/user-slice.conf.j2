@@ -1,0 +1,18 @@
+{#
+  The runner process lives in the runner slice; containers live in
+  user.slice/user-<uid>.slice, because they are children of the rootless
+  daemon, not of the runner unit. Two separate cgroup trees, so the ceilings
+  do NOT stack into one another - each path is capped independently at the
+  same per-runner budget. A given job is almost always one or the other: a
+  container: job spends its memory here, a bare-steps job in the unit, so
+  capping both at the full budget gives each job its whole allowance whichever
+  path it takes.
+#}
+# {{ _runner_host_managed }}
+[Slice]
+# Containers started by rootless Docker land here rather than in the unit.
+CPUWeight=100
+IOWeight=100
+MemoryLow={{ runner_rp_fair }}M
+MemoryMax={{ runner_rp_ceilings[(_runner_host_n | int) - 1] }}M
+TasksMax=8192

@@ -1,0 +1,9 @@
+# {{ _runner_host_managed }}
+[Unit]
+Description=Run the {{ _runner_host_flavor_noun[runner_flavor] }} janitor daily
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target

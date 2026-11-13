@@ -1,0 +1,46 @@
+---
+# Pure: set_fact only, no host access (test/ansible/policy.yaml drives it).
+# Inputs: _runner_host_current_limits, a list of {n, text}, one per drop-in a
+# runner runs under now (its unit's 10-instance.conf and its user slice's
+# limits); _runner_host_current_slice, the runners' slice as it is now ('' when
+# there is none); runner_instances, runner_rp_fair, runner_rp_ceilings and
+# runner_rp_aggregate.
+#
+# A daemon-reload applies a lower MemoryMax or MemoryLow to a running unit at
+# once: a busy job is reclaimed below what it holds, or OOM-killed, on the spot.
+# Those runners are drained before anything is written. A lower cap on the
+# slice reaches every runner it holds, the ones above the count included.
+
+- name: 'Read the memory limits the runners run under now'
+  ansible.builtin.set_fact:
+    _runner_host_limits_now: >-
+      {%- macro mb(text, key) -%}
+      {%- set raw = text | regex_findall('(?m)^' ~ key ~ '=(\S+)\s*$') | last | default('') -%}
+      {%- if raw == 'infinity' -%}1000000000000
+      {%- elif raw is match('^[0-9]+[KMGT]?$') -%}
+      {{- ((raw | regex_replace('[KMGT]$', '') | int)
+           * {'': 1, 'K': 1024, 'M': 1048576, 'G': 1073741824, 'T': 1099511627776}[raw | regex_replace('^[0-9]+', '')])
+          // 1048576 -}}
+      {%- else -%}-1{%- endif -%}
+      {%- endmacro -%}
+      {%- set out = [] -%}
+      {%- for file in _runner_host_current_limits -%}
+      {%- set _ = out.append({'n': file.n | int, 'max': mb(file.text, 'MemoryMax') | int, 'low': mb(file.text, 'MemoryLow') | int}) -%}
+      {%- endfor -%}
+      {{ {'slice': mb(_runner_host_current_slice, 'MemoryMax') | int, 'runners': out} }}
+
+# -1 is a limit not set, which nothing can lower.
+- name: 'Work out which runners are about to get less memory'
+  ansible.builtin.set_fact:
+    _runner_host_lowered_instances: >-
+      {%- set out = [] -%}
+      {%- set slice_lowered = _runner_host_limits_now.slice >= 0 and (runner_rp_aggregate | int) < _runner_host_limits_now.slice -%}
+      {%- for now in _runner_host_limits_now.runners -%}
+      {%- set kept = now.n in runner_instances -%}
+      {%- if slice_lowered
+            or (kept and now.max >= 0 and (runner_rp_ceilings[now.n - 1] | int) < now.max)
+            or (kept and now.low >= 0 and (runner_rp_fair | int) < now.low) -%}
+      {%- set _ = out.append(now.n) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out | unique | sort }}

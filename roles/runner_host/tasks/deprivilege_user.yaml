@@ -1,0 +1,137 @@
+---
+# One old account. Last line of defence: locking the admin account removes
+# your way back in, so a protected account is skipped unless forced, and the
+# account driving this play is refused outright.
+
+- name: "Report an old account that does not exist: {{ _runner_host_old_user }}"
+  ansible.builtin.debug:
+    msg: "{{ _runner_host_old_user }} does not exist; nothing to de-privilege."
+  when: "_runner_host_old_user not in ansible_facts['getent_passwd']"
+
+- name: "De-privilege {{ _runner_host_old_user }}"
+  when: "_runner_host_old_user in ansible_facts['getent_passwd']"
+  vars:
+    _runner_host_protected: "{{ _runner_host_old_user in _runner_host_protected_users }}"
+    # The same list the wipe and the summary read (discover.yaml).
+    _runner_host_proceed: "{{ _runner_host_old_user in _runner_host_deprivileged_users }}"
+  block:
+    - name: 'Refuse outright to lock the account running this play'
+      ansible.builtin.fail:
+        msg: >-
+          REFUSING to de-privilege '{{ _runner_host_old_user }}': it is the
+          account running this play. Locking it would cut off your access.
+      when: "_runner_host_old_user in _runner_host_invokers"
+
+    - name: 'Explain why a protected account is left alone'
+      ansible.builtin.debug:
+        msg:
+          - "REFUSING to de-privilege '{{ _runner_host_old_user }}'."
+          - '  It is the admin account for this box (uid 1000, sudo NOPASSWD,'
+          - '  owner of an authorized_keys file, or an active login session).'
+          - '  Locking it would cut off your access.'
+          - "Skipping. If '{{ _runner_host_old_user }}' really is the runner account, set"
+          - '  runner_force_deprivilege: true and make sure root SSH still works first.'
+      when: "not (_runner_host_proceed | bool)"
+
+    - name: 'Warn that a protected account is de-privileged on request'
+      ansible.builtin.debug:
+        msg: "WARNING: runner_force_deprivilege is set - de-privileging the protected account {{ _runner_host_old_user }} against advice."
+      when:
+        - "_runner_host_protected | bool"
+        - "_runner_host_proceed | bool"
+
+    - name: 'Strip the account of its privileges'
+      when: "_runner_host_proceed | bool"
+      block:
+        - name: 'Remove the account from the privileged groups'
+          ansible.builtin.command:
+            argv: ['gpasswd', '-d', "{{ _runner_host_old_user }}", "{{ _runner_host_group }}"]
+          loop: "{{ _runner_host_privileged_groups }}"
+          loop_control:
+            loop_var: '_runner_host_group'
+          register: '_runner_host_gpasswd'
+          changed_when: "_runner_host_gpasswd.rc == 0"
+          when: >-
+            _runner_host_old_user in (ansible_facts['getent_group'].get(_runner_host_group, ['', '', ''])[2]
+            | default('', true) | split(','))
+
+        - name: 'Find the sudoers drop-ins that name the account'
+          ansible.builtin.command:
+            argv: ['grep', '-rIlwF', '--', "{{ _runner_host_old_user }}", '/etc/sudoers.d/']
+          register: '_runner_host_sudoers_hits'
+          changed_when: false
+          failed_when: "_runner_host_sudoers_hits.rc > 1"
+          check_mode: false
+
+        # Moving a drop-in disables every rule in it. One that also grants the
+        # admin account would lock that account out of sudo, so it stays and
+        # the operator edits it instead.
+        - name: 'Find which of them also grant a protected account'
+          ansible.builtin.command:
+            argv: "{{ ['grep', '-lwF'] + (['-e'] | product(_others) | flatten) + ['--'] + _runner_host_sudoers_hits.stdout_lines }}"
+          register: '_runner_host_sudoers_shared'
+          changed_when: false
+          failed_when: "_runner_host_sudoers_shared.rc > 1"
+          check_mode: false
+          when:
+            - "_runner_host_sudoers_hits.stdout_lines | length > 0"
+            - "_others | length > 0"
+          vars:
+            _others: "{{ _runner_host_protected_users | reject('equalto', _runner_host_old_user) | list }}"
+
+        - name: 'Move the drop-ins that grant only this account out of sudoers.d'
+          ansible.builtin.command:
+            argv:
+              - '/bin/bash'
+              - '-c'
+              - 'mv -- "$1" "$2" && chmod 0400 "$2"'
+              - 'disable-sudoers'
+              - "{{ _runner_host_sudoers_file }}"
+              - "{{ _runner_host_state_dir }}/{{ _runner_host_sudoers_file | basename }}.disabled-{{ now(fmt='%Y%m%d%H%M%S') }}"
+            removes: "{{ _runner_host_sudoers_file }}"
+          loop: "{{ _runner_host_sudoers_hits.stdout_lines | difference(_runner_host_sudoers_shared.stdout_lines | default([])) }}"
+          loop_control:
+            loop_var: '_runner_host_sudoers_file'
+
+        - name: 'Warn about the drop-ins shared with a protected account'
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: {{ _runner_host_sudoers_shared.stdout_lines | join(', ') }} also grants a protected
+              account, so it was left in place. Remove the rule for {{ _runner_host_old_user }} with visudo -f.
+          when: "_runner_host_sudoers_shared.stdout_lines | default([]) | length > 0"
+
+        - name: 'Look for an inline rule in /etc/sudoers'
+          ansible.builtin.command:
+            argv: ['grep', '-qE', "^[[:space:]]*{{ _runner_host_old_user }}[[:space:]]", '/etc/sudoers']
+          register: '_runner_host_sudoers_inline'
+          changed_when: false
+          failed_when: "_runner_host_sudoers_inline.rc > 1"
+          check_mode: false
+
+        - name: 'Warn about the inline rule in /etc/sudoers'
+          ansible.builtin.debug:
+            msg: "WARNING: {{ _runner_host_old_user }} has an inline rule in /etc/sudoers - remove it with visudo."
+          when: "_runner_host_sudoers_inline.rc == 0"
+
+        - name: 'Lock the account and take its login shell'
+          ansible.builtin.user:
+            name: "{{ _runner_host_old_user }}"
+            password_lock: true
+            shell: '/usr/sbin/nologin'
+
+        - name: 'Remove the account crontab'
+          ansible.builtin.command:
+            argv: ['crontab', '-u', "{{ _runner_host_old_user }}", '-r']
+            removes: "/var/spool/cron/crontabs/{{ _runner_host_old_user }}"
+
+        - name: 'Stop the account lingering'
+          ansible.builtin.command:
+            argv: ['loginctl', 'disable-linger', "{{ _runner_host_old_user }}"]
+            removes: "/var/lib/systemd/linger/{{ _runner_host_old_user }}"
+
+        - name: 'Kill the account processes'
+          ansible.builtin.command:
+            argv: ['pkill', '-KILL', '-u', "{{ _runner_host_old_user }}"]
+          register: '_runner_host_pkill'
+          changed_when: "_runner_host_pkill.rc == 0"
+          failed_when: "_runner_host_pkill.rc > 1"

@@ -1,8 +1,14 @@
 # The fleet definition names your hosts. Only the example is tracked.
 fleet.conf
 
+# Real inventories name your hosts. Only inventory/example is tracked.
+inventory/local/
+
 # Per-host run logs written by fleet.sh
 .fleet-logs/
+
+# ansible-lint and ansible-core caches
+.ansible/
 
 # SAST and quality reports
 build/

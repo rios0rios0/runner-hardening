@@ -1,0 +1,3 @@
+kind: 'Security'
+body: 'moved the per-job wrapper out of the runner tree a job can write into a root-owned `/usr/local/libexec/runner-hardening`, so a job can no longer rewrite the wrapper the next job runs, and made every trust value other than exactly `internal` get the full reset between jobs'
+time: '2026-11-13T02:30:18.960293976Z'

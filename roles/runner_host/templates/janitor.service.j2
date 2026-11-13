@@ -1,0 +1,6 @@
+# {{ _runner_host_managed }}
+[Unit]
+Description={{ _runner_host_flavor_noun[runner_flavor] }} disk and health janitor
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/{{ runner_sbin_prefix }}-janitor

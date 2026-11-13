@@ -1,0 +1,39 @@
+---
+# The machines this collection converges, grouped by the CI they serve.
+#
+# Copy this directory to inventory/local/ and edit it there. ansible.cfg reads
+# that one by default, and .gitignore keeps it out of git, because a real
+# inventory names your hosts.
+#
+# Every host belongs to runner_hosts through exactly one of its two children,
+# and each vendor playbook targets its own: playbooks/github.yaml converges
+# github_runners, playbooks/azure_devops.yaml converges azure_devops_agents. The
+# vendor-neutral playbooks (verify, diagnose, drain, uninstall) take every
+# runner host.
+runner_hosts:
+  children:
+    github_runners:
+      hosts:
+        build-01:
+          ansible_host: '10.0.0.11'
+        # Fewer runners, and a lifted memory ceiling: host_vars/build-02.yaml.
+        build-02:
+          ansible_host: '10.0.0.12'
+        # Another SSH port and an old runner account: host_vars/build-03.yaml.
+        build-03:
+          ansible_host: '192.0.2.13'
+        # Runs fork pull requests: host_vars/public-01.yaml.
+        public-01:
+          ansible_host: '10.0.0.21'
+        # Out of rotation for now. Comment a host out rather than delete it, or
+        # keep it and skip it per run with --limit '!build-04'.
+        # build-04:
+        #   ansible_host: '10.0.0.14'
+    azure_devops_agents:
+      hosts:
+        agent-01:
+          ansible_host: '10.0.0.31'
+        # Already runs a registered agent, adopted rather than registered
+        # again: host_vars/agent-02.yaml.
+        agent-02:
+          ansible_host: '10.0.0.32'

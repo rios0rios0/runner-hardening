@@ -1,0 +1,77 @@
+---
+# The scripts around every agent cycle, and the hooks runner_host's own scripts
+# call. Static files, the same on every box: each one reads its paths from
+# /etc/runner-hardening/host.env and /etc/azure-pipelines-agent/env.
+
+# Which of the directories below are already there. A dry run creates none,
+# and copy fails on a directory that does not exist even in check mode, so a
+# file whose directory this run would create is left out of a dry run.
+- name: 'Look for the directories the helpers go in'
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_helper_dir }}"
+    get_checksum: false
+  loop: ["{{ _runner_azp_libexec_dir }}", "{{ _runner_azp_lib_dir }}", "{{ runner_config_dir }}"]
+  loop_control:
+    loop_var: '_runner_azp_helper_dir'
+  register: '_runner_azp_helper_dirs'
+
+- name: 'Note which helper directories exist'
+  ansible.builtin.set_fact:
+    _runner_azp_dir_present: >-
+      {{ _runner_azp_helper_dirs.results | selectattr('stat.exists') | map(attribute='_runner_azp_helper_dir') | list }}
+
+- name: 'Create the directory of the one-job wrapper'
+  ansible.builtin.file:
+    path: "{{ _runner_azp_libexec_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+# Root-only: azp-cycle runs from ExecStartPre=+ and ExecStopPost=+, and
+# azp-register handles the PAT.
+- name: 'Install the root-only agent helpers'
+  ansible.builtin.copy:
+    src: "{{ _runner_azp_helper.src }}"
+    dest: "{{ _runner_azp_sbin_dir }}/{{ _runner_azp_helper.dest }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+  loop:
+    - {src: 'azp-cycle.sh', dest: 'azp-cycle'}
+    - {src: 'azp-register.sh', dest: 'azp-register'}
+  loop_control:
+    loop_var: '_runner_azp_helper'
+    label: "{{ _runner_azp_helper.dest }}"
+  notify: 'Restart idle runners'
+
+# 0755 root and outside every tree a job can write: the agent user runs it,
+# and no job can edit the wrapper its successor runs in.
+- name: 'Install the one-job wrapper'
+  ansible.builtin.copy:
+    src: 'azp-run-once.sh'
+    dest: "{{ _runner_azp_libexec_dir }}/azp-run-once"
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+  when: "not ansible_check_mode or _runner_azp_libexec_dir in _runner_azp_dir_present"
+  notify: 'Restart idle runners'
+
+- name: 'Install the Azure DevOps hooks beside lib.sh'
+  ansible.builtin.copy:
+    src: 'vendor.sh'
+    dest: "{{ _runner_azp_lib_dir }}/vendor.sh"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  # The directory is runner_host's, made in prepare.
+  when: "not ansible_check_mode or _runner_azp_lib_dir in _runner_azp_dir_present"
+  notify: 'Restart idle runners'
+
+- name: 'Create the Azure DevOps configuration directory'
+  ansible.builtin.file:
+    path: "{{ runner_config_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0700'

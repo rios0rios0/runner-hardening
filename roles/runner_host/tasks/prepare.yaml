@@ -1,0 +1,42 @@
+---
+# Entry point 1 of 3, included by a vendor role right after it sets the
+# flavour (contract section 6). Leaves the host with its users, rootless
+# Docker and prerequisites in place, and sets runner_count_resolved,
+# runner_instances and runner_surplus_instances.
+#
+# The order encodes dependencies: the admin tool before anything that drains,
+# the legacy units down before their accounts are locked, the wipe before
+# Docker is installed, and the kernel settings before rootless Docker.
+
+- name: 'Check the host and the answers'
+  ansible.builtin.import_tasks: 'preflight.yaml'
+
+- name: 'Work out the runner count'
+  ansible.builtin.import_tasks: 'count.yaml'
+
+- name: 'Look at what is already on this host'
+  ansible.builtin.import_tasks: 'discover.yaml'
+
+- name: 'Install the runtime library, the admin tool and the host configuration'
+  ansible.builtin.import_tasks: 'runtime.yaml'
+
+- name: 'Retire the legacy runner services'
+  ansible.builtin.import_tasks: 'legacy.yaml'
+
+- name: 'De-privilege the old runner accounts'
+  ansible.builtin.import_tasks: 'deprivilege.yaml'
+
+- name: 'Destroy the old build state, once'
+  ansible.builtin.import_tasks: 'wipe.yaml'
+
+- name: 'Install the prerequisites'
+  ansible.builtin.import_tasks: 'prereqs.yaml'
+
+- name: 'Install the extra binaries'
+  ansible.builtin.import_tasks: 'binaries.yaml'
+
+- name: 'Add swap where there is none'
+  ansible.builtin.import_tasks: 'swap.yaml'
+
+- name: 'Create the runner users and their rootless Docker'
+  ansible.builtin.import_tasks: 'users.yaml'

@@ -1,0 +1,222 @@
+---
+# Proves the pure task files of runner_host - the memory policy, the runner
+# count, the instances found, the legacy services and the runners a lower
+# limit would hit - against the installer's own arithmetic.
+# Every expected number below was produced by harden-gha-runners.sh's
+# compute_resource_policy, codeql_ram_budget, runner_ceiling and
+# instances_above; the first thirteen policy cases are the ones its own test
+# suite pins. Runs as non-root, offline, on the controller:
+#
+#   ansible-playbook test/ansible/policy.yaml
+- name: 'Prove the resource policy, the count and the surplus against the installer'
+  hosts: 'localhost'
+  connection: 'local'
+  gather_facts: false
+  vars:
+    # Hermetic whatever the configured inventory says about localhost.
+    ansible_connection: 'local'
+    ansible_become: false
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    runner_host_tasks: "{{ playbook_dir }}/../../roles/runner_host/tasks"
+    # A key left out is a value never answered.
+    policy_cases:
+      - {name: 'codeql on an 8 GB box with three runners and one heavy', mem: 7936, count: 3, heavy: 1, codeql: 'auto', slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '4564', ceilings: [5365, 5365, 5365]}
+      - {name: 'codeql on a 12 GB box with five runners and one heavy', mem: 11955, count: 5, heavy: 1, codeql: 'auto', slice: 'none', fair: 1986, ceiling: 8441, aggregate: 10431, sysmin: 768, codeql_ram: '6335', ceilings: [8441, 8441, 8441, 8441, 8441]}
+      - {name: 'codeql split between two heavy runners', mem: 7936, count: 3, heavy: 2, codeql: 'auto', slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '2794', ceilings: [5365, 5365, 5365]}
+      - {name: 'codeql capped at a lone runner ceiling', mem: 4000, count: 1, heavy: 1, codeql: 'auto', slice: 'none', fair: 2776, ceiling: 2776, aggregate: 2876, sysmin: 512, codeql_ram: '2776', ceilings: [2776]}
+      - {name: 'codeql at the fair share with no heavy runner', mem: 7936, count: 3, heavy: 0, codeql: 'auto', slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '2104', ceilings: [5365, 5365, 5365]}
+      - {name: 'codeql with more heavy runners than runners', mem: 7936, count: 3, heavy: 9, codeql: 'auto', slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '2204', ceilings: [5365, 5365, 5365]}
+      - {name: 'codeql set by hand', mem: 7936, count: 3, heavy: 1, codeql: 3000, slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '3000', ceilings: [5365, 5365, 5365]}
+      - {name: 'codeql switched off', mem: 7936, count: 3, heavy: 1, codeql: 'off', slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '', ceilings: [5365, 5365, 5365]}
+      - {name: 'ceiling left alone on a 12 GB box with two runners', mem: 11955, count: 2, heavy: 1, codeql: 'off', slice: 'none', fair: 5265, ceiling: 8951, aggregate: 10731, sysmin: 768, codeql_ram: '', ceilings: [8951, 8951]}
+      - {name: 'ceiling never answered', mem: 11955, count: 2, heavy: 1, codeql: 'off', fair: 5265, ceiling: 8951, aggregate: 10731, sysmin: 768, codeql_ram: '', ceilings: [8951, 8951]}
+      - {name: 'ceiling lifted for every runner', mem: 11955, count: 2, heavy: 1, codeql: 'off', slice: 'all', fair: 5265, ceiling: 8951, aggregate: 10731, sysmin: 768, codeql_ram: '', ceilings: [10731, 10731]}
+      - {name: 'ceiling lifted for the heavy runner only', mem: 7936, count: 3, heavy: 1, codeql: 'off', slice: 'heavy', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '', ceilings: [6612, 5365, 5365]}
+      - {name: 'one runner lifted to the whole slice', mem: 4000, count: 1, heavy: 1, codeql: 'auto', slice: 'all', fair: 2776, ceiling: 2776, aggregate: 2876, sysmin: 512, codeql_ram: '2776', ceilings: [2876]}
+      - {name: 'a heavy ceiling with no heavy runner lifts nobody', mem: 7936, count: 3, heavy: 0, codeql: 'auto', slice: 'heavy', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '2104', ceilings: [5365, 5365, 5365]}
+      - {name: 'a heavy ceiling with more heavy runners than runners lifts all', mem: 7936, count: 3, heavy: 9, codeql: 'auto', slice: 'heavy', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '2204', ceilings: [6612, 6612, 6612]}
+      - {name: 'a box smaller than the reserve', mem: 1024, count: 2, heavy: 1, codeql: 'auto', slice: 'all', fair: 512, ceiling: 512, aggregate: 512, sysmin: 512, codeql_ram: '512', ceilings: [512, 512]}
+      - {name: 'a heavy count that is not a number counts as none', mem: 7936, count: 3, heavy: 'junk', codeql: 'auto', slice: 'heavy', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '2104', ceilings: [5365, 5365, 5365]}
+      - {name: 'an empty heavy count means one', mem: 7936, count: 3, heavy: '', codeql: 'auto', slice: 'heavy', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '4564', ceilings: [6612, 5365, 5365]}
+      - {name: 'nothing answered means one heavy runner, auto and none', mem: 7936, count: 3, fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '4564', ceilings: [5365, 5365, 5365]}
+      - {name: 'a codeql budget of 0 means auto', mem: 7936, count: 3, heavy: 1, codeql: 0, slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '4564', ceilings: [5365, 5365, 5365]}
+      - {name: 'an empty codeql budget means auto', mem: 7936, count: 3, heavy: 1, codeql: '', slice: 'none', fair: 2104, ceiling: 5365, aggregate: 6612, sysmin: 512, codeql_ram: '4564', ceilings: [5365, 5365, 5365]}
+      - {name: 'a heavy count with a leading zero is decimal', mem: 257000, count: 33, heavy: '08', codeql: 'auto', slice: 'heavy', fair: 7556, ceiling: 211969, aggregate: 252676, sysmin: 768, codeql_ram: '28384', ceilings: "{{ [252676] * 8 + [211969] * 25 }}"}
+      - {name: 'the OS floor just under 8000 MB', mem: 7999, count: 2, heavy: 1, codeql: 'auto', slice: 'none', fair: 3287, ceiling: 5588, aggregate: 6775, sysmin: 512, codeql_ram: '5588', ceilings: [5588, 5588]}
+      - {name: 'the OS floor at 8000 MB', mem: 8000, count: 2, heavy: 1, codeql: 'auto', slice: 'none', fair: 3288, ceiling: 5589, aggregate: 6776, sysmin: 768, codeql_ram: '5589', ceilings: [5589, 5589]}
+    count_cases:
+      - {name: 'auto on an 8 GB box with four vCPUs is held by the RAM', count: 'auto', vcpus: 4, mem: 7936, resolved: 3}
+      - {name: 'auto on a 12 GB box with eight vCPUs', count: 'auto', vcpus: 8, mem: 11955, resolved: 5}
+      - {name: 'auto on a large box is held by the vCPUs', count: 'auto', vcpus: 2, mem: 64000, resolved: 2}
+      - {name: 'auto never goes below one runner', count: 'auto', vcpus: 4, mem: 1024, resolved: 1}
+      - {name: 'auto on a box with exactly one job of RAM', count: 'auto', vcpus: 4, mem: 3500, resolved: 1}
+      - {name: 'a number is taken as given', count: 3, vcpus: 1, mem: 1024, resolved: 3}
+      - {name: 'a number as a string is taken as given', count: '7', vcpus: 64, mem: 257000, resolved: 7}
+    surplus_cases:
+      - {name: 'retires the instances above a lowered count', unit: 'gha-runner', count: 3, units: ['gha-runner@1.service', 'gha-runner@2.service', 'gha-runner@3.service', 'gha-runner@4.service', 'gha-runner@5.service'], surplus: [4, 5]}
+      - {name: 'retires nothing at or under the count', unit: 'gha-runner', count: 3, units: ['gha-runner@1.service', 'gha-runner@2.service'], surplus: []}
+      - {name: 'compares instance numbers numerically', unit: 'gha-runner', count: 3, trees: ['2', '10'], surplus: [10]}
+      - {name: 'merges the units, drop-ins and trees found, and ignores what is not an instance', unit: 'gha-runner', count: 3, units: ['gha-runner@.service', 'gha-runner@3.service', 'gha-runnerX@9.service', 'azp-agent@8.service', 'gha-jitconfig.service', 'gha-runner@7.service'], dropins: ['gha-runner@12.service.d', 'gha-runner@.service.d', 'gha-runner@x.service.d'], trees: ['7', 'lost+found', '07', 'bin'], surplus: [7, 12]}
+      - {name: 'reads the Azure DevOps unit name', unit: 'azp-agent', count: 2, units: ['azp-agent@1.service', 'azp-agent@4.service', 'gha-runner@9.service'], dropins: ['azp-agent@6.service.d'], surplus: [4, 6]}
+    legacy_cases:
+      - {name: 'finds the GitHub runner services svc.sh installed', globs: ['actions.runner.*'], legacy: ['actions.runner.x.service', 'actions.runner.your-org-example.build-01.service', 'actions.runner.your-org.build-01-1.service']}
+      - {name: 'finds the Azure Pipelines agent services svc.sh installed', globs: ['vsts.agent.*'], legacy: ['vsts.agent.your-org.your-pool.build-01.service']}
+      - {name: 'matches a dot in a glob only as a dot, and ? as one character', globs: ['actions.runner.?.service'], legacy: ['actions.runner.x.service']}
+      - {name: 'finds nothing without a glob', globs: [], legacy: []}
+    legacy_units:
+      - 'actions.runner.your-org.build-01-1.service'
+      - 'actions.runner.your-org-example.build-01.service'
+      - 'actions.runner.x.service'
+      - 'actionsXrunner.service'
+      - 'actionsXrunnerXyXservice'
+      - 'gha-runner@1.service'
+      - 'vsts.agent.your-org.your-pool.build-01.service'
+      - 'vstsXagent.service'
+    # A runner whose MemoryMax or MemoryLow is about to drop is drained before
+    # the reload applies it to the job it runs. Fair, ceilings and aggregate
+    # below are the policy numbers above for the box each case describes.
+    lowered_cases:
+      - name: 'a higher count lowers every running runner'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [5365, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=3256M\nMemoryMax=5535M\n"}
+          - {n: 1, text: "[Slice]\nMemoryLow=3256M\nMemoryMax=5535M\nTasksMax=8192\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=3256M\nMemoryMax=5535M\n"}
+        slice: "[Slice]\nMemoryMax=6712M\n"
+        lowered: [1, 2]
+      - name: 'a lower count raises the rest and drains nothing'
+        instances: [1, 2]
+        fair: 3256
+        ceilings: [5535, 5535]
+        aggregate: 6712
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 3, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: []
+      - name: 'dropping the slice ceiling from all to none lowers the lifted runners'
+        instances: [1, 2]
+        fair: 5265
+        ceilings: [8951, 8951]
+        aggregate: 10731
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=5265M\nMemoryMax=10731M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=5265M\nMemoryMax=10731M\n"}
+        slice: "[Slice]\nMemoryMax=10731M\n"
+        lowered: [1, 2]
+      - name: 'dropping the heavy ceiling lowers only the heavy runner'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [5365, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=6612M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 3, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: [1]
+      - name: 'a lower slice cap drains every runner it holds, the ones above the count too'
+        instances: [1, 2]
+        fair: 2104
+        ceilings: [5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 4, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=7000M\n"
+        lowered: [1, 2, 4]
+      - name: 'an unchanged policy drains nothing'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [6612, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=6612M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: []
+      - name: 'a limit lifted by hand to infinity is lowered back, so it drains'
+        instances: [1, 2]
+        fair: 2104
+        ceilings: [5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Slice]\nMemoryLow=2104M\nMemoryMax=infinity\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: [1]
+      - name: 'a limit written in other units is compared in MB'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [6612, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryMax=6G\n"}
+          - {n: 2, text: "[Service]\nMemoryMax=5626613760\n"}
+          - {n: 3, text: "[Service]\nMemoryLow=2207252480\n"}
+        slice: ''
+        lowered: [3]
+      - name: 'a first converge has nothing to compare'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [5365, 5365, 5365]
+        aggregate: 6612
+        limits: []
+        slice: ''
+        lowered: []
+  tasks:
+    - name: 'Start with no results'
+      ansible.builtin.set_fact:
+        test_results: []
+
+    - name: 'Check each memory policy case'
+      ansible.builtin.include_tasks: 'policy_case.yaml'
+      loop: "{{ policy_cases }}"
+      loop_control:
+        loop_var: 'policy_case'
+        label: "{{ policy_case.name }}"
+
+    - name: 'Check each surplus case'
+      ansible.builtin.include_tasks: 'surplus_case.yaml'
+      loop: "{{ surplus_cases }}"
+      loop_control:
+        loop_var: 'surplus_case'
+        label: "{{ surplus_case.name }}"
+
+    - name: 'Check each legacy service case'
+      ansible.builtin.include_tasks: 'legacy_case.yaml'
+      loop: "{{ legacy_cases }}"
+      loop_control:
+        loop_var: 'legacy_case'
+        label: "{{ legacy_case.name }}"
+
+    # Last: count.yaml sets runner_count_resolved as a fact, which the cases
+    # above pass in themselves.
+    - name: 'Check each lowered-limit case'
+      ansible.builtin.include_tasks: 'lowered_case.yaml'
+      loop: "{{ lowered_cases }}"
+      loop_control:
+        loop_var: 'lowered_case'
+        label: "{{ lowered_case.name }}"
+
+    - name: 'Check each runner count case'
+      ansible.builtin.include_tasks: 'count_case.yaml'
+      loop: "{{ count_cases }}"
+      loop_control:
+        loop_var: 'count_case'
+        label: "{{ count_case.name }}"
+
+    - name: 'Report every case'
+      ansible.builtin.debug:
+        msg: "{{ test_results + [(test_results | select('match', '^  ok') | list | length | string) ~ ' passed, ' ~ (test_results | select('match', '^FAIL') | list | length | string) ~ ' failed'] }}"
+
+    - name: 'Fail when any case failed'
+      ansible.builtin.assert:
+        that: "test_results | select('match', '^FAIL') | list | length == 0"
+        fail_msg: "{{ test_results | select('match', '^FAIL') | list }}"
+        quiet: true

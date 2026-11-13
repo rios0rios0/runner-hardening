@@ -1,0 +1,3 @@
+kind: 'Security'
+body: 'kept every credential away from what a job can write: a fresh Azure Pipelines registration runs only in a pristine, root-owned unpack of the verified agent package, an agent is removed by the ids recorded when it was registered instead of by its job-writable `.agent`, root never reads a file under a runner home or tree through a link a job could have planted, `--diff` never shows such a file, and a PAT is written through `stdin` so no temporary copy of it is left on the host'
+time: '2026-11-13T03:36:56.652316459Z'

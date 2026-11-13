@@ -1,0 +1,22 @@
+---
+# Pure: set_fact only, no host access (test/ansible/policy.yaml drives it).
+# Inputs: _runner_host_found_units (unit names), _runner_host_found_dropins
+# and _runner_host_found_trees (directory basenames), runner_unit and
+# runner_count_resolved.
+#
+# Numeric, not lexical: runner 10 is above a count of 3.
+- name: 'List the runner instances that exist on this host'
+  ansible.builtin.set_fact:
+    _runner_host_existing_instances: >-
+      {{ ((_runner_host_found_units | select('match', _unit_re ~ '[.]service$')
+           | map('regex_replace', _unit_re ~ '[.]service$', '\1') | list)
+          + (_runner_host_found_dropins | select('match', _unit_re ~ '[.]service[.]d$')
+             | map('regex_replace', _unit_re ~ '[.]service[.]d$', '\1') | list)
+          + (_runner_host_found_trees | map('string') | select('match', '^[0-9]+$') | list))
+         | map('int') | unique | sort }}
+  vars:
+    _unit_re: "^{{ runner_unit | regex_escape }}@([0-9]+)"
+
+- name: 'List the instances the runner count no longer names'
+  ansible.builtin.set_fact:
+    runner_surplus_instances: "{{ _runner_host_existing_instances | select('gt', runner_count_resolved | int) | list }}"
