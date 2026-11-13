@@ -26,7 +26,7 @@
 
     - name: 'Show how the legacy runners came down'
       ansible.builtin.debug:
-        msg: "{{ _runner_host_legacy_drain.stdout_lines }}"
+        msg: "{{ _runner_host_legacy_drain.stdout_lines | default([]) }}"
 
     - name: 'Disable the legacy runner services'
       ansible.builtin.systemd_service:

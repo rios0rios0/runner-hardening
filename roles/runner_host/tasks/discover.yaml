@@ -47,6 +47,7 @@
   register: '_runner_host_sessions'
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: 'Find the accounts that hold SSH keys'
   ansible.builtin.find:
@@ -63,6 +64,7 @@
   register: '_runner_host_nopasswd'
   changed_when: false
   failed_when: "_runner_host_nopasswd.rc > 1"
+  check_mode: false
 
 # The account driving this play comes in through sudo (SUDO_USER), or is the
 # inventory's ansible_user.
@@ -80,6 +82,16 @@
     _invokers: >-
       {{ [ansible_facts['env']['SUDO_USER'] | default(''), ansible_user | default('')]
          | reject('in', ['', 'root']) | unique | list }}
+
+# The one list of the old accounts this role locks: those that exist, less the
+# protected ones unless runner_force_deprivilege overrides that. The
+# de-privileging, the wipe of their caches and the summary all read it, so
+# none of them acts on an account another one left alone.
+- name: 'Work out which old accounts are de-privileged'
+  ansible.builtin.set_fact:
+    _runner_host_deprivileged_users: >-
+      {{ runner_old_users | reject('equalto', 'none') | select('in', ansible_facts['getent_passwd'])
+         | reject('in', [] if runner_force_deprivilege | bool else _runner_host_protected_users) | list }}
 
 # Reported, never acted on: only runner_old_users is de-privileged.
 - name: 'Work out which accounts look over-privileged'

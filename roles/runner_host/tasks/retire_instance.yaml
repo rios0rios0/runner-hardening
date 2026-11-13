@@ -139,3 +139,11 @@
     - "{{ runner_base_dir }}/{{ _runner_host_n }}"
   loop_control:
     loop_var: '_runner_host_tree'
+
+# The disk guard's root-owned copy of this runner's rootless user unit, which
+# an untrusted reset restores before every job. A runner re-created later with
+# the same number must snapshot its own unit, not inherit this one.
+- name: "Remove the rootless unit snapshot of runner {{ _runner_host_n }}"
+  ansible.builtin.file:
+    path: "{{ _runner_host_state_dir }}/rootless/{{ runner_user_prefix }}{{ _runner_host_n }}.docker.service"
+    state: 'absent'

@@ -21,12 +21,14 @@
   register: '_runner_host_verify'
   changed_when: false
   failed_when: false
+  # It only reads, so a dry run checks the host as it stands.
+  check_mode: false
 
 - name: 'Show the checks'
   ansible.builtin.debug:
-    msg: "{{ _runner_host_verify.stdout_lines + _runner_host_verify.stderr_lines }}"
+    msg: "{{ (_runner_host_verify.stdout_lines | default([])) + (_runner_host_verify.stderr_lines | default([])) }}"
 
 - name: 'Warn that some checks failed'
   ansible.builtin.debug:
     msg: 'WARNING: some checks failed - review them before sending real traffic.'
-  when: "_runner_host_verify.rc != 0"
+  when: "_runner_host_verify.rc | default(0) != 0"

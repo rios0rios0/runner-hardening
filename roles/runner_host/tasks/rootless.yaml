@@ -85,7 +85,7 @@
           rootless docker setup failed for {{ runner_user_prefix }}{{ _runner_host_failed._runner_host_n }}
           (try: journalctl --user -u docker -M {{ runner_user_prefix }}{{ _runner_host_failed._runner_host_n }}@):
           {{ (_runner_host_failed.stderr_lines | default([]))[-5:] | join(' / ') }}
-      loop: "{{ _runner_host_rootless_setup.results | rejectattr('rc', 'equalto', 0) | list }}"
+      loop: "{{ _runner_host_rootless_setup.results | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | list }}"
       loop_control:
         loop_var: '_runner_host_failed'
         label: "{{ runner_user_prefix }}{{ _runner_host_failed._runner_host_n }}"

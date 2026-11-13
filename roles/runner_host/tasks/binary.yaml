@@ -19,6 +19,13 @@
     group: 'root'
     mode: '0600'
 
+# Outside check mode the download is always there by now; a dry run fetched
+# nothing, so it stops at what it would have downloaded.
+- name: "Look for the download of {{ _runner_host_binary.name }}"
+  ansible.builtin.stat:
+    path: "{{ _runner_host_download }}"
+  register: '_runner_host_downloaded'
+
 - name: "Install the bare binary {{ _runner_host_binary.name }}"
   ansible.builtin.copy:
     src: "{{ _runner_host_download }}"
@@ -27,12 +34,15 @@
     owner: 'root'
     group: 'root'
     mode: '0755'
-  when: "_runner_host_member | length == 0"
+  when:
+    - "_runner_host_member | length == 0"
+    - "_runner_host_downloaded.stat.exists"
 
 - name: "Install from its archive: {{ _runner_host_binary.name }}"
   when:
     - "_runner_host_member | length > 0"
     - "_runner_host_binary.links | default({}) | length == 0"
+    - "_runner_host_downloaded.stat.exists"
   block:
     # A directory of its own that persists, so unpacking an archive that did
     # not change reports nothing either.
@@ -76,6 +86,7 @@
   when:
     - "_runner_host_member | length > 0"
     - "_runner_host_binary.links | default({}) | length > 0"
+    - "_runner_host_downloaded.stat.exists"
   vars:
     _runner_host_tool_dir: "{{ _runner_host_lib_dir }}/tools/{{ _runner_host_binary.name }}"
     _runner_host_tool_marker: "{{ _runner_host_lib_dir }}/tools/{{ _runner_host_binary.name }}/.runner-hardening.sha256"

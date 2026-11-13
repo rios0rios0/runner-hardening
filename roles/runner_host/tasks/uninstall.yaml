@@ -35,6 +35,53 @@
     - "_runner_host_admin_tool.stat.exists"
     - "_runner_host_existing_instances | length > 0"
 
+# A host the old installer set up has no admin tool. It is drained the way the
+# installer drained: Restart=no first, so a runner that finishes its job stays
+# down rather than taking the next one, then a wait - bounded by
+# runner_drain_timeout - until no worker is left in each unit's cgroup.
+- name: 'Drain without the admin tool, as the installer did'
+  when:
+    - "not _runner_host_admin_tool.stat.exists"
+    - "_runner_host_existing_instances | length > 0"
+  block:
+    - name: 'Create the drop-in directory of each runner'
+      ansible.builtin.file:
+        path: "{{ _runner_host_systemd_dir }}/{{ runner_unit }}@{{ _runner_host_n }}.service.d"
+        state: 'directory'
+        owner: 'root'
+        group: 'root'
+        mode: '0755'
+      loop: "{{ _runner_host_existing_instances }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+
+    - name: 'Keep each runner from coming back after its job'
+      ansible.builtin.copy:
+        content: "[Service]\nRestart=no\n"
+        dest: "{{ _runner_host_systemd_dir }}/{{ runner_unit }}@{{ _runner_host_n }}.service.d/40-drain.conf"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      loop: "{{ _runner_host_existing_instances }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+
+    - name: 'Make systemd read the drain overrides'
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: 'Let every runner finish its job, then stop it, without the admin tool'
+      ansible.builtin.command:
+        argv: >-
+          {{ ['/bin/bash', '-c', _runner_host_legacy_drain_script, 'drain', runner_drain_timeout | string, runner_worker_pattern]
+             + (_runner_host_existing_instances | map('regex_replace', '^(.*)$', runner_unit ~ '@\1.service') | list) }}
+      register: '_runner_host_uninstall_fallback_drain'
+      changed_when: "_runner_host_uninstall_fallback_drain.stdout is search('(?m)^stopped ')"
+
+    - name: 'Show how the runners came down'
+      ansible.builtin.debug:
+        msg: "{{ _runner_host_uninstall_fallback_drain.stdout_lines | default([]) }}"
+
 - name: 'Remove each runner'
   ansible.builtin.include_tasks: 'retire_instance.yaml'
   loop: "{{ _runner_host_existing_instances }}"
@@ -73,6 +120,7 @@
         _runner_host_systemd_dir ~ '/' ~ runner_sbin_prefix ~ '-reboot.timer',
         '/etc/sysctl.d/99-' ~ runner_sbin_prefix ~ '-rootless.conf',
         '/etc/systemd/user/docker.service.d/10-runner-hardening.conf',
+        _runner_host_state_dir ~ '/rootless',
         '/etc/apt/apt.conf.d/52' ~ runner_sbin_prefix ~ '-unattended',
         '/etc/needrestart/conf.d/90-' ~ runner_sbin_prefix ~ '.conf',
         _runner_host_lib_dir, _runner_host_libexec_dir, _runner_host_etc_dir, _runner_host_cache_dir,

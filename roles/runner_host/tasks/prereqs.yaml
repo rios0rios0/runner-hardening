@@ -62,7 +62,9 @@
     loop_var: '_runner_host_apt_source'
     label: "{{ _runner_host_apt_source.name }}"
   register: '_runner_host_apt_keys'
+  failed_when: false
 
+# Outside check mode every key is on disk by now; a dry run fetched none.
 - name: 'Check that every apt signing key is ASCII-armored'
   ansible.builtin.assert:
     that: "(_runner_host_apt_key.content | b64decode) is search('BEGIN PGP PUBLIC KEY BLOCK')"
@@ -75,6 +77,7 @@
   loop_control:
     loop_var: '_runner_host_apt_key'
     label: "{{ _runner_host_apt_key._runner_host_apt_source.name }}"
+  when: "not ansible_check_mode or _runner_host_apt_key.content is defined"
 
 - name: 'Write the apt sources'
   ansible.builtin.template:
@@ -95,7 +98,8 @@
     update_cache: true
   when: "_runner_host_apt_written.results | selectattr('changed') | list | length > 0"
 
-# After the sources: an extra package may come from one of them.
+# After the sources: an extra package may come from one of them. A dry run
+# adds no source, so a package only a new source carries cannot be resolved.
 - name: 'Install Docker CE, the rootless extras and the extra packages'
   ansible.builtin.apt:
     name: "{{ _runner_host_docker_packages + runner_extra_packages }}"
@@ -103,6 +107,12 @@
   environment:
     NEEDRESTART_MODE: 'a'
     NEEDRESTART_SUSPEND: '1'
+  when: "not (ansible_check_mode and _runner_host_apt_written.results | selectattr('changed') | list | length > 0)"
+
+- name: 'Say why the dry run skips the packages of new sources'
+  ansible.builtin.debug:
+    msg: 'Check mode: the packages that come from a source this run adds are not resolved until that source exists.'
+  when: "ansible_check_mode and _runner_host_apt_written.results | selectattr('changed') | list | length > 0"
 
 # Only the rootless daemon is wanted. containerd too: the installer's wipe
 # disabled it on every run, and a one-time wipe runs before Docker is even
@@ -112,10 +122,17 @@
     name: "{{ _runner_host_rootful_unit }}"
     enabled: false
     state: 'stopped'
-  # The socket first: stopped second, it could start the daemon again.
-  loop: "{{ ['docker.socket', 'docker.service'] + (['containerd.service'] if runner_dismantle_rootful_docker | bool else []) }}"
+  # The socket first: stopped second, it could start the daemon again. A dry
+  # run of a first converge installs no Docker, so it only checks units there.
+  loop: >-
+    {{ (['docker.socket', 'docker.service'] + (['containerd.service'] if runner_dismantle_rootful_docker | bool else []))
+       | select('in', _present if ansible_check_mode else ['docker.socket', 'docker.service', 'containerd.service']) | list }}
   loop_control:
     loop_var: '_runner_host_rootful_unit'
+  vars:
+    _present: >-
+      {{ (ansible_facts['services'] | default({}) | list)
+         + (['docker.socket'] if 'docker.service' in (ansible_facts['services'] | default({})) else []) }}
 
 # Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor, which breaks
 # rootlesskit. Relaxing it is a genuine (small) reduction in 24.04's default

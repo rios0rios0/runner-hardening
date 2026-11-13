@@ -27,6 +27,8 @@
       register: 'runner_verify_result'
       changed_when: false
       failed_when: false
+      # It only reads, so --check runs it too.
+      check_mode: false
 
     - name: 'Show the checks'
       ansible.builtin.debug:

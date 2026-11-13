@@ -54,8 +54,8 @@
 
 - name: 'Show the reap'
   ansible.builtin.debug:
-    msg: "{{ _runner_host_reap.stdout_lines + _runner_host_reap.stderr_lines }}"
-  when: "(_runner_host_reap.stdout + _runner_host_reap.stderr) | length > 0"
+    msg: "{{ (_runner_host_reap.stdout_lines | default([])) + (_runner_host_reap.stderr_lines | default([])) }}"
+  when: "((_runner_host_reap.stdout | default('')) + (_runner_host_reap.stderr | default(''))) | length > 0"
 
 - name: 'Verify the host'
   ansible.builtin.import_tasks: 'verify.yaml'

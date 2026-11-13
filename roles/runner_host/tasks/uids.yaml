@@ -1,0 +1,20 @@
+---
+# n -> uid for every runner, keyed by the instance number as a string. In check
+# mode a runner user this run would create does not exist yet, so it stands in
+# as 65534 (nobody): a dry run on a fresh host renders that runner's paths
+# instead of failing on the lookup. Outside check mode a missing user is a real
+# failure, and the lookup still fails loudly.
+- name: 'Read the account database'
+  ansible.builtin.getent:
+    database: 'passwd'
+
+- name: 'Record each runner uid'
+  ansible.builtin.set_fact:
+    _runner_host_uids: >-
+      {{ dict(runner_instances | map('string') | zip(runner_instances | map('regex_replace', '^', runner_user_prefix)
+              | map('extract', ansible_facts['getent_passwd'] | combine(_runner_host_uid_stand_ins))
+              | map(attribute=1) | map('int'))) }}
+  vars:
+    _runner_host_uid_stand_ins: >-
+      {{ dict(runner_instances | map('regex_replace', '^', runner_user_prefix) | reject('in', ansible_facts['getent_passwd'])
+              | zip_longest([], fillvalue=['x', '65534'])) if ansible_check_mode else {} }}

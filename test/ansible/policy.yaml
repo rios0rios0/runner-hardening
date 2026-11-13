@@ -1,7 +1,7 @@
 ---
 # Proves the pure task files of runner_host - the memory policy, the runner
-# count, the instances found and the legacy services - against the
-# installer's own arithmetic.
+# count, the instances found, the legacy services and the runners a lower
+# limit would hit - against the installer's own arithmetic.
 # Every expected number below was produced by harden-gha-runners.sh's
 # compute_resource_policy, codeql_ram_budget, runner_ceiling and
 # instances_above; the first thirteen policy cases are the ones its own test
@@ -72,6 +72,103 @@
       - 'gha-runner@1.service'
       - 'vsts.agent.your-org.your-pool.build-01.service'
       - 'vstsXagent.service'
+    # A runner whose MemoryMax or MemoryLow is about to drop is drained before
+    # the reload applies it to the job it runs. Fair, ceilings and aggregate
+    # below are the policy numbers above for the box each case describes.
+    lowered_cases:
+      - name: 'a higher count lowers every running runner'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [5365, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=3256M\nMemoryMax=5535M\n"}
+          - {n: 1, text: "[Slice]\nMemoryLow=3256M\nMemoryMax=5535M\nTasksMax=8192\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=3256M\nMemoryMax=5535M\n"}
+        slice: "[Slice]\nMemoryMax=6712M\n"
+        lowered: [1, 2]
+      - name: 'a lower count raises the rest and drains nothing'
+        instances: [1, 2]
+        fair: 3256
+        ceilings: [5535, 5535]
+        aggregate: 6712
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 3, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: []
+      - name: 'dropping the slice ceiling from all to none lowers the lifted runners'
+        instances: [1, 2]
+        fair: 5265
+        ceilings: [8951, 8951]
+        aggregate: 10731
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=5265M\nMemoryMax=10731M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=5265M\nMemoryMax=10731M\n"}
+        slice: "[Slice]\nMemoryMax=10731M\n"
+        lowered: [1, 2]
+      - name: 'dropping the heavy ceiling lowers only the heavy runner'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [5365, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=6612M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 3, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: [1]
+      - name: 'a lower slice cap drains every runner it holds, the ones above the count too'
+        instances: [1, 2]
+        fair: 2104
+        ceilings: [5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+          - {n: 4, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=7000M\n"
+        lowered: [1, 2, 4]
+      - name: 'an unchanged policy drains nothing'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [6612, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryLow=2104M\nMemoryMax=6612M\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: []
+      - name: 'a limit lifted by hand to infinity is lowered back, so it drains'
+        instances: [1, 2]
+        fair: 2104
+        ceilings: [5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Slice]\nMemoryLow=2104M\nMemoryMax=infinity\n"}
+          - {n: 2, text: "[Service]\nMemoryLow=2104M\nMemoryMax=5365M\n"}
+        slice: "[Slice]\nMemoryMax=6612M\n"
+        lowered: [1]
+      - name: 'a limit written in other units is compared in MB'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [6612, 5365, 5365]
+        aggregate: 6612
+        limits:
+          - {n: 1, text: "[Service]\nMemoryMax=6G\n"}
+          - {n: 2, text: "[Service]\nMemoryMax=5626613760\n"}
+          - {n: 3, text: "[Service]\nMemoryLow=2207252480\n"}
+        slice: ''
+        lowered: [3]
+      - name: 'a first converge has nothing to compare'
+        instances: [1, 2, 3]
+        fair: 2104
+        ceilings: [5365, 5365, 5365]
+        aggregate: 6612
+        limits: []
+        slice: ''
+        lowered: []
   tasks:
     - name: 'Start with no results'
       ansible.builtin.set_fact:
@@ -100,6 +197,13 @@
 
     # Last: count.yaml sets runner_count_resolved as a fact, which the cases
     # above pass in themselves.
+    - name: 'Check each lowered-limit case'
+      ansible.builtin.include_tasks: 'lowered_case.yaml'
+      loop: "{{ lowered_cases }}"
+      loop_control:
+        loop_var: 'lowered_case'
+        label: "{{ lowered_case.name }}"
+
     - name: 'Check each runner count case'
       ansible.builtin.include_tasks: 'count_case.yaml'
       loop: "{{ count_cases }}"

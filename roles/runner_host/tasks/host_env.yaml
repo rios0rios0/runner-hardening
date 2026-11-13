@@ -55,6 +55,7 @@
     runner_slice: "{{ _runner_host_env['RUNNER_SLICE'] | default(_fixed.runner_slice, true) }}"
     runner_sbin_prefix: "{{ _runner_host_env['RUNNER_SBIN_PREFIX'] | default(_fixed.runner_sbin_prefix, true) }}"
     runner_config_dir: "{{ _runner_host_env['RUNNER_CONFIG_DIR'] | default(_fixed.runner_config_dir, true) }}"
+    runner_worker_pattern: "{{ _runner_host_env['RUNNER_WORKER_PATTERN'] | default(_fixed.runner_worker_pattern, true) }}"
     runner_count_resolved: "{{ _runner_host_env['RUNNER_COUNT'] | default(0, true) | int }}"
   vars:
     _fixed: "{{ _runner_host_flavors[_runner_host_flavor] }}"

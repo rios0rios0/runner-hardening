@@ -12,7 +12,8 @@
   when: "_runner_host_old_user in ansible_facts['getent_passwd']"
   vars:
     _runner_host_protected: "{{ _runner_host_old_user in _runner_host_protected_users }}"
-    _runner_host_proceed: "{{ (not _runner_host_protected) or (runner_force_deprivilege | bool) }}"
+    # The same list the wipe and the summary read (discover.yaml).
+    _runner_host_proceed: "{{ _runner_host_old_user in _runner_host_deprivileged_users }}"
   block:
     - name: 'Refuse outright to lock the account running this play'
       ansible.builtin.fail:
@@ -60,6 +61,7 @@
           register: '_runner_host_sudoers_hits'
           changed_when: false
           failed_when: "_runner_host_sudoers_hits.rc > 1"
+          check_mode: false
 
         # Moving a drop-in disables every rule in it. One that also grants the
         # admin account would lock that account out of sudo, so it stays and
@@ -70,6 +72,7 @@
           register: '_runner_host_sudoers_shared'
           changed_when: false
           failed_when: "_runner_host_sudoers_shared.rc > 1"
+          check_mode: false
           when:
             - "_runner_host_sudoers_hits.stdout_lines | length > 0"
             - "_others | length > 0"
@@ -103,6 +106,7 @@
           register: '_runner_host_sudoers_inline'
           changed_when: false
           failed_when: "_runner_host_sudoers_inline.rc > 1"
+          check_mode: false
 
         - name: 'Warn about the inline rule in /etc/sudoers'
           ansible.builtin.debug:

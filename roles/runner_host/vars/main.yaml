@@ -107,6 +107,7 @@ _runner_host_flavors:
     runner_slice: 'gha.slice'
     runner_sbin_prefix: 'gha'
     runner_config_dir: '/etc/github-runner'
+    runner_worker_pattern: 'Runner\.Worker'
   azure_devops:
     runner_flavor: 'azure_devops'
     runner_user_prefix: 'azp'
@@ -115,6 +116,7 @@ _runner_host_flavors:
     runner_slice: 'azp.slice'
     runner_sbin_prefix: 'azp'
     runner_config_dir: '/etc/azure-pipelines-agent'
+    runner_worker_pattern: 'Agent\.Worker'
 
 # The vendor helpers uninstall removes, beside the neutral ones.
 _runner_host_vendor_sbin:

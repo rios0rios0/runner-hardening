@@ -23,7 +23,7 @@
 
     - name: 'Show the drain'
       ansible.builtin.debug:
-        msg: "{{ _runner_host_retire_drain.stdout_lines + _runner_host_retire_drain.stderr_lines }}"
+        msg: "{{ (_runner_host_retire_drain.stdout_lines | default([])) + (_runner_host_retire_drain.stderr_lines | default([])) }}"
 
     - name: 'Remove each retired runner'
       ansible.builtin.include_tasks: 'retire_instance.yaml'

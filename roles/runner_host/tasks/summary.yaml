@@ -17,6 +17,10 @@
     msg: "{{ _lines }}"
   vars:
     _noun: "{{ _runner_host_flavor_noun[runner_flavor] }}"
+    # Named in runner_old_users, present, and skipped by the de-privileging.
+    _protected_old: >-
+      {{ runner_old_users | reject('equalto', 'none') | select('in', _runner_host_protected_users | default([]))
+         | reject('in', _runner_host_deprivileged_users | default([])) | list }}
     _units: >-
       {% set out = [] %}{% for r in _runner_host_summary_units.results %}{%
       set n = r._runner_host_n %}{% set s = r.status | default({}) %}{%
@@ -41,8 +45,10 @@
             ~ ((' ; ' ~ runner_sbin_prefix ~ '-reboot.timer 02:00-05:00, only when no runner is busy')
                if runner_reboot_guard | bool else '')]
          + (['the old accounts are locked but still present - delete them when satisfied: '
-             ~ (runner_old_users | reject('equalto', 'none') | map('regex_replace', '^(.*)$', 'pkill -u \1; userdel -r \1')
-                | join(' ; '))]
-            if runner_old_users | reject('equalto', 'none') | list | length > 0 else [])
+             ~ (_runner_host_deprivileged_users | map('regex_replace', '^(.*)$', 'pkill -u \1; userdel -r \1') | join(' ; '))]
+            if _runner_host_deprivileged_users | default([]) | length > 0 else [])
+         + (['left alone, protected (admin account, SSH keys or a live session): '
+             ~ (_protected_old | join(', ')) ~ '; set runner_force_deprivilege to lock them']
+            if _protected_old | length > 0 else [])
          + (runner_summary_lines | default([]))
          + ['next: playbooks/verify.yaml re-checks the host; playbooks/diagnose.yaml explains a runner that will not stay up'] }}

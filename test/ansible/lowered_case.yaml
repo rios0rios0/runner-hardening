@@ -1,0 +1,17 @@
+---
+- name: "Work out which runners get less memory: {{ lowered_case.name }}"
+  ansible.builtin.include_tasks: "{{ runner_host_tasks }}/lowered.yaml"
+  vars:
+    _runner_host_current_limits: "{{ lowered_case.limits }}"
+    _runner_host_current_slice: "{{ lowered_case.slice }}"
+    runner_instances: "{{ lowered_case.instances }}"
+    runner_rp_fair: "{{ lowered_case.fair }}"
+    runner_rp_ceilings: "{{ lowered_case.ceilings }}"
+    runner_rp_aggregate: "{{ lowered_case.aggregate }}"
+
+- name: "Compare it with what the reload would lower: {{ lowered_case.name }}"
+  ansible.builtin.set_fact:
+    test_results: "{{ test_results + [('  ok  ' if _passed else 'FAIL  ') ~ lowered_case.name ~ ('' if _passed else ': ' ~ _why)] }}"
+  vars:
+    _passed: "{{ _runner_host_lowered_instances == lowered_case.lowered }}"
+    _why: "expected {{ lowered_case.lowered }}, got {{ _runner_host_lowered_instances }} from {{ _runner_host_limits_now }}"

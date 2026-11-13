@@ -32,16 +32,8 @@
   loop_control:
     loop_var: '_runner_host_n'
 
-- name: 'Read the account database'
-  ansible.builtin.getent:
-    database: 'passwd'
-
-# Keyed by the instance number as a string: n -> uid.
 - name: 'Record each runner uid'
-  ansible.builtin.set_fact:
-    _runner_host_uids: >-
-      {{ dict(runner_instances | map('string') | zip(runner_instances | map('regex_replace', '^', runner_user_prefix)
-              | map('extract', ansible_facts['getent_passwd']) | map(attribute=1) | map('int'))) }}
+  ansible.builtin.import_tasks: 'uids.yaml'
 
 - name: 'Read the subordinate id files'
   ansible.builtin.slurp:

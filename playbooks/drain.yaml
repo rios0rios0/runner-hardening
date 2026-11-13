@@ -40,4 +40,4 @@
 
     - name: 'Show the drain'
       ansible.builtin.debug:
-        msg: "{{ runner_drain_result.stdout_lines + runner_drain_result.stderr_lines }}"
+        msg: "{{ (runner_drain_result.stdout_lines | default([])) + (runner_drain_result.stderr_lines | default([])) }}"

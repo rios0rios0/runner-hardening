@@ -32,6 +32,7 @@
       register: '_runner_host_docker_info'
       changed_when: false
       failed_when: false
+      check_mode: false
       when:
         - "runner_dismantle_rootful_docker | bool"
         - "_runner_host_docker_cli.stat.exists"
@@ -78,15 +79,31 @@
         loop_var: '_runner_host_image_store'
       when: "runner_dismantle_rootful_docker | bool"
 
+    # Only the accounts de-privileged above: a protected one keeps its caches,
+    # as it keeps its privileges. And as that account, never as root: it owns
+    # its home and every path component below it, so it may have swapped one
+    # for a symlink (.config -> /etc), which a delete as root would follow.
+    # As the account, rm reaches only what the account could delete itself,
+    # and --one-file-system keeps it off any other mount.
     - name: 'Clear the caches under the old accounts homes'
-      ansible.builtin.file:
-        path: "{{ ansible_facts['getent_passwd'][_runner_host_cache[0]][4] }}/{{ _runner_host_cache[1] }}"
-        state: 'absent'
-      loop: >-
-        {{ runner_old_users | reject('equalto', 'none') | select('in', ansible_facts['getent_passwd'])
-           | product(_runner_host_old_user_caches) | list }}
+      ansible.builtin.command:
+        argv:
+          - 'setpriv'
+          - "--reuid={{ _runner_host_cache[0] }}"
+          - "--regid={{ _runner_host_cache[0] }}"
+          - '--init-groups'
+          - '--'
+          - '/bin/sh'
+          - '-c'
+          - 'if [ -e "$1" ] || [ -L "$1" ]; then rm -rf --one-file-system -- "$1"; echo "removed $1"; fi'
+          - 'clear-cache'
+          - "{{ ansible_facts['getent_passwd'][_runner_host_cache[0]][4] }}/{{ _runner_host_cache[1] }}"
+      loop: "{{ _runner_host_deprivileged_users | product(_runner_host_old_user_caches) | list }}"
       loop_control:
         loop_var: '_runner_host_cache'
+      register: '_runner_host_cache_clear'
+      changed_when: "_runner_host_cache_clear.stdout is search('^removed ')"
+      failed_when: false
       when: "ansible_facts['getent_passwd'][_runner_host_cache[0]][4] is match('^/.+')"
 
     - name: 'Find the _work directories the old setup left behind'

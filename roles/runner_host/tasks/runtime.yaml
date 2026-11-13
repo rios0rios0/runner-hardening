@@ -59,7 +59,8 @@
   register: '_runner_host_audit'
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: 'Show the audit'
   ansible.builtin.debug:
-    msg: "{{ _runner_host_audit.stdout_lines + _runner_host_audit.stderr_lines }}"
+    msg: "{{ (_runner_host_audit.stdout_lines | default([])) + (_runner_host_audit.stderr_lines | default([])) }}"

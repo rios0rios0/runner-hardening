@@ -16,6 +16,12 @@
         mode: '0700'
         validate: '/bin/bash -n %s'
 
+    # Absent before the first converge, which in check mode is never written.
+    - name: 'Look for the reboot timer'
+      ansible.builtin.stat:
+        path: "{{ _runner_host_systemd_dir }}/{{ runner_sbin_prefix }}-reboot.timer"
+      register: '_runner_host_reboot_timer_file'
+
     - name: 'Write the reboot service and timer'
       ansible.builtin.template:
         src: "reboot.{{ _runner_host_reboot_unit }}.j2"
@@ -34,6 +40,7 @@
         enabled: true
         state: 'started'
         daemon_reload: "{{ _runner_host_reboot_units.results | selectattr('changed') | list | length > 0 }}"
+      when: "not ansible_check_mode or _runner_host_reboot_timer_file.stat.exists"
 
 - name: 'Remove the reboot guard'
   when: "not (runner_reboot_guard | bool)"
