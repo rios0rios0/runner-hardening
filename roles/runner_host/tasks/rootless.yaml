@@ -18,6 +18,31 @@
          + (_runner_host_sockets.results | selectattr('stat.issock', 'defined') | rejectattr('stat.issock')
             | map(attribute='_runner_host_n') | list) }}
 
+# A user manager takes its environment from PAM, and pam_env reads
+# /etc/environment: an image that sets XDG_RUNTIME_DIR there for its own login
+# user hands that one directory to every account's manager, so each runner's
+# rootless daemon refuses to start ("XDG_RUNTIME_DIR needs to be set and
+# writable"). Pinned per user, root-owned, for every user's docker.service.
+# /run/user/%U, not %t: %t expands to that same inherited value.
+- name: 'Create the drop-in directory for every user docker.service'
+  ansible.builtin.file:
+    path: '/etc/systemd/user/docker.service.d'
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+- name: 'Pin each rootless daemon to its own runtime directory'
+  ansible.builtin.copy:
+    dest: '/etc/systemd/user/docker.service.d/10-runner-hardening.conf'
+    content: |
+      # Managed by rios0rios0.runner_hardening (runner_host). See rootless.yaml.
+      [Service]
+      Environment=XDG_RUNTIME_DIR=/run/user/%U
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+
 - name: 'Set up rootless Docker'
   when: "_runner_host_need_docker | length > 0"
   vars:

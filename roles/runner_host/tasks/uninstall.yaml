@@ -72,6 +72,7 @@
         _runner_host_systemd_dir ~ '/' ~ runner_sbin_prefix ~ '-reboot.service',
         _runner_host_systemd_dir ~ '/' ~ runner_sbin_prefix ~ '-reboot.timer',
         '/etc/sysctl.d/99-' ~ runner_sbin_prefix ~ '-rootless.conf',
+        '/etc/systemd/user/docker.service.d/10-runner-hardening.conf',
         '/etc/apt/apt.conf.d/52' ~ runner_sbin_prefix ~ '-unattended',
         '/etc/needrestart/conf.d/90-' ~ runner_sbin_prefix ~ '.conf',
         _runner_host_lib_dir, _runner_host_libexec_dir, _runner_host_etc_dir, _runner_host_cache_dir,
