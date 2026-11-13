@@ -188,6 +188,13 @@
     mode: '0750'
   loop: "{{ runner_instances }}"
 
+# diff: false on both copies below, and on any copy or template that writes
+# into a tree a job can write. To show a diff, copy reads the destination back
+# as root and follows a link a job planted there, so `.runner-version ->
+# /etc/github-runner/pat` would print the PAT as the diff's "before" on a
+# --diff run. Without the diff, copy replaces such a link rather than reading
+# or writing through it.
+
 # Root-owned: the runner user can delete it, which only makes the next converge
 # read the release from the binaries, but cannot rewrite it in place.
 - name: 'Record the release each tree holds'
@@ -197,11 +204,10 @@
     owner: 'root'
     group: 'root'
     mode: '0644'
+  diff: false
   loop: "{{ runner_instances }}"
 
 # The runner reads .env from its own directory into every job's environment.
-# copy replaces a link a job may have planted there rather than writing
-# through it.
 - name: 'Point each runner at its own rootless Docker'
   ansible.builtin.copy:
     content: |
@@ -212,6 +218,7 @@
     owner: "{{ runner_user_prefix }}{{ item }}"
     group: "{{ runner_user_prefix }}{{ item }}"
     mode: '0600'
+  diff: false
   vars:
     _runner_github_uid: "{{ ansible_facts['getent_passwd'][runner_user_prefix ~ item][1] }}"
   loop: "{{ runner_instances }}"

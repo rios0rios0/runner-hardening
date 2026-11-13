@@ -124,25 +124,19 @@
     group: 'root'
     mode: '0700'
 
-# copy writes a temporary file beside the destination and renames it over:
-# an atomic swap, never a half-written file for a runner starting meanwhile.
+# An atomic swap: a runner starting meanwhile reads the old token or the new
+# one, never a half-written file.
 - name: 'Store the new PAT where only root can read it'
-  ansible.builtin.copy:
-    content: "{{ runner_github_new_pat | string | trim }}"
-    dest: "{{ _runner_github_pat_file }}"
-    owner: 'root'
-    group: 'root'
-    mode: '0600'
-  register: '_runner_github_rotate_write'
-  no_log: true
-  diff: false
+  ansible.builtin.include_tasks: 'write_pat.yaml'
+  vars:
+    _runner_github_write_pat: "{{ runner_github_new_pat }}"
 
 - name: 'Report the rotation'
   ansible.builtin.debug:
     msg:
       - >-
         {{ ('stored at ' ~ _runner_github_pat_file ~ ' (0600 root:root)')
-           if _runner_github_rotate_write is changed
+           if _runner_github_pat_written | bool
            else 'this host already stored the new PAT; nothing changed' }}
       - >-
         No runner restarted: gha-jitconfig reads the file at every start, and every

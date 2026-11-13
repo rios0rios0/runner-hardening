@@ -1,0 +1,59 @@
+---
+# Store _runner_github_write_pat at /etc/github-runner/pat: byte for byte what
+# save_config wrote (no newline), only when it differs, and atomically. Sets
+# _runner_github_pat_written. Shared by the converge and by the rotation.
+#
+# Not copy: copy uploads its content as a temporary file into the connecting
+# user's ~/.ansible/tmp, even with pipelining, and an interrupted run leaves
+# the token there. Here it reaches install on its stdin, and pipelining sends
+# module arguments on the SSH session's stdin: never a temporary file, an argv
+# entry or the environment.
+#
+# install truncates and rewrites an existing destination in place, so a runner
+# starting mid-write would read an empty token. It writes a new file beside the
+# stored one instead, and mv renames it over: rename(2) is atomic, so
+# gha-jitconfig reads the old token or the new one, never half of either.
+
+- name: 'Look at the PAT this host stores'
+  ansible.builtin.stat:
+    path: "{{ _runner_github_pat_file }}"
+    checksum_algorithm: 'sha1'
+  register: '_runner_github_pat_stat'
+  # A digest of the token is not something to print either.
+  no_log: true
+
+- name: 'Note whether the stored PAT is the one given'
+  ansible.builtin.set_fact:
+    _runner_github_pat_differs: >-
+      {{ not (_runner_github_pat_stat.stat.exists | default(false))
+         or (_runner_github_pat_stat.stat.checksum | default('')) != (_runner_github_write_pat | string | trim | hash('sha1')) }}
+
+- name: 'Keep the stored PAT root-only'
+  ansible.builtin.file:
+    path: "{{ _runner_github_pat_file }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0600'
+  when: "not (_runner_github_pat_differs | bool)"
+
+- name: 'Write the new PAT beside the stored one'
+  ansible.builtin.command:
+    argv: ['install', '-m', '0600', '-o', 'root', '-g', 'root', '-T', '/dev/stdin', "{{ _runner_github_pat_staging }}"]
+    stdin: "{{ _runner_github_write_pat | string | trim }}"
+    stdin_add_newline: false
+  register: '_runner_github_pat_install'
+  # Only reached when the stored PAT differs, so success is a change.
+  changed_when: "_runner_github_pat_install.rc == 0"
+  no_log: true
+  when: "_runner_github_pat_differs | bool"
+
+- name: 'Swap the new PAT in'
+  ansible.builtin.command:
+    argv: ['mv', '-f', '-T', '--', "{{ _runner_github_pat_staging }}", "{{ _runner_github_pat_file }}"]
+    removes: "{{ _runner_github_pat_staging }}"
+  register: '_runner_github_pat_swap'
+  when: "_runner_github_pat_differs | bool"
+
+- name: 'Note whether the PAT was replaced'
+  ansible.builtin.set_fact:
+    _runner_github_pat_written: "{{ _runner_github_pat_swap is changed }}"
