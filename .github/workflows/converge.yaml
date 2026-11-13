@@ -1,0 +1,245 @@
+---
+# Converges each flavour's playbook onto a disposable GitHub-hosted VM, twice,
+# and fails unless the second converge changes nothing. `make test` renders and
+# parses everything, but it cannot run apt, useradd or systemd: this is the one
+# run that does before someone points the roles at a real host.
+#
+# Disposable is what makes it safe. The roles do their destructive work here
+# exactly as they would on a runner host -- dismantle the rootful Docker the
+# image ships, delete leftover build state, create the runner users -- and the
+# VM is thrown away when the job ends. The units are installed and enabled but
+# never started, because no credential here is real.
+name: 'converge'
+
+on:  # yamllint disable-line rule:truthy
+  pull_request:
+    branches:
+      - 'main'
+  workflow_dispatch:
+
+# A newer push to the same branch makes the converge in flight worthless.
+concurrency:
+  group: "converge-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  converge:
+    name: "converge (${{ matrix.flavor }})"
+    runs-on: 'ubuntu-24.04'
+    timeout-minutes: 45
+    # Declared per JOB rather than at workflow level, as `checks.yaml` does and
+    # for its reason: a workflow-level grant hands the token to every job in the
+    # file, including any future one that only needs to read.
+    permissions:
+      contents: 'read'
+    strategy:
+      # The flavours share the host role and nothing else, so one failing says
+      # nothing about the other: let both finish and report.
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: 'github'
+            playbook: 'playbooks/github.yaml'
+            group: 'github_runners'
+            unit: 'gha-runner'
+            prefix: 'gha'
+          - flavor: 'azure_devops'
+            playbook: 'playbooks/azure_devops.yaml'
+            group: 'azure_devops_agents'
+            unit: 'azp-agent'
+            prefix: 'azp'
+    env:
+      # The newest release whose controller still runs on this image's Python
+      # 3.12; 2.22 needs 3.13. The collection itself requires 2.16 or later.
+      ANSIBLE_CORE_VERSION: '2.21.6'
+      # The idempotency check below reads the recap line, which must not carry
+      # colour codes.
+      ANSIBLE_NOCOLOR: true
+    steps:
+      - name: 'Checkout code'
+        uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
+        with:
+          # Nothing below needs the token after the checkout, and the converge
+          # runs as root on this VM and creates accounts on it. Not persisting
+          # it keeps it out of `.git/config`, where any of them could read it.
+          persist-credentials: false
+
+      # The roles stop every unit named like a legacy runner once its job is
+      # done. On this VM that job would be this one: the converge would wait out
+      # the drain timeout, then stop the runner it is running on. Hosted images
+      # run their runner under no such name; this says so loudly if one ever does.
+      - name: 'Check the VM runs no legacy runner unit'
+        shell: 'bash'
+        run: |
+          legacy=$(systemctl list-units --all --plain --no-legend 'actions.runner.*' 'vsts.agent.*' || true)
+          if [[ -n "$legacy" ]]; then
+            printf '%s\n' "$legacy"
+            echo "::error::this VM runs a unit the roles would treat as a legacy runner and stop"
+            exit 1
+          fi
+
+      - name: 'Install ansible-core'
+        shell: 'bash'
+        run: |
+          # The system Python, not actions/setup-python: the roles' one-time wipe
+          # deletes /opt/hostedtoolcache, which is where setup-python installs,
+          # and the controller would lose its own standard library mid-converge.
+          # A venv keeps pip off the system site-packages without needing root.
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/ansible"
+          "$RUNNER_TEMP/ansible/bin/pip" install --quiet --disable-pip-version-check \
+            "ansible-core==${ANSIBLE_CORE_VERSION}"
+          echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ansible/bin/ansible-playbook" --version
+
+      - name: 'Resolve the collection'
+        shell: 'bash'
+        run: 'make collection'
+
+      # Every variable reaches Ansible through the files this step writes, never
+      # as -e name=value. The values are dummies, but -e would put them in
+      # ansible-playbook's argv, which every account on the box can read through
+      # /proc -- the runner users the converge creates among them -- and this
+      # job is the template for passing real ones. The PAT itself comes from the
+      # environment through the same lookup inventory/example uses.
+      - name: 'Write the inventory'
+        shell: 'bash'
+        env:
+          GROUP: "${{ matrix.group }}"
+        run: |
+          inv="$RUNNER_TEMP/inventory"
+          mkdir -p "$inv/group_vars" "$RUNNER_TEMP/logs"
+          # A bare `-i localhost,` would leave the host in no group, and each
+          # vendor playbook targets only its own.
+          cat > "$inv/hosts.yaml" <<EOF
+          ---
+          runner_hosts:
+            children:
+              ${GROUP}:
+                hosts:
+                  localhost:
+          EOF
+          cat > "$inv/group_vars/runner_hosts.yaml" <<'EOF'
+          ---
+          # The system Python runs the modules: it has the apt bindings the
+          # controller's venv lacks.
+          ansible_python_interpreter: '/usr/bin/python3'
+          runner_host_dedicated: true
+          # Installed and enabled, never started: no credential here is real.
+          runner_start_units: false
+          # Two, not auto: a heavy instance and a regular one, for half the
+          # rootless daemons this VM's four vCPUs would size it to.
+          runner_count: 2
+          # Never the job's own account, which sits in the docker and sudo groups.
+          runner_old_users: []
+          # The guard reboots an idle box between 02:00 and 05:00, and every
+          # runner here is idle: it would reboot the VM under the job.
+          runner_reboot_guard: false
+          EOF
+          # Only the file of the group the host is in applies.
+          cat > "$inv/group_vars/github_runners.yaml" <<'EOF'
+          ---
+          runner_github_org: 'your-org'
+          runner_github_pat: "{{ lookup('ansible.builtin.env', 'RUNNER_GITHUB_PAT', default=undef()) }}"
+          # The PAT is a placeholder the API would reject.
+          runner_github_validate_pat: false
+          # Pinned, so the converge makes no unauthenticated call to the
+          # GitHub API, whose rate limit hosted runners share.
+          runner_github_version: '2.338.2'
+          EOF
+          cat > "$inv/group_vars/azure_devops_agents.yaml" <<'EOF'
+          ---
+          runner_azp_url: 'https://dev.azure.com/your-org'
+          runner_azp_pool: 'your-pool'
+          # No PAT and no agent to adopt: leave the instances unregistered.
+          runner_azp_skip_registration: true
+          # Pinned for the same reason as the runner release above.
+          runner_azp_version: '5.281.1'
+          EOF
+          cat "$inv/hosts.yaml"
+
+      - name: 'Converge'
+        shell: 'bash'
+        env:
+          PLAYBOOK: "${{ matrix.playbook }}"
+          RUNNER_GITHUB_PAT: 'fixture-token-placeholder'
+        run: |
+          ansible-playbook -c local -i "$RUNNER_TEMP/inventory/hosts.yaml" "$PLAYBOOK" 2>&1 \
+            | tee "$RUNNER_TEMP/logs/converge-1.log"
+
+      - name: 'Converge again: nothing may change'
+        shell: 'bash'
+        env:
+          PLAYBOOK: "${{ matrix.playbook }}"
+          RUNNER_GITHUB_PAT: 'fixture-token-placeholder'
+        run: |
+          ansible-playbook -c local -i "$RUNNER_TEMP/inventory/hosts.yaml" "$PLAYBOOK" 2>&1 \
+            | tee "$RUNNER_TEMP/logs/converge-2.log"
+          # A second converge that changes something is a bug: some task writes
+          # without comparing first, and every real converge would repeat that
+          # work, restarting idle runners for nothing among it.
+          recap=$(grep -E '^localhost +: ' "$RUNNER_TEMP/logs/converge-2.log" | tail -n 1 || true)
+          echo "recap: ${recap:-none}"
+          if ! grep -qE ' changed=0 +unreachable=0 +failed=0 ' <<<"$recap"; then
+            echo "::error::the second converge was not a no-op: ${recap:-no recap line}"
+            exit 1
+          fi
+
+      - name: 'Verify the installed units'
+        shell: 'bash'
+        env:
+          UNIT: "${{ matrix.unit }}"
+          PREFIX: "${{ matrix.prefix }}"
+        run: |
+          shopt -s nullglob
+          sd=/etc/systemd/system
+          units=("$sd/${UNIT}@.service" "$sd/${PREFIX}.slice" "$sd/system.slice"
+                 "$sd/${PREFIX}"-*.service "$sd/${PREFIX}"-*.timer)
+          # Each instance as systemd loads it: the template plus its drop-ins.
+          for d in "$sd/${UNIT}"@[0-9]*.service.d; do
+            d=${d##*/}; units+=("$sd/${d%.d}")
+          done
+          # The rootless containers' slices, which carry their own drop-in.
+          for f in "$sd"/user-*.slice.d/10-"${PREFIX}"-limits.conf; do
+            d=${f%/*}; d=${d##*/}; units+=("$sd/${d%.d}")
+          done
+          # The service glob above also matches the template.
+          mapfile -t units < <(printf '%s\n' "${units[@]}" | sort -u)
+          printf 'verifying %s\n' "${units[@]}"
+          # As root, because verify checks that every command a unit runs is
+          # executable by whoever asks, and the vendor helpers are 0700 root.
+          # --recursive-errors=no lets only these units decide the exit status,
+          # not the system units they pull in; the grep also catches a warning
+          # in ours that verify prints without failing.
+          rc=0
+          out=$(sudo systemd-analyze verify --man=no --recursive-errors=no "${units[@]}" 2>&1) || rc=$?
+          printf '%s\n' "$out" | tee "$RUNNER_TEMP/logs/systemd-analyze-verify.log"
+          if (( rc != 0 )) || grep -qE "${PREFIX}[.@-]" <<<"$out"; then
+            echo "::error::systemd-analyze verify found a problem in the installed units"
+            exit 1
+          fi
+
+      - name: 'Collect the logs'
+        if: "${{ failure() }}"
+        shell: 'bash'
+        env:
+          UNIT: "${{ matrix.unit }}"
+          PREFIX: "${{ matrix.prefix }}"
+        run: |
+          logs="$RUNNER_TEMP/logs"
+          mkdir -p "$logs/etc"
+          sudo journalctl --no-pager -o short-iso -u "${UNIT}@*" -u "${PREFIX}-*" > "$logs/journal-units.log" 2>&1 || true
+          sudo journalctl --no-pager -o short-iso -b -n 3000 > "$logs/journal.log" 2>&1 || true
+          sudo systemctl list-units --all --no-pager "${UNIT}@*" "${PREFIX}-*" "${PREFIX}.slice" > "$logs/units.txt" 2>&1 || true
+          # Unit files and host.env hold no secret. The vendor configuration
+          # directories are left out on purpose: they are where a PAT would live.
+          sudo cp -r /etc/systemd/system/"${UNIT}"@* /etc/systemd/system/"${PREFIX}".slice \
+            /etc/runner-hardening "$logs/etc/" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$logs"
+
+      - name: 'Upload the logs'
+        if: "${{ failure() }}"
+        uses: 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9' # v7.0.2
+        with:
+          name: "converge-${{ matrix.flavor }}-logs"
+          path: "${{ runner.temp }}/logs"
+          if-no-files-found: 'ignore'

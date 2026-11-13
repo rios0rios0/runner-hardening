@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added the `converge` workflow, which converges both playbooks twice on a disposable GitHub-hosted VM and fails unless the second run changes nothing'
+time: '2026-11-13T02:30:18.972965555Z'
