@@ -194,6 +194,22 @@
       {{ (ansible_facts['services'] | default({}) | list)
          + (['docker.socket'] if 'docker.service' in (ansible_facts['services'] | default({})) else []) }}
 
+# A stopped socket unit leaves its file behind (RemoveOnStop defaults to no),
+# so the old daemon's /run/docker.sock, root:docker, outlives the dismantle. It
+# answers nothing, but "no root-owned Docker socket on the box" is the claim,
+# and a job probing for one should find none. /run is a tmpfs: a reboot clears
+# it as well; this clears it now.
+- name: 'Remove the socket file the rootful daemon left behind'
+  ansible.builtin.file:
+    path: "{{ _runner_host_root_socket }}"
+    state: 'absent'
+  loop: ['/run/docker.sock', '/var/run/docker.sock']
+  loop_control:
+    loop_var: '_runner_host_root_socket'
+  when:
+    - "runner_dismantle_rootful_docker | bool"
+    - "not ansible_check_mode"
+
 # Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor, which breaks
 # rootlesskit. Relaxing it is a genuine (small) reduction in 24.04's default
 # posture; the alternative is a per-binary AppArmor profile.
