@@ -10,9 +10,10 @@ runner_azp_pool: 'your-pool'
 #                                    # needs no API call; fresh installs only
 
 # A PAT with the Agent Pools (Read & manage) scope. Only registering a new agent
-# or removing one needs it, and it is never stored on the box: the role hands it
-# to the agent's own configuration through a root-only file that is deleted
-# straight after. Adopted agents and re-deploys need none, so leave it unset:
+# or removing one needs it, and it is never stored on the box: the role writes
+# it to a root-only file, deleted straight after, for config.sh to read as root
+# in a pristine unpack no job can write. Adopted agents and re-deploys need
+# none, so leave it unset:
 #   read -rs RUNNER_AZP_PAT && export RUNNER_AZP_PAT
 runner_azp_pat: "{{ lookup('ansible.builtin.env', 'RUNNER_AZP_PAT', default=undef()) }}"
 # Or from 1Password, with community.general and a signed-in `op` CLI:

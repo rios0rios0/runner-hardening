@@ -37,7 +37,7 @@ by its own instructions is the same arrangement. This project replaces it:
 ## Features
 
 - **Rootless Docker per runner** — `container:` jobs and `docker build` both keep working, with no root-owned socket for a job to reach.
-- **One job per runner, then a fresh start** — a GitHub runner gets a single-use JIT registration, minted by a root-only helper at every start, so no credential and no workspace survives a job; an Azure Pipelines agent runs with `--once`.
+- **One job per runner, then a fresh start** — a GitHub runner gets a single-use JIT registration, minted by a root-only helper at every start and handed to the runner in its environment, never on a command line, so no credential and no workspace survives a job; an Azure Pipelines agent runs with `--once`.
 - **Hardened systemd units** — dedicated user, read-only filesystem outside `ReadWritePaths`, no capabilities, no new privileges, private `/tmp`, and job temp files (`TMPDIR`) in a private `/var/tmp` on disk, not the RAM-backed `/tmp` every runner on the box would otherwise share.
 - **Capacity-aware resource policy** — a lone job may use the whole machine, while an aggregate slice ceiling stops the runners together from exhausting the host and keeps any OOM kill inside CI.
 - **Heavy jobs kept apart** — the first runner on each box also takes jobs the size of a CodeQL analysis (GitHub label `heavy`, Azure Pipelines capability `heavy`), and every job sees a `CODEQL_RAM` sized from the box, so two analyses never pile onto one machine.
@@ -74,7 +74,7 @@ by its own instructions is the same arrangement. This project replaces it:
 
 **On each runner host**
 
-- Ubuntu on `x86_64` <!-- TODO(lead): list the releases the roles have been exercised on. The converge workflow covers `24.04`; the shell installer was tested on `22.04`, `24.04` and `26.04`. -->
+- Ubuntu on `x86_64`: the roles are exercised on `24.04` (the converge workflow, on every pull request) and `26.04` (a live fleet converged from the shell installer); the shell installer before them was also tested on `22.04`
 - kernel `5.11` or later and cgroup v2 — both needed for rootless overlayfs
 - Python 3, which every Ubuntu release ships
 - a machine that does nothing but CI: the roles refuse to run until `runner_host_dedicated: true` says so
@@ -141,8 +141,9 @@ qualified names a consumer uses. The repository's `ansible.cfg` points
 ```bash
 cp -r inventory/example inventory/local   # then edit it: hosts, organisation, labels
 read -rs RUNNER_GITHUB_PAT && export RUNNER_GITHUB_PAT
-ansible-playbook playbooks/github.yaml --limit build-01   # one host first
-ansible-playbook playbooks/github.yaml                    # then the rest
+ansible-playbook playbooks/github.yaml --limit build-01 --check --diff   # what it would do, changing nothing
+ansible-playbook playbooks/github.yaml --limit build-01                  # one host first
+ansible-playbook playbooks/github.yaml                                   # then the rest
 ansible-playbook playbooks/verify.yaml
 ```
 
@@ -179,7 +180,7 @@ shows each one in place.
 | `runner_heavy_runners`            | `1`                          | how many runners, from runner 1, also take heavy jobs; `0` for none — see [Memory](#memory) |
 | `runner_codeql_ram`               | `auto`                       | the `CODEQL_RAM`, in MB, every job sees: `auto` sizes it from the box, `off` leaves CodeQL to size itself |
 | `runner_slice_ceiling`            | `none`                       | which runners may grow to the whole slice budget instead of the usual per-runner ceiling: `none`, `heavy` or `all` — see [Memory](#memory) |
-| `runner_old_users`                | `[]`                         | over-privileged accounts to de-privilege, named explicitly: the converge reports the candidates it finds and touches only the accounts listed here. Each is removed from `sudo`, `docker`, `lxd` and the other root-equivalent groups, locked, its processes killed and its caches cleared; its home is left for you to delete |
+| `runner_old_users`                | `[]`                         | over-privileged accounts to de-privilege, named explicitly: the converge reports the candidates it finds and touches only the accounts listed here. Each is removed from `sudo`, `docker`, `lxd` and the other root-equivalent groups, locked, its processes killed, and its caches cleared as that account, never as root; its home is left for you to delete. A listed account that is protected is left alone, and the summary names it beside the accounts it did de-privilege |
 | `runner_force_deprivilege`        | `false`                      | de-privilege an account the role protects — uid 1000, a `NOPASSWD` sudoer, an `authorized_keys` owner, an active session. Read the warning first |
 | `runner_drain_timeout`            | `1800`                       | seconds a drain lets running jobs finish before it stops their runners anyway |
 | `runner_extra_packages`           | `[]`                         | apt packages your jobs need on top of the base list |
@@ -253,7 +254,7 @@ replaced only when its pinned `sha256` changes.
 | `runner_azp_pool`              | (required)                      | the agent pool |
 | `runner_azp_agent_name`        | `{{ ansible_facts['hostname'] }}-{{ n }}` | a new agent's name, templated with its instance number `n`; an adopted agent keeps the name it was registered with |
 | `runner_azp_pat`               | (none)                          | a PAT with Agent Pools (Read & manage), only to register a new agent or remove one; never stored. Undefined or empty means none |
-| `runner_azp_version`           | `latest`                        | the agent release fresh installs download, or a pinned one such as `4.264.2`, which needs no API call. Installed and adopted agents update themselves from the pool |
+| `runner_azp_version`           | `latest`                        | the agent release fresh installs download. `latest` asks GitHub's releases API and checks the package against the SHA-256 in that release's notes; a pinned one such as `4.264.2` asks nothing (that API allows 60 unauthenticated calls an hour per address), builds the documented download URL, and is checked by unpacking it. Installed and adopted agents update themselves from the pool |
 | `runner_azp_adopt`             | `{}`                            | `{n: '/path/to/agent'}`: an already-registered agent to adopt as instance `n`. Keys are read as integers, so `1:` and `'1':` both work; naming one instance both ways is refused |
 | `runner_azp_adopt_keep_work`   | `false`                         | keep an adopted agent's `_work`, which the over-privileged account it ran as wrote |
 | `runner_azp_adopt_home`        | (none)                          | the home of the account the adopted agents ran as. An adopted agent's `.env` values that point into it are dropped, and `runner_home_seed` can name what each new agent user starts with from it |
@@ -338,12 +339,15 @@ Two other sources work as well:
   reads the token from stdin, never from an argument, and prints a block to
   paste in place of the lookup. Run the playbooks with `--ask-vault-pass`.
 
-On its way to a host, a token travels only as the content of a root-only file
-written by a task with `no_log: true`, or as the header of a `no_log` API call.
-It is never a command argument, and never an `environment:` value, which Ansible
-renders onto the remote command line. Keep **pipelining** on, so that a module
-and its arguments reach the target over the SSH session's stdin rather than
-through a temporary file there:
+On its way to a host, a token travels only inside a `no_log` task: as the
+stdin of an `install … /dev/stdin` that writes its root-only file — so no
+temporary copy of it lands in `~/.ansible/tmp`, as one would through `copy` —
+or as the header of an API call. The GitHub PAT goes to a staging file that is
+then renamed over the stored one, so a runner starting meanwhile never reads
+half a token. A token is never a command argument, and never an `environment:`
+value, which Ansible renders onto the remote command line. Keep **pipelining**
+on, so that a module and its arguments reach the target over the SSH session's
+stdin rather than through a temporary file there:
 
 ```ini
 # ansible.cfg, in the project that runs the playbooks
@@ -378,6 +382,11 @@ ansible-playbook playbooks/drain.yaml --limit build-01 -e '{"runner_drain_instan
 ansible-playbook playbooks/uninstall.yaml --limit build-01 -e runner_uninstall_confirm=true
 ```
 
+`--check --diff` completes on any host, one with no runner users yet included,
+and changes nothing. Its diff leaves out the files the roles write into a tree
+a job can write: computing it would have root read a file a job may have
+replaced with a link to anything root can read.
+
 Both vendor playbooks converge one host at a time and stop at the first one
 that fails, so the rest of the fleet keeps taking jobs while a host drains for
 a new release or adopts its agents. `serial` is read before any host is chosen,
@@ -399,8 +408,9 @@ units and timers, `/etc/runner-hardening`, `/usr/local/lib/runner-hardening`,
 `/usr/local/sbin` and the extra binaries. It leaves three things in place, and
 says so: the vendor configuration directory (on a GitHub host,
 `/etc/github-runner`, which holds the admin PAT), `/var/lib/runner-hardening`
-with the sudoers drop-ins de-privileging moved aside, and `/swapfile`. It does
-not remove Azure Pipelines agents from their pool: delete them there.
+with the sudoers drop-ins de-privileging moved aside (the rootless-unit
+snapshots in it go), and `/swapfile`. It does not remove Azure Pipelines agents
+from their pool: delete them there.
 
 A rotation restarts no runner: `gha-jitconfig` reads the stored PAT at every
 start, and every runner starts again after each job, so the new token is in use
@@ -413,13 +423,16 @@ says, and a second one changes nothing. Edit `runner_github_labels` or
 runners above the new count completely (unit, user, home and tool cache), so
 they neither return at the next boot nor keep their disk.
 
-A configuration change never waits on a drain and never kills a job. An
-ephemeral runner restarts after every job anyway, so an idle one is restarted
-on the new definition at once, and a busy one picks it up when its job ends.
-Only a new runner release replaces a runner's tree: the role stages the new one
-beside it, drains only the runners being replaced — each finishes the job it is
-on, bounded by `runner_drain_timeout` — renames it into place, and puts the
-runners back if anything fails.
+A configuration change never kills a job. An ephemeral runner restarts after
+every job anyway, so an idle one is restarted on the new definition at once,
+and a busy one picks it up when its job ends. Two changes cannot wait for that,
+so they drain the runners they touch first — each finishes the job it is on,
+bounded by `runner_drain_timeout` — and put them back if anything fails:
+
+- a lower `MemoryMax` or `MemoryLow` for a runner, because systemd applies
+  cgroup limits to a running unit the moment it reloads, under the job;
+- a new runner release, which replaces the runner's tree: the new one is
+  staged beside it and renamed into place.
 
 ## Using the runners
 
@@ -485,10 +498,12 @@ Both timers are installed and enabled by the converge:
 | `gha-janitor.timer` | daily          | trims Docker images once the filesystem holding the runners' homes passes `runner_disk_soft_pct`, and prunes them in full past `runner_disk_hard_pct`; on a GitHub host it also reaps orphan registrations and checks when the admin PAT expires, pointing at `playbooks/rotate_github_pat.yaml` when it must be replaced |
 | `gha-reboot.timer`  | 02:00–05:00    | applies a pending reboot **only** when no runner on the host is executing a job (`runner_reboot_guard`) |
 
-The reboot guard asks the box, not the CI service: a runner is busy while its
-job's worker process runs, and the guard looks twice, two seconds apart, so a
-job handed out an instant earlier is not missed. It needs no PAT, and works the
-same on both flavours.
+The reboot guard asks the box, not the CI service. A runner is busy while a
+job's worker process runs inside its unit's own cgroup; a process of the same
+user anywhere else does not count. The guard looks twice, two seconds apart, so
+a job handed out an instant earlier is not missed. It needs no PAT, and works
+the same on both flavours, as the drain and `restart-idle`, which use the same
+test, do.
 
 ```bash
 journalctl -fu 'gha-runner@*'           # watch the runners
@@ -507,18 +522,22 @@ answers every question:
 | `verify`           | post-flight checks; exits non-zero on any failure |
 | `diagnose`         | everything needed to work out why a runner will not stay up |
 | `audit`            | reports the persistence surfaces a root-capable job could have used; changes nothing |
-| `reap`             | deletes leaked offline registrations (GitHub) |
+| `reap`             | deletes this host's leaked offline registrations (GitHub) |
 | `sandbox-probe`    | which systemd directive breaks a job? |
 | `sandbox-relax`    | clears the seccomp filter |
 | `sandbox-off`      | strips the sandbox, to diagnose |
 | `drain [n…]`       | lets runners finish their jobs, bounded by `runner_drain_timeout`, then keeps them stopped; every instance when no number is given |
 | `undrain [n…]`     | puts drained runners back; every drained one when no number is given |
 | `restart-idle`     | restarts every runner that is not running a job |
-| `busy <n>`         | exits 0 while runner `n` is running a job |
+| `busy <n>`         | exits 0 while a job's worker runs in runner `n`'s unit |
 | `instances`        | prints the instance numbers that exist |
 
 The next converge puts the sandbox back: it removes the drop-ins
 `sandbox-relax` and `sandbox-off` write.
+
+`reap` and `verify` recognise this host's registrations by name, exactly or by
+the `<host>-` prefix its runners are named with, and leave alone any minted in
+the last 5 minutes: a runner that has just registered is not a leak.
 
 ### Restarts
 
@@ -576,7 +595,10 @@ keep them apart:
   runner can be reclaimed or OOM-killed sooner.
 
 Like every variable, they take effect at the next converge: idle runners pick
-the new policy up at once, busy ones after their job.
+the new policy up at once, busy ones after their job. A converge that lowers a
+runner's `MemoryMax` or `MemoryLow` drains that runner first, because systemd
+applies a unit's new cgroup limits the moment it reloads, under whatever job
+the runner is running.
 
 When the kernel does kill a job's process, only that process dies: the step
 fails as killed (exit code 137) and the job ends as a failure. systemd's
@@ -629,8 +651,14 @@ the link that enables it, and its data root, which is emptied through Docker
 rather than deleted under a running daemon — plus whatever
 `runner_home_keep_extra` and `runner_home_seed` name. Under `untrusted` those
 paths survive every reset, so the converge warns when either is set there.
-Every deletion runs as the runner's own user, never as root, so a symlink a job
-plants in its home cannot make the guard delete anything the job could not.
+The daemon's user unit survives too, and a job can rewrite it, so on its first
+run the guard keeps a root-owned copy of each runner's,
+`/var/lib/runner-hardening/rootless/<user>.docker.service`; before every
+untrusted job it puts that copy back and restarts the runner's Docker daemon,
+which costs about one to three seconds a job. Every deletion runs as the
+runner's own user, never as root, so a symlink a job plants in its home cannot
+make the guard delete anything the job could not, and root never reads a file
+under a runner's home or tree through a link.
 `verify` warns past `runner_disk_soft_pct` and fails past
 `runner_disk_hard_pct`, on the disks that hold these caches and on the one that
 holds the jobs' temp files (`/var/tmp`). A separate `/var` has no cache for the
@@ -671,7 +699,11 @@ agent keeps its own binaries and updates itself from the pool, as it did before.
 Two things must hold for an adoption: the agent's `.agent` names a relative
 `workFolder` (the default `_work`), so the work directory moves with it; and
 `runner_count` is a number that covers every key of `runner_azp_adopt`, not
-`auto`, while any adoption is pending.
+`auto`, while any adoption is pending. The converge refuses to move a
+directory that is an account's home, one that holds an `.ssh`, or one every
+account can write. Once it has adopted an agent, it records the agent's pool
+and agent ids root-side, in `/var/lib/runner-hardening/azp/<n>.json`, for a
+later removal to go by.
 
 To carry over what the old account installed for its jobs, name it in
 `runner_azp_adopt_home` and the paths in `runner_home_seed`, which copies them
@@ -692,26 +724,32 @@ survives every home reset, and `~/.local/bin` is first on every agent's
 ### Registering new agents
 
 An instance with no agent to adopt is registered fresh, which needs
-`runner_azp_pat`. The PAT never becomes an argument and is never stored: the
-role writes it to a root-only `/run/azp-register.pat`, and `azp-register` reads
-it into `VSTS_AGENT_INPUT_TOKEN` — the variable the agent's `config.sh` takes
-its token from — then drops to the agent's user and runs
-`config.sh --unattended --auth pat --replace` with the URL, pool and agent name,
-never `--token`. The file is removed whether the registration succeeds or not.
-With neither an agent to adopt nor a PAT, the converge stops and says which of
-the two to supply.
+`runner_azp_pat`. The PAT never becomes an argument, is never stored, and never
+reaches code a job can write. The role writes it, through stdin, to a
+root-only `/run/azp-register.pat`, and `azp-register` reads it into
+`VSTS_AGENT_INPUT_TOKEN` — the variable the agent's `config.sh` takes its
+token from — and runs `config.sh --unattended --auth pat --replace` with the
+URL, pool and agent name, never `--token`. It runs it as root
+(`AGENT_ALLOW_RUNASROOT=1`), in a pristine, root-owned unpack of the verified
+package rather than in the instance's own tree, which a job can rewrite. Only
+then is the new tree handed to `azp<n>` and swapped into place, so a
+registration replaces the instance's whole tree, its `_work` aside. The agent's
+pool and agent ids are recorded root-side, in
+`/var/lib/runner-hardening/azp/<n>.json`, and the PAT file is removed whether
+the registration succeeds or not. With neither an agent to adopt nor a PAT, the
+converge stops and says which of the two to supply.
 
-Two consequences to know. `--replace` takes over an agent of the same name
-already in the pool, so keep `runner_azp_agent_name` unique across hosts, as
-the default, which carries the host name, is. And while `config.sh` runs, the
-PAT sits in its environment, which a process already running as that agent's
-user could read; registration therefore happens before the agent's unit
-starts.
+`--replace` takes over an agent of the same name already in the pool, so keep
+`runner_azp_agent_name` unique across hosts, as the default, which carries the
+host name, is.
 
 Fresh installs download the release `runner_azp_version` names, the latest by
-default; a pinned release needs no API call. Lowering `runner_count` removes the instances above it from the box;
-given a PAT it also removes their registrations from the pool, and without one
-they stay there, offline, until you delete them.
+default. Lowering `runner_count` removes the instances above it from the box.
+Given a PAT, it also deletes their registrations from the pool, through the
+REST API, by the pool and agent ids recorded at registration or adoption. An
+agent registered before that record existed is left in the pool, with a
+warning saying so, as is every agent when no PAT is given: delete those in the
+pool yourself.
 
 ### One job per agent process
 
@@ -815,7 +853,10 @@ Then move the fleet over in check mode first, one host at a time:
    A change to `/etc/github-runner/env` is an answer your inventory disagrees
    with: fix the inventory until only the expected changes remain — the wrapper
    moving, and the new files.
-   <!-- TODO(lead): confirm the roles support check mode on a host the installer set up. -->
+   Check mode is supported on such a host: on a box the shell installer set up,
+   expect about thirty changes. Those are the new runtime files, the unit and its drop-ins, the trees'
+   `0750` mode and release markers, the update settings, and the one-time wipe's
+   marker. Expect no drain unless a runner's memory limit would drop.
 3. Converge that host, run `ansible-playbook playbooks/verify.yaml --limit build-01`,
    and watch a job run on it. A busy runner finishes its job first and picks the
    new definition up on its own restart, so the move costs no builds.

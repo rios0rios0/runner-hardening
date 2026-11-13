@@ -106,15 +106,15 @@ those read. The table names each script by its installed path; `<sbin>` is
 
 | Installed as                                             | Source                                         | Role |
 |----------------------------------------------------------|------------------------------------------------|------|
-| `/usr/local/lib/runner-hardening/lib.sh`                 | `roles/runner_host/files/lib.sh`               | sourced by every runtime script: the shared functions, among them `load_host_env`, `runner_trusted`, `runner_user`, `runner_dir`, `unit_of`, `runner_busy`, `existing_instances`, `as_runner`, `restart_backoff_delay`, `cycle_ran_a_job`, `runner_state_between_jobs`, `log`/`ok`/`warn`/`err` |
+| `/usr/local/lib/runner-hardening/lib.sh`                 | `roles/runner_host/files/lib.sh`               | sourced by every runtime script: the shared functions, among them `load_host_env`, `runner_trusted`, `read_untrusted`, `runner_user`, `runner_dir`, `unit_of`, `runner_busy`, `existing_instances`, `as_runner`, `restart_backoff_delay`, `cycle_ran_a_job`, `runner_state_between_jobs`, `log`/`ok`/`warn`/`err` |
 | `/usr/local/lib/runner-hardening/vendor.sh`              | `roles/runner_github/files/vendor.sh`, `roles/runner_azure_devops/files/vendor.sh` | optional hooks, called only when `declare -F` finds them: `vendor_verify`, `vendor_diagnose`, `vendor_reap`, `vendor_janitor` (GitHub: orphan reap, PAT expiry), `vendor_registered` |
 | `/usr/local/sbin/<sbin>-diskguard`                       | `roles/runner_host/files/runner-diskguard.sh`  | root-only; before each job, frees that runner's caches under disk pressure, or resets it in full when `trust=untrusted` |
 | `/usr/local/sbin/<sbin>-janitor` + timer                 | `roles/runner_host/files/runner-janitor.sh`    | daily Docker trim, measured on the homes' filesystem, and health check, then `vendor_janitor` |
-| `/usr/local/sbin/<sbin>-reboot-if-idle` + timer          | `roles/runner_host/files/runner-reboot-if-idle.sh` | reboots only 02:00–05:00, and only when no runner is busy: no local worker process, at two looks 2 s apart. No PAT, so the same on both flavours |
+| `/usr/local/sbin/<sbin>-reboot-if-idle` + timer          | `roles/runner_host/files/runner-reboot-if-idle.sh` | reboots only 02:00–05:00, and only when no runner is busy (`runner_busy`: no worker in any runner unit's cgroup), at two looks 2 s apart. No PAT, so the same on both flavours |
 | `/usr/local/sbin/<sbin>-admin`                           | `roles/runner_host/files/runner-admin.sh`      | the on-box modes: `verify`, `diagnose`, `audit`, `reap`, `sandbox-probe`/`-relax`/`-off`, `drain [n…]`, `undrain [n…]`, `restart-idle`, `busy <n>`, `instances`; the global `--yes` answers every question |
 | `/usr/local/sbin/gha-jitconfig`, `gha-jitreap`           | `roles/runner_github/files/gha-jitconfig.sh`, `gha-jitreap.sh` | root-only; wait out any backoff and mint one single-use JIT config, adding `heavy` for runners 1..`GHA_HEAVY_RUNNERS`; count job-less cycles and delete the registration |
-| `/usr/local/libexec/runner-hardening/gha-run-ephemeral`  | `roles/runner_github/files/gha-run-ephemeral.sh` | `0755` root, outside the tree a job can write; runs exactly one job, then cleans up |
-| `/usr/local/sbin/azp-cycle`, `azp-register`              | `roles/runner_azure_devops/files/azp-cycle.sh`, `azp-register.sh` | root-only; the backoff before a cycle and the job-less count after it; registration through `VSTS_AGENT_INPUT_TOKEN` |
+| `/usr/local/libexec/runner-hardening/gha-run-ephemeral`  | `roles/runner_github/files/gha-run-ephemeral.sh` | `0755` root, outside the tree a job can write; hands `run.sh` the JIT config in `ACTIONS_RUNNER_INPUT_JITCONFIG`, never on its command line, runs exactly one job, and on a stop waits for `run.sh` to finish before it cleans up |
+| `/usr/local/sbin/azp-cycle`, `azp-register`              | `roles/runner_azure_devops/files/azp-cycle.sh`, `azp-register.sh` | root-only; the backoff before a cycle and the job-less count after it; registration as root (`AGENT_ALLOW_RUNASROOT=1`) in a pristine, root-owned unpack, the PAT in `VSTS_AGENT_INPUT_TOKEN`, then the tree handed to `azp<n>`; removal through the REST API by the ids in `/var/lib/runner-hardening/azp/<n>.json` |
 | `/usr/local/libexec/runner-hardening/azp-run-once`       | `roles/runner_azure_devops/files/azp-run-once.sh` | `./run.sh --once` as the agent user |
 | `/etc/systemd/system/<unit>@.service`                    | `roles/runner_host/templates/runner@.service.j2` | the hardened unit template |
 | `/etc/systemd/system/<slice>`, `system.slice.d/10-<sbin>-protect.conf`, `user-<uid>.slice.d/10-<sbin>-limits.conf` | `roles/runner_host/templates/runner.slice.j2`, `protect.conf.j2`, `user-slice.conf.j2` | the aggregate boundary, the OS floor, the rootless containers' limits |
@@ -132,8 +132,8 @@ systemd starts gha-runner@N
       writes a single-use JIT config to /run/gha-runner/N.jit
   → ExecStart=/usr/local/libexec/runner-hardening/gha-run-ephemeral N
                                                     (runner user; a root-owned script outside the job-writable
-                                                     tree; reads the .jit, wipes _work,
-                                                     ./run.sh --jitconfig "$JIT" -- exits after ONE job)
+                                                     tree; reads the .jit, wipes _work, exports it as
+                                                     ACTIONS_RUNNER_INPUT_JITCONFIG, ./run.sh -- exits after ONE job)
   → ExecStopPost=+/usr/local/sbin/gha-jitreap N      (root; counts a job-less cycle unless the stop was
                                                      requested, then removes the registration)
   → Restart=always  → back to the top with a fresh registration and a fresh workspace
@@ -153,11 +153,15 @@ systemd starts azp-agent@N
 Every security claim in the README rests on this chain. A change that lets
 `run.sh` survive a second job, or that lets a wrapper `exec` (which discards
 `gha-run-ephemeral`'s EXIT trap and skips its cleanup), silently turns these
-back into long-lived runners. The wrapper lives root-owned outside the tree a
-job can write, so a job cannot edit it, but it runs as the job's user, so a job
-can kill it before its trap fires: its cleanup is housekeeping, and the reset
-the root `ExecStartPre` runs with `trust=untrusted` is what isolates one job
-from the next. `StartLimitIntervalSec=0`, `RestartSec=1`,
+back into long-lived runners. The JIT config reaches `run.sh` in
+`ACTIONS_RUNNER_INPUT_JITCONFIG`, exported inside the wrapper, never as an
+argument: the listener reads it and removes it from its own environment
+(`actions/runner`'s `CommandSettings.cs`). On a stop the wrapper forwards
+`SIGTERM` and waits for `run.sh` to finish before its cleanup runs. It lives
+root-owned outside the tree a job can write, so a job cannot edit it, but it
+runs as the job's user, so a job can kill it before its trap fires: its cleanup
+is housekeeping, and the reset the root `ExecStartPre` runs with
+`trust=untrusted` is what isolates one job from the next. `StartLimitIntervalSec=0`, `RestartSec=1`,
 `OOMPolicy=continue` and the absence of `RestartSteps`/`RestartMaxDelaySec`
 are deliberate (the unit template says why beside each). The restart backoff
 is keyed on cycles that ran no job — a `_diag/Worker_*.log` newer than the
@@ -183,6 +187,8 @@ run-helper sets to 0 even on a terminated error.
 | `/run/gha-runner/<n>.fails`, `/run/azp-agent/<n>.fails` | cycles in a row that ran no job — drives the restart backoff; tmpfs |
 | `/run/azp-agent/<n>.start`              | written as a cycle starts; the job-less check measures against it |
 | `/run/azp-register.pat`                 | a registration's PAT, root-only, for the length of one task        |
+| `/var/lib/runner-hardening/rootless/<user>.docker.service` | the disk guard's root-owned copy of a runner's rootless user unit, taken on its first run and put back before every untrusted job |
+| `/var/lib/runner-hardening/azp/<n>.json` | the pool and agent ids recorded at registration or adoption, which a removal goes by |
 | `/var/tmp/systemd-private-*-<unit>@<n>.service-*/tmp` | the job's `TMPDIR` (`/var/tmp` inside the unit): private, on disk, removed at every stop |
 | `/var/lib/runner-hardening/`            | role state, which `uninstall` leaves in place: `wiped`, which keeps the one-time wipe from ever running twice; `no-swap`, which records that this host could not take a swapfile, so later converges stop retrying (delete it to retry); and the sudoers drop-ins de-privileging disabled (`<file>.disabled-<stamp>`) |
 
@@ -226,15 +232,21 @@ run-helper sets to 0 even on a terminated error.
   - never pass one as `-e name=value` (a vars file given as `-e @file` puts
     only its path in argv); the README and the converge workflow show the
     lookup that replaces it;
-  - a secret reaches a box only as `ansible.builtin.copy` `content:` into a
-    root-only file with `no_log: true`, or as `ansible.builtin.uri` `headers:`
-    with `no_log: true`. `ansible.cfg` turns on pipelining, so module arguments
-    travel on stdin.
+  - a secret reaches a box only inside a `no_log: true` task: as the `stdin` of
+    an `install … /dev/stdin` command that writes its root-only file (unlike
+    `copy` `content:`, this leaves no temporary copy in `~/.ansible/tmp`), or
+    as `ansible.builtin.uri` `headers:`. A secret that must replace one in use
+    goes to a staging file renamed over it, as the GitHub PAT does, so a runner
+    starting meanwhile never reads half of it. `ansible.cfg` turns on
+    pipelining, so module arguments travel on stdin.
 
   In scripts, read a secret from its root-only file, pass it to `curl` with
   `-H @file` rather than `-H "Authorization: Bearer ..."`, and hand it to a
   child through a variable exported inside the script (as `azp-register` does
-  with `VSTS_AGENT_INPUT_TOKEN`), never `env VAR=secret cmd`. Do not "simplify"
+  with `VSTS_AGENT_INPUT_TOKEN`, and `gha-run-ephemeral` with
+  `ACTIONS_RUNNER_INPUT_JITCONFIG`), never `env VAR=secret cmd`. A secret never
+  reaches code a job can write: `azp-register` runs `config.sh` as root in a
+  pristine, root-owned unpack, never in the agent's own tree. Do not "simplify"
   any of these. `curl -K -` is not a substitute: its unquoted value form drops a
   malformed header silently, which sends the request unauthenticated instead of
   failing.
@@ -261,26 +273,46 @@ run-helper sets to 0 even on a terminated error.
   habit of taking a lone detected account on its own is gone, and a guess here
   locks an account out and kills its processes. The protections (uid 1000, a
   `NOPASSWD` sudoer, an `authorized_keys` owner, an active session) still apply
-  to a listed account unless `runner_force_deprivilege` overrides them.
+  to a listed account unless `runner_force_deprivilege` overrides them, and the
+  summary lists only the accounts actually de-privileged, naming the protected
+  ones it left alone. An account's caches are cleared as that account, never as
+  root, for the disk guard's reason: what a deletion can reach through a planted
+  link stays what the account could delete itself.
 - **Trust fails safe.** `runner_trusted` in `lib.sh` is true only when
   `host.env` says exactly `internal`; anything else — the key missing,
   misspelt, empty — gets the full reset before every job. Keep every trust
   check that way round: the opposite mistake hands one fork PR's state to the
   next job.
-- **A configuration change never waits on a drain or kills a job.** The
-  `Restart idle runners` handler restarts only idle instances
-  (`<sbin>-admin restart-idle`); a busy one picks up the new definition on the
-  restart that follows its job anyway. A runner tree is replaced only when its
-  version changes, and only after `<sbin>-admin drain <n>`, inside a `block`
-  whose `rescue` runs `undrain`. That `rescue` replaces the installer's EXIT
-  trap, and like it, keeps a failed converge from leaving the box out of the
-  pool.
+- **A configuration change never kills a job.** The `Restart idle runners`
+  handler restarts only idle instances (`<sbin>-admin restart-idle`); a busy
+  one picks up the new definition on the restart that follows its job anyway.
+  Two changes drain the runners they touch first, inside a `block` whose
+  `rescue` runs `undrain`: a lower `MemoryMax` or `MemoryLow`, because a
+  daemon-reload applies cgroup limits to a running unit at once, under its job;
+  and a new runner release, the only thing that replaces a runner's tree. That
+  `rescue` replaces the installer's EXIT trap, and like it, keeps a failed
+  converge from leaving the box out of the pool.
+- **Busy means a worker inside the unit's own cgroup.** `runner_busy` in
+  `lib.sh` looks for `runner_worker_pattern` among the processes of the unit's
+  `ControlGroup`, never among every process of the runner's uid, which a job
+  can start outside the unit. The drain, the reboot guard and `restart-idle`
+  all go through it; keep any new busy check there.
+- **Root never reads a job-writable file through a link.** Anything root reads
+  under a runner's home or tree goes through `read_untrusted` in `lib.sh`
+  (`dd iflag=nofollow`, as the runner's user inside its own tree), because a
+  job can replace any file there with a link to a root-only one. For the same
+  reason a task that writes into a job-writable tree sets `diff: false`: the
+  diff would read the old file as root and print it on the controller.
 - **The stored PAT is a fallback, never an override, and never a requirement.**
   With `runner_github_pat` defined the role writes it; undefined, each host
   uses `/etc/github-runner/pat`. Do not add a code path that requires the
   controller to hold the admin token for a machine that already has one: that
   is what lets a re-deploy run with no token on the controller. Azure DevOps
   stores no PAT at all; one is needed only to register or remove an agent.
+- **`reap` and `verify` touch only this host's registrations.** They match a
+  registration to this host by its exact runner name or the `<host>-` prefix,
+  and spare names minted in the last 5 minutes, so a runner that has just
+  registered, or another host's, is never taken for a leak.
 - **`set -Eeuo pipefail` is on in every script**, or `set -uo pipefail` where a
   script deliberately never fails its unit, as the disk guard does. A
   `[[ cond ]] && action` list whose condition can be false is fine on its own,
@@ -304,7 +336,11 @@ run-helper sets to 0 even on a terminated error.
   state from the next, because a job can kill its wrapper before the wrapper's
   trap fires. The paths `runner_home_keep_extra` and `runner_home_seed` name
   survive that reset, which is why the converge warns when either is set on an
-  untrusted host.
+  untrusted host. So does the rootless daemon's user unit, which a job can
+  rewrite: the guard keeps a root-owned copy of each runner's, taken on its
+  first run, in `/var/lib/runner-hardening/rootless/<user>.docker.service`,
+  and before every untrusted job puts it back and restarts the runner's Docker
+  daemon, about 1–3 s a job. Do not drop the restore to save that time.
 - **`restart_backoff_delay` and `cycle_ran_a_job` live in `lib.sh`, with the
   installer's signatures.** `gha-jitconfig`, `gha-jitreap` and `azp-cycle` all
   go through them (`azp-cycle` by way of `lib.sh`'s `wait_out_backoff` and

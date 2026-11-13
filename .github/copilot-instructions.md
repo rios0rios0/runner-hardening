@@ -72,7 +72,9 @@ Makefile targets load the shared config that every repository standardises on.
   the cycle's start (Azure DevOps), so no PAT is ever seen by the runner user;
   `ExecStart` runs a root-owned wrapper from
   `/usr/local/libexec/runner-hardening`, outside the job-writable tree, for
-  exactly ONE job (`./run.sh --jitconfig`, `./run.sh --once`); `ExecStopPost`
+  exactly ONE job (`./run.sh` with the JIT config in
+  `ACTIONS_RUNNER_INPUT_JITCONFIG`, never on its command line;
+  `./run.sh --once`); `ExecStopPost`
   (root) counts a cycle that ran no job and, on GitHub, deletes the
   registration; `Restart=always` loops. The backoff is keyed on job-less cycles
   (no `_diag/Worker_*.log` newer than the cycle's marker), never on systemd's
@@ -87,8 +89,11 @@ Makefile targets load the shared config that every repository standardises on.
 
 - **A configuration change never kills a job.** The `Restart idle runners`
   handler restarts only idle instances; a busy one picks up the new unit on the
-  restart that follows its job. A runner tree is replaced only on a version
-  change, after a drain, in a `block` whose `rescue` undrains.
+  restart that follows its job. Two changes drain the runners they touch first,
+  in a `block` whose `rescue` undrains: a lower `MemoryMax`/`MemoryLow`, which a
+  reload applies to a running unit at once, and a new runner release, the only
+  thing that replaces a tree. Busy means a worker inside the unit's own cgroup
+  (`runner_busy`), never any process of the runner's uid.
 
 ## Conventions a generic assistant gets wrong here
 
@@ -96,10 +101,11 @@ Makefile targets load the shared config that every repository standardises on.
   `/proc/<pid>/cmdline` is world-readable, including to the unprivileged runner
   accounts. Never put a secret in `command`/`shell` arguments, never in the
   `environment:` keyword (Ansible renders it as a `VAR=value` prefix on the
-  remote command line), never as `-e name=value`. A secret reaches a box only as
-  `ansible.builtin.copy` `content:` into a root-only file, or as
-  `ansible.builtin.uri` `headers:`, each with `no_log: true`, with pipelining
-  on. Scripts pass a token to `curl` with `-H @file`, and to a child through a
+  remote command line), never as `-e name=value`. A secret reaches a box only
+  inside a `no_log: true` task, with pipelining on: as the `stdin` of an
+  `install … /dev/stdin` that writes its root-only file (no temporary copy in
+  `~/.ansible/tmp`, unlike `copy` `content:`), or as `ansible.builtin.uri`
+  `headers:`. Scripts pass a token to `curl` with `-H @file`, and to a child through a
   variable exported inside the script, never `env VAR=secret cmd`. `curl -K -`
   is not a substitute — its unquoted value form drops a malformed header
   silently and sends the request unauthenticated.
@@ -119,7 +125,11 @@ Makefile targets load the shared config that every repository standardises on.
 - **`runner_host_dedicated` gates every destructive step**, and defaults to
   `false`.
 - **De-privileging touches only what `runner_old_users` lists.** Candidates the
-  converge finds are reported, never acted on.
+  converge finds are reported, never acted on; a protected account is left
+  alone and named; caches are cleared as the account, never as root.
+- **Root never reads a job-writable file through a link.** Root reads under a
+  runner's home or tree go through `read_untrusted` in `lib.sh`, and a task
+  writing into a job-writable tree sets `diff: false`.
 - **Trust fails safe.** `runner_trusted` in `lib.sh` is true only for an exact
   `internal` in `host.env`; anything else gets the full reset before every job.
   Never write a trust check the other way round.
@@ -132,7 +142,9 @@ Makefile targets load the shared config that every repository standardises on.
   point a runner is guaranteed idle. Every path it clears is job-writable, so
   `as_runner` drops to the runner user (`setpriv`) for every deletion; a planted
   symlink then reaches no further than the job could delete itself. Do not move
-  a deletion back to root.
+  a deletion back to root. With `trust=untrusted` it also puts back a
+  root-owned copy of the runner's rootless user unit and restarts its Docker
+  daemon before every job, since a job can rewrite that unit.
 - **`restart_backoff_delay` and `cycle_ran_a_job` live in `lib.sh`** with the
   installer's signatures, shared by both flavours' cycle helpers.
 - **`set -Eeuo pipefail` is on in every script** (or `set -uo pipefail` where a

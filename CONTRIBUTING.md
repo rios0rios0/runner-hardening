@@ -75,9 +75,9 @@ Converge twice, every time. A second run that changes something is a bug.
   is installed without the suffix.
 - **No secret may become a command-line argument**, on the controller or on a
   box: argv is readable from `/proc` by any local user. Not in `command` or
-  `shell`, not in `environment:`, not as `-e name=value`. A secret reaches a box only
-  as `copy` `content:` into a root-only file, or as `uri` `headers:`, each with
-  `no_log: true`.
+  `shell`, not in `environment:`, not as `-e name=value`. A secret reaches a box
+  only inside a `no_log: true` task: as the `stdin` of an `install … /dev/stdin`
+  that writes its root-only file, or as `uri` `headers:`.
 - **Every converge is idempotent.** Every `command` or `shell` task has a
   `changed_when`, and never `changed_when: true`.
 - **`ansible.builtin` only**, called by fully qualified name: the collection has

@@ -53,14 +53,28 @@ reboot path as "verified" on CI alone — say it needs a disposable VM.
   vendor's (`gha-jitconfig` mints a single-use JIT config as root, PAT unseen by
   the runner user; `azp-cycle pre` waits out the backoff and marks the start),
   then the root-owned wrapper in `/usr/local/libexec/runner-hardening` runs one
-  job (`run.sh --jitconfig`, `run.sh --once`), `ExecStopPost` counts a job-less
-  cycle (and on GitHub reaps the registration), `Restart=always` loops. Flag
-  anything that lets `run.sh` survive a second job, that makes a wrapper
-  `exec ./run.sh` — `exec` discards the EXIT trap and skips cleanup, silently
-  restoring a long-lived runner — or that moves a wrapper back into the tree a
-  job can write. The wrapper still runs as the job's user, so a job can kill it
-  before its trap fires: flag any change that relies on the wrapper's cleanup to
-  keep one job's state from the next. That is the root disk guard's reset.
+  job (`run.sh` with the JIT config in `ACTIONS_RUNNER_INPUT_JITCONFIG`,
+  `run.sh --once`), `ExecStopPost` counts a job-less cycle (and on GitHub reaps
+  the registration), `Restart=always` loops. Flag anything that lets `run.sh`
+  survive a second job, that makes a wrapper `exec ./run.sh` — `exec` discards
+  the EXIT trap and skips cleanup, silently restoring a long-lived runner — that
+  puts the JIT config back on `run.sh`'s command line, that lets the wrapper's
+  cleanup run before `run.sh` has finished on a stop, or that moves a wrapper
+  back into the tree a job can write. The wrapper still runs as the job's user,
+  so a job can kill it before its trap fires: flag any change that relies on
+  the wrapper's cleanup to keep one job's state from the next. That is the root
+  disk guard's reset, which with `trust=untrusted` also puts back the root-owned
+  copy of the runner's rootless user unit and restarts its Docker daemon; flag
+  a change that drops that restore.
+- **Busy means a worker inside the unit's own cgroup.** `runner_busy` in `lib.sh`
+  is what the drain, the reboot guard and `restart-idle` ask. Flag a busy check
+  that matches any process of the runner's uid, which a job can start outside
+  its unit.
+- **Root never reads a job-writable file through a link.** Flag a root read
+  under a runner's home or tree that does not go through `read_untrusted`, and
+  a task that writes into a job-writable tree without `diff: false`: the diff
+  reads the old file as root, and a job can have made it a link to a root-only
+  one.
 - **Trust fails safe.** `runner_trusted` in `lib.sh` is true only for an exact
   `internal` in `host.env`. Flag a trust check that treats a missing, empty or
   unknown value as trusted.
@@ -87,11 +101,14 @@ reboot path as "verified" on CI alone — say it needs a disposable VM.
   `environment:` keyword (Ansible renders it onto the remote command line), or
   passed as `-e name=value` in a doc, a workflow or a test (a vars file given as
   `-e @file` puts only its path in argv); flag a secret-bearing task
-  without `no_log: true`; flag a secret reaching a box any way other than
-  `copy` `content:` into a root-only file or `uri` `headers:`. In scripts, flag
-  any `-H "Authorization: Bearer ..."`, any token in argv, any
-  `env VAR=secret cmd`, and any `curl -K -` substitute (its unquoted value form
-  drops a malformed header silently and sends the request unauthenticated).
+  without `no_log: true`; flag a secret reaching a box any way other than the
+  `stdin` of an `install … /dev/stdin` into a root-only file or `uri`
+  `headers:` — `copy` `content:` leaves a temporary copy in `~/.ansible/tmp`.
+  In scripts, flag any `-H "Authorization: Bearer ..."`, any token in argv, any
+  `env VAR=secret cmd`, any secret handed to code a job can write (Azure DevOps
+  registers as root in a pristine, root-owned unpack for that reason), and any
+  `curl -K -` substitute (its unquoted value form drops a malformed header
+  silently and sends the request unauthenticated).
 - **Scripts are static.** A runtime script reads paths, prefixes and thresholds
   from `/etc/runner-hardening/host.env` (or its vendor's env file) at runtime.
   Flag a script turned into a template, a value baked in at install time, or a
@@ -119,12 +136,15 @@ reboot path as "verified" on CI alone — say it needs a disposable VM.
   any change to its `false` default.
 - **De-privileging is explicit.** Only the accounts `runner_old_users` names are
   touched; detected candidates are reported. Flag a change that acts on a
-  detected account, or that weakens the protections (uid 1000, a `NOPASSWD`
+  detected account, that weakens the protections (uid 1000, a `NOPASSWD`
   sudoer, an `authorized_keys` owner, an active session) without
-  `runner_force_deprivilege`.
+  `runner_force_deprivilege`, or that clears an account's caches as root rather
+  than as that account.
 - **A configuration change never kills a job.** Flag a change that restarts busy
-  runners, replaces a runner tree without a version change, or drains without a
-  `rescue` that undrains.
+  runners, replaces a runner tree without a version change, lowers a runner's
+  `MemoryMax` or `MemoryLow` without draining it first (a reload applies the
+  limit to the running job at once), or drains without a `rescue` that
+  undrains.
 - **`ansible.builtin` only.** Flag any module or lookup from another collection
   in the roles or playbooks (the example inventory may show `community.general`
   lookups, labelled as optional), a module called without its FQCN, an unnamed
