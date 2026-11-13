@@ -1,0 +1,10 @@
+---
+# Reached on another SSH port, and still holding the over-privileged runner
+# account a documented install created. The converge strips that account of
+# sudo, docker and the other root-equivalent groups, locks it and kills its
+# processes; its home is left for you to delete. The account you log in with
+# is protected, along with any account holding SSH keys or an active session,
+# and is never de-privileged unless runner_force_deprivilege says otherwise.
+ansible_port: 2222
+runner_old_users:
+  - 'actions'

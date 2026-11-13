@@ -1,0 +1,83 @@
+---
+# Every runner host, whichever CI it serves: the connection, and the variables
+# of the runner_host role. A value shown commented out is the role's default.
+# The README's variable table explains each one in full.
+
+# --- connection ---------------------------------------------------------------
+# Key-based SSH to an account with sudo. The vendor playbooks set `become: true`
+# themselves; a sudo that asks for a password needs --ask-become-pass.
+ansible_user: 'ubuntu'
+# ansible_ssh_private_key_file: '~/.ssh/id_ed25519'
+# With more keys in your agent than sshd's MaxAuthTries (6 by default), every
+# host refuses you before the right one is offered. Pin the identity: the key
+# file above already reaches ssh, so do not name a second one here. A key that
+# lives only in an agent works too: point the key file at its public half.
+# ansible_ssh_common_args: '-o IdentitiesOnly=yes'
+
+# --- the box --------------------------------------------------------------------
+# Required, and deliberately false by default. A converge dismantles the rootful
+# Docker daemon and its image store, de-privileges the accounts listed below and
+# deletes leftover build state, so every destructive step refuses to run until
+# you say the machine does nothing but CI.
+runner_host_dedicated: true
+
+# internal keeps caches warm between jobs; untrusted resets the runner's home,
+# tool cache, Docker and workspace before every job. Set it explicitly: a host
+# whose inventory omits it gets the default, internal, whatever it ran before.
+runner_trust: 'internal'
+
+# runner_count: 'auto'               # or an integer. auto: one runner per vCPU and
+#                                    # one per 2 GB of RAM above a 1.5 GB reserve,
+#                                    # whichever is fewer. Lowering the count
+#                                    # retires the runners above it completely.
+# runner_heavy_runners: 1            # runners 1..N also take heavy jobs; 0 for none
+# runner_codeql_ram: 'auto'          # the CODEQL_RAM every job sees: auto | off | <MB>
+# runner_slice_ceiling: 'none'       # none | heavy | all: see host_vars/build-02.yaml
+# runner_old_users: []               # named explicitly: candidates the converge
+#                                    # finds are only reported (host_vars/build-03.yaml)
+# runner_force_deprivilege: false
+# runner_drain_timeout: 1800         # seconds a drain lets running jobs finish
+# runner_disk_soft_pct: 75           # the disk guard starts freeing caches here
+# runner_disk_hard_pct: 90           # the janitor prunes Docker in full here
+# runner_stale_days: 7               # unread this long, a cache entry goes first
+# runner_home_keep_extra: []         # $HOME-relative paths a home reset must keep
+# runner_home_seed: {}               # {relative_path: source on the host}, copied
+#                                    # once into every runner home. Both survive
+#                                    # every reset, untrusted too: see public-01.
+# runner_dismantle_rootful_docker: true
+# runner_unattended_upgrades: true   # false leaves the box's own configuration alone
+# runner_reboot_guard: true          # reboots 02:00-05:00, only when every runner is
+#                                    # idle; false removes the timer and its script
+
+# What your jobs need on the box beyond the base packages, and where apt finds
+# it. key_url must be https and serve an ASCII-armored key, which goes to
+# /etc/apt/keyrings/<name>.asc; `repo`, the whole source line, goes to
+# /etc/apt/sources.list.d/<name>.list as it is written, and its signed-by must
+# name that key.
+# runner_extra_packages:
+#   - 'postgresql-client'
+# runner_extra_apt_repositories:
+#   - name: 'example'
+#     key_url: 'https://packages.example.com/key.asc'
+#     repo: 'deb [signed-by=/etc/apt/keyrings/example.asc] https://packages.example.com/apt stable main'
+
+# CLIs no apt source ships, each checked against its pinned SHA-256 and
+# installed root-owned, one copy shared by every runner. Three forms: a bare
+# binary; one file of a .tar.gz or .zip (member); or a directory of one
+# (member + links), kept whole in /usr/local/lib/runner-hardening/tools/<name>/
+# with a /usr/local/bin link per command.
+# runner_extra_binaries:
+#   - name: 'tool'
+#     url: 'https://downloads.example.com/tool-linux-amd64'
+#     sha256: '<sha256 of the download>'
+#   - name: 'other-tool'
+#     url: 'https://downloads.example.com/other-tool-linux-amd64.tar.gz'
+#     sha256: '<sha256 of the archive>'
+#     member: 'bin/other-tool'
+#   - name: 'aws'
+#     url: 'https://downloads.example.com/awscli-exe-linux-x86_64.zip'
+#     sha256: '<sha256 of the archive>'
+#     member: 'aws/dist'
+#     links:
+#       aws: 'aws'
+#       aws_completer: 'aws_completer'

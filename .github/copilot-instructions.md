@@ -1,16 +1,19 @@
 ## What this repository is
 
-Two self-contained Bash scripts that turn a raw Ubuntu box into a hardened,
-ephemeral, rootless GitHub Actions runner host, and fan that setup across a
-fleet over SSH. No build step, no runtime dependencies beyond a stock Ubuntu
-image plus `ssh`.
+An Ansible collection, `rios0rios0.runner_hardening`, that turns raw Ubuntu
+boxes into hardened, ephemeral, rootless self-hosted CI hosts — GitHub Actions
+runners or Azure Pipelines agents — and converges a fleet of them from one
+inventory. The repository root is the collection, and it depends on nothing
+beyond `ansible.builtin`.
 
-| File                     | Role                                                                       |
-|--------------------------|----------------------------------------------------------------------------|
-| `harden-gha-runners.sh`  | The installer. Runs as root on one Ubuntu box and does all the work.       |
-| `fleet.sh`               | Fans any installer mode out across the machines in `fleet.conf`, over SSH. |
-| `fleet.conf.example`     | The documented fleet format. `fleet.conf` itself is gitignored.            |
-| `test/bootstrap_test.sh` | Tests for the config reader, the remote bootstrap and the disk guard.      |
+| Path                         | Role                                                                    |
+|------------------------------|-------------------------------------------------------------------------|
+| `roles/runner_host/`         | The vendor-neutral host role: hardening, users, rootless Docker, the unit, slice and resource policy, the disk guard, janitor and reboot guard. |
+| `roles/runner_github/`       | GitHub Actions runners: JIT registration, the one-job wrapper, `/etc/github-runner`. |
+| `roles/runner_azure_devops/` | Azure Pipelines agents: adoption or registration, `run.sh --once`, the `lru` work policy. |
+| `roles/*/files/*.sh`         | Every runtime script, static, installed without its `.sh`.               |
+| `playbooks/`                 | `github.yaml`, `azure_devops.yaml`, `verify`, `diagnose`, `drain`, `uninstall`, `rotate_github_pat`. |
+| `inventory/example/`         | The documented inventory; real ones live in the gitignored `inventory/local/`. |
 
 `AGENTS.md` at the repo root covers the same ground in more depth; read it for
 the full architecture map. This file is the fast orientation for Copilot Chat.
@@ -18,157 +21,186 @@ the full architecture map. This file is the fast orientation for Copilot Chat.
 ## Commands
 
 ```bash
-make setup   # clone/update the shared pipelines scripts the other targets need
-make lint    # ShellCheck
-make test    # parse check + the test suite (~3s, 164 assertions, no VM)
-make sast    # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
+make setup        # clone/update the shared pipelines scripts lint and sast need
+make collection   # resolve the collection from build/collections
+make lint         # ShellCheck + ansible-lint (production profile)
+make test         # bash -n, the runtime suite, the Ansible test playbooks, syntax checks
+make sast         # CodeQL, Semgrep, Trivy, Hadolint, Gitleaks
 ```
 
-`make test` is the only target that works on a bare clone; the rest read the
-shared configuration from a local checkout of `rios0rios0/pipelines` and need
+`make test` needs only `bash` and `ansible-core`; the rest read the shared
+configuration from a local checkout of `rios0rios0/pipelines` and need
 `make setup` first (or `make SCRIPTS_DIR=/path/to/pipelines <target>`). Never
-call `shellcheck`, `semgrep` or `gitleaks` directly — the Makefile targets load
-the shared config that the fleet standardises on. To run one test case in
-isolation there is no filter: source the file's setup and call the `it_*`
-function, or just run the whole suite.
+call `shellcheck`, `ansible-lint`, `semgrep` or `gitleaks` directly — the
+Makefile targets load the shared config that every repository standardises on.
 
 ## Architecture you cannot see by reading one file
 
-- **The installer is a mode dispatcher over phases.** `main()` at the bottom of
-  `harden-gha-runners.sh` is a `case` on the mode. Most modes assert root,
-  `load_config`, then run one `phase_*`. `install` and `reconfigure` are the
-  exception: they run a **fixed, ordered pipeline** (preflight → discover →
-  wizard/load_config → audit → stop_existing → deprivilege → wipe → prereqs →
-  per-runner user + rootless Docker → swap → token_helper → diskguard → runners → systemd →
-  janitor → unattended → cleanup_stale → verify → summary). The order encodes
-  dependencies. Do not reorder without tracing what each phase assumes exists.
+- **A vendor role orchestrates; the host role is called into it.** A vendor
+  role's `tasks/main.yaml` sets the flavour facts first, validates its
+  credentials, then calls `runner_host` three times:
+  `tasks_from: prepare` (preflight, legacy units, de-privilege, one-time wipe,
+  prerequisites, users and rootless Docker), then its own helpers and trees,
+  then `tasks_from: finish` (`host.env`, scripts, policy, unit, slice,
+  drop-ins, enable, timers, `verify`), then surplus de-registration, then
+  `tasks_from: retire`. The order encodes dependencies. Do not reorder without
+  tracing what each step assumes exists.
 
-- **The installer *generates* the runtime it hardens.** Nothing under
-  `/usr/local/sbin` or `/opt/actions-runner` exists in this repo. Every helper,
-  wrapper and systemd unit is written by a `phase_*` function as a heredoc. To
-  change the janitor you edit the heredoc inside `phase_janitor`, not a separate
-  file.
+- **The flavour is data.** `runner_user_prefix`, `runner_base_dir`,
+  `runner_unit`, `runner_slice`, `runner_sbin_prefix`, `runner_config_dir`,
+  `runner_worker_pattern`, `runner_work_policy` and the unit's vendor lines are
+  set by the vendor role and drive every name on the box. The GitHub values
+  (`gha`, `/opt/actions-runner`, `gha-runner@`, `gha.slice`,
+  `/etc/github-runner`) are the shell installer's, on purpose: an existing
+  fleet converges without anything being renamed.
 
-- **The ephemeral loop is the core invariant.** systemd starts `gha-runner@N`;
-  a first `ExecStartPre` (root) runs `gha-diskguard`, which frees that runner's
-  own caches once the disk is past 75% and is a no-op otherwise (with
-  `trust=untrusted` it resets the runner in full, every time); the next
-  `ExecStartPre` (root) waits out any restart backoff, then mints a
-  single-use JIT config to `/run/gha-runner/N.jit`
-  so the PAT is never seen by the runner user; `ExecStart` (runner user) wipes
-  `_work` and runs `./run.sh --jitconfig` for exactly ONE job; `ExecStopPost`
-  (root) counts a cycle that ran no job and deletes the registration;
-  `Restart=always` loops with a fresh registration and workspace. The
-  backoff is keyed on job-less cycles (no `_diag/Worker_*.log` newer than the
-  cycle's `.jit`), never on systemd's `RestartSteps`, which counts every
-  restart and so idled healthy runners for minutes after each job; for the
-  same reason `RestartSec` stays at 1 s, since every job pays it. A change that lets `run.sh` survive a second job,
-  or that lets the wrapper `exec` (which discards the EXIT trap and skips
-  cleanup), silently turns these back into long-lived runners. Every README
-  security claim rests on this chain.
+- **Scripts are static; configuration is a file.** The roles copy fixed
+  scripts and write the files those read at runtime:
+  `/etc/runner-hardening/host.env`, `/etc/github-runner/env`,
+  `/etc/azure-pipelines-agent/env`. No script is a template, so every script is
+  identical on every box and the tests drive the real file. Every script
+  sources `/usr/local/lib/runner-hardening/lib.sh` for the shared functions;
+  nothing is spliced in. Vendor hooks in `vendor.sh` run only when `declare -F`
+  finds them.
 
-- **`fleet.sh` is a transport, not a second installer.** `parse_config` (a
-  hand-rolled INI reader — never `source`; a fleet definition is data) →
-  `select_hosts` → per host `build_env` emits the `GHA_*` exports →
-  `build_bootstrap` wraps them and the base64'd installer into one stdin stream →
-  `run_host` pipes it to `ssh`. It never decides policy: an omitted `fleet.conf`
-  key is not sent, so the host keeps its stored answer.
+- **The ephemeral loop is the core invariant.** systemd starts
+  `gha-runner@N` (or `azp-agent@N`); the first `ExecStartPre` (root) runs the
+  disk guard, which frees that runner's own caches once the disk is past
+  `runner_disk_soft_pct` and is a no-op otherwise (with `trust=untrusted` it
+  resets the runner in full, every time); the next `ExecStartPre` (root) waits
+  out any restart backoff, then mints a single-use JIT config (GitHub) or marks
+  the cycle's start (Azure DevOps), so no PAT is ever seen by the runner user;
+  `ExecStart` runs a root-owned wrapper from
+  `/usr/local/libexec/runner-hardening`, outside the job-writable tree, for
+  exactly ONE job (`./run.sh --jitconfig`, `./run.sh --once`); `ExecStopPost`
+  (root) counts a cycle that ran no job and, on GitHub, deletes the
+  registration; `Restart=always` loops. The backoff is keyed on job-less cycles
+  (no `_diag/Worker_*.log` newer than the cycle's marker), never on systemd's
+  `RestartSteps`, which counts every restart and so idled healthy runners for
+  minutes after each job; for the same reason `RestartSec` stays at 1 s, since
+  every job pays it. A change that lets `run.sh` survive a second job, or that
+  lets a wrapper `exec` (which discards the EXIT trap and skips cleanup),
+  silently turns these back into long-lived runners. The wrapper runs as the
+  job's user, so a job can kill it before its trap fires: what isolates one job
+  from the next is the root disk guard's reset with `trust=untrusted`, never the
+  wrapper's cleanup. Every README security claim rests on this chain.
+
+- **A configuration change never kills a job.** The `Restart idle runners`
+  handler restarts only idle instances; a busy one picks up the new unit on the
+  restart that follows its job. A runner tree is replaced only on a version
+  change, after a drain, in a `block` whose `rescue` undrains.
 
 ## Conventions a generic assistant gets wrong here
 
-- **`harden-gha-runners.sh` is self-contained.** It is copied onto machines on
-  its own, so it must never source another file from this repo. Shared helpers
-  between it and `fleet.sh` are duplicated on purpose — do not refactor them
-  into a common file.
-- **`set -Eeuo pipefail` is on in both scripts.** A `[[ cond ]] && action` whose
-  *action* can fail needs `|| true`, or write it as an `if`.
-- **Heredoc quoting is load-bearing.** `<<EOF` expands installer-side variables
-  into the generated artefact, so every runtime `$` inside it must be escaped
-  (`\$JIT`); `<<'EOF'` ships the body verbatim. Getting it backwards yields a
-  valid script that reads an empty variable at job time. `phase_runners` runs `bash -n`
-  on the wrapper it writes for this reason — keep that check for new generated
-  scripts.
-- **No secret may become a command-line argument, anywhere.** `/proc/<pid>/cmdline`
-  is world-readable, including to the unprivileged runner accounts. The SSH
-  bootstrap streams its env file on stdin; every `curl` passes the token with
-  `-H @file`. `curl -K -` is not a substitute — its unquoted value form drops a
-  malformed header silently and sends the request unauthenticated.
-- **The stored configuration is a default, never an override.** `load_config`
-  saves caller-supplied `GHA_*` answers, sources `/etc/github-runner/env`, then
-  restores the caller's values, falling back to `/etc/github-runner/pat` only
-  when no `GHA_PAT` was given. Do not replace it with a plain `. "$ENV_FILE"`:
-  the install dispatch runs it inside an `&&` chain for its side effect, so a
-  clobbering version makes unattended runs report success while changing
-  nothing. It is also what lets `fleet.sh --no-pat install` work.
-- **`die` inside `$( )` only exits the subshell.** `build_bootstrap` assigns
-  `build_env`'s output to a variable rather than inlining the substitution, so
-  the failure propagates under `errexit`. Do not inline it again.
-- **Every mode is idempotent.** A second consecutive run that changes something
-  is a bug.
-- **The disk guard runs before the registration is minted, and deletes as the
-  runner user.** Before `gha-jitconfig` is the one point a runner is guaranteed
-  idle, so the two `ExecStartPre` lines must not be swapped. Every path it
-  clears is job-writable, so `as_runner` drops to the runner user (`setpriv`)
-  for every deletion; a planted symlink then reaches no further than the job
-  could delete itself. Do not move a deletion back to root.
-- **`restart_backoff_delay`, `cycle_ran_a_job` and `runner_labels` are spliced
-  into the generated JIT helpers with `declare -f`.** Edit them in the installer
-  and keep them self-contained: nothing else of the installer travels with them.
+- **No secret may become a command-line argument, anywhere.**
+  `/proc/<pid>/cmdline` is world-readable, including to the unprivileged runner
+  accounts. Never put a secret in `command`/`shell` arguments, never in the
+  `environment:` keyword (Ansible renders it as a `VAR=value` prefix on the
+  remote command line), never as `-e name=value`. A secret reaches a box only as
+  `ansible.builtin.copy` `content:` into a root-only file, or as
+  `ansible.builtin.uri` `headers:`, each with `no_log: true`, with pipelining
+  on. Scripts pass a token to `curl` with `-H @file`, and to a child through a
+  variable exported inside the script, never `env VAR=secret cmd`. `curl -K -`
+  is not a substitute — its unquoted value form drops a malformed header
+  silently and sends the request unauthenticated.
+- **The `.sh` suffix is a repository convention.** Every runtime script ends in
+  `.sh` so the shared ShellCheck target lints it; the install task drops it.
+  `lib.sh` and `vendor.sh` keep their names, and a script's journal tag is its
+  installed basename.
+- **Every converge is idempotent.** A second converge must report `changed=0`;
+  the converge workflow enforces it. Every `command`/`shell` task needs a
+  `changed_when`, and `changed_when: true` is banned. Prefer a module.
+- **`ansible.builtin` only, by FQCN, clean under the ansible-lint `production`
+  profile.** No `ansible.posix`, no `community.*`; every task named and
+  capitalised; variables prefixed `runner_`, `runner_github_` or `runner_azp_`,
+  private facts `_runner_`.
+- **Adding a variable means `defaults/main.yaml`, the README's variable table,
+  and `inventory/example`.**
+- **`runner_host_dedicated` gates every destructive step**, and defaults to
+  `false`.
+- **De-privileging touches only what `runner_old_users` lists.** Candidates the
+  converge finds are reported, never acted on.
+- **Trust fails safe.** `runner_trusted` in `lib.sh` is true only for an exact
+  `internal` in `host.env`; anything else gets the full reset before every job.
+  Never write a trust check the other way round.
+- **The stored PAT is a fallback, never a requirement.** Undefined
+  `runner_github_pat` means each host reuses `/etc/github-runner/pat`. Do not
+  add a path that requires the controller to hold the admin token for a host
+  that already has one.
+- **The disk guard runs first and deletes as the runner user.** Its
+  `ExecStartPre` must stay ahead of the vendor's, because before it is the one
+  point a runner is guaranteed idle. Every path it clears is job-writable, so
+  `as_runner` drops to the runner user (`setpriv`) for every deletion; a planted
+  symlink then reaches no further than the job could delete itself. Do not move
+  a deletion back to root.
+- **`restart_backoff_delay` and `cycle_ran_a_job` live in `lib.sh`** with the
+  installer's signatures, shared by both flavours' cycle helpers.
+- **`set -Eeuo pipefail` is on in every script** (or `set -uo pipefail` where a
+  script deliberately never fails its unit). A `[[ cond ]] && action` whose
+  *action* can fail needs `|| true`, or write it as an `if`. Each script keeps
+  its `if [[ "${BASH_SOURCE[0]}" == "${0}" ]]` guard around `main` so the tests
+  can source it.
 - **`OOMPolicy=continue` and the absence of any `ManagedOOM*` policy are
   deliberate.** systemd's default `stop` turned one OOM-killed job process into
   a stop of the whole runner ("The runner has received a shutdown signal"), and
   systemd-oomd is absent from a server install. Heavy jobs are kept apart by the
-  `heavy` label and sized by the `CODEQL_RAM` each runner exports.
-- **`TMPDIR=/var/tmp` in the unit is deliberate.** Ubuntu 26.04's `/tmp` is a
+  `heavy` label or capability and sized by the `CODEQL_RAM` each runner exports.
+- **`TMPDIR=/var/tmp` in the unit is deliberate.** Ubuntu `26.04`'s `/tmp` is a
   tmpfs of half the RAM that `PrivateTmp=` shares between every runner on the
   box; concurrent test suites filled it. The private `/var/tmp` is on disk and
   wiped at every stop just the same.
-- **Every wizard question must also be answerable from the environment.**
-  `fleet.sh` drives the installer over SSH with no pty, so an interactive-only
-  prompt is unreachable to the fleet.
 
 ## Keeping the cross-file lists in sync
 
-These sets are duplicated by design and drift silently:
+These sets live in more than one file and drift silently:
 
-- **A new mode** goes in five places: the installer's `main()` `case`, the
-  `die "unknown mode ..."` list beside it, the installer's header USAGE block
-  (the `--help` output is a hardcoded `sed -n '2,30p'` range — adding a header
-  line pushes `uninstall` out of the window, so adjust the range too),
-  `VALID_MODES` in `fleet.sh`, and the README.
-- **A new `fleet.conf` key** goes in `KNOWN_KEYS` (an unknown key is a hard
-  parse error), the `cfg` reads in `build_env`, the export it emits,
-  `fleet.conf.example`, and the README.
-- **A new `GHA_*` answer** goes in `CONFIG_ANSWERS`, the `save_config` heredoc,
-  the wizard, and the README's variable table.
-- **Anything the installer puts in a runner's `$HOME`** goes in the disk
-  guard's `KEEP` list too, or the first reset under disk pressure deletes it.
+- **A new role variable** goes in `defaults/main.yaml`, the README's variable
+  table and `inventory/example` — and, when a script reads it, the `host.env`
+  template, the script and a `test/runtime` case.
+- **A new runtime script** ends in `.sh`, gets an install task that drops the
+  suffix, a `test/runtime` case, a row in `AGENTS.md`'s script table, and a
+  removal in `playbooks/uninstall.yaml`.
+- **A new `<sbin>-admin` mode** goes in `runner-admin.sh` and the README's
+  `gha-admin` table.
+- **A new playbook** goes in the README's playbook table.
+- **Anything the roles put in a runner's `$HOME`** goes in the disk guard's
+  keep list (`RUNNER_HOME_KEEP` in the `host.env` template), or the first reset
+  under disk pressure deletes it.
+- **A new key in `/etc/github-runner/env`** must be one the `0.1.0` installer
+  can source harmlessly: that release is the rollback.
 
 ## Testing
 
-`test/bootstrap_test.sh` sources both scripts and exercises their real
-functions (`parse_config`, `build_env`, `build_bootstrap`, `load_config`,
-`should_preload_config`, `runner_state_between_jobs`, `report_disk`,
-`restart_backoff_delay`, `cycle_ran_a_job`, `runner_labels`,
-`compute_resource_policy`, `render_instance_dropin`, `instances_above`). The
-bootstrap cases run the real bootstrap through a real `bash -s`, exactly as
-`sshd` would on the far side, against a stand-in installer — only the SSH hop
-is substituted. The
-disk-guard cases render `gha-diskguard` from `render_diskguard` and drive its
-eviction steps against a scratch runner tree — only the root-only privilege
-drop is substituted. Cases are
-hand-rolled BDD (`# given / # when / # then`), each an `it_*` function defined
-and invoked on the next line; the final tally picks up new ones automatically.
+`make test` runs `bash -n` on every script; `test/runtime/run.sh`, which runs
+each `test/runtime/*_test.sh` in its own process and totals the result;
+`test/ansible/policy.yaml` (the memory policy, the count, the surplus and the
+legacy units, pinned to numbers the shell installer's arithmetic produced);
+`test/ansible/templates.yaml` (the unit, slice, drop-ins, timers and `host.env`
+of both flavours, rendered and checked for their invariants); and
+`ansible-playbook --syntax-check` on every playbook.
 
-**Anything that changes system state is untestable here** — it has to be run on
-a disposable Ubuntu VM. Say so rather than claiming a change is verified when
-only `make test` has run.
+The runtime tests source `test/runtime/harness.sh`, which builds a scratch box
+and drives the real scripts against it as non-root, offline. Only what a test
+run lacks is substituted: the root-only steps (`as_runner`, `runner_uid`,
+`ensure_run_dir`), and stand-ins on `PATH` for `systemctl`, `pgrep`, `logger`,
+`docker` and `curl`, each recording how it was called. Cases are hand-rolled
+BDD (`# given / # when / # then`), each an `it_*` function defined and invoked
+on the next line; the final tally picks up new ones automatically.
+
+`.github/workflows/converge.yaml` converges both playbooks twice on a disposable
+`ubuntu-24.04` VM and fails unless the second run reports `changed=0`, then runs
+`systemd-analyze verify` on the installed units. It never starts a runner or
+registers one. **Anything beyond that is untestable here** — a registration, a
+job, a reboot have to be run on a disposable Ubuntu VM. Say so rather than
+claiming a change is verified when only `make test` has run.
 
 ## Anonymity and documentation
 
 This repo is public and describes infrastructure: no host names, IP addresses,
-organisation names, or fleet sizes. Examples use `your-org`, `example`, and
-RFC 5737 / RFC 1918 addresses. Every change adds a `chlog` fragment under
-`.changes/unreleased/` (`chlog new --kind <Kind> --body '...'`); never edit
-`CHANGELOG.md` by hand — it is generated. Update `README.md` whenever a flag, a
-`GHA_*` variable, a `fleet.conf` key, or a requirement changes.
+organisation or pool names, or fleet sizes. Examples use `your-org`,
+`your-pool`, `example`, and RFC 5737 / RFC 1918 addresses. Every change adds a
+`chlog` fragment under `.changes/unreleased/`
+(`chlog new --kind <Kind> --body '...'`); never edit `CHANGELOG.md` by hand —
+it is generated. Update `README.md` whenever a variable, a playbook, an admin
+mode, or a requirement changes, and `inventory/example` whenever a variable
+does.
