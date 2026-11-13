@@ -70,7 +70,7 @@ test: collection
 		bash -n "$$f" && echo "  ok  $$f parses" || exit 1; \
 	done
 	@bash test/runtime/run.sh
-	@for t in test/ansible/policy.yaml test/ansible/templates.yaml; do \
+	@for t in test/ansible/policy.yaml test/ansible/templates.yaml test/ansible/agent_json.yaml; do \
 		ansible-playbook "$$t" || exit 1; \
 	done
 	@for p in $(PLAYBOOKS); do \

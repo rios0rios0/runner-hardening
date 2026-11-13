@@ -19,6 +19,7 @@
     runner_unit_exec_start: "{{ test_flavor.value.runner_unit_exec_start }}"
     runner_unit_exec_stop_post: "{{ test_flavor.value.runner_unit_exec_stop_post }}"
     runner_heavy_env: "{{ test_flavor.value.runner_heavy_env }}"
+    runner_instance_env: "{{ test_flavor.value.runner_instance_env }}"
     test_dir: "{{ test_scratch.path }}/{{ test_flavor.key }}"
 
 - name: "Create the scratch directory of {{ test_flavor.key }}"
@@ -198,6 +199,7 @@
       - ['runner 1, heavy and lifted, may grow to the slice; runner 2 keeps the usual ceiling', "{{ 'MemoryLow=2104M' in _drop1 and 'MemoryMax=6612M' in _drop1 and 'MemoryLow=2104M' in _drop2 and 'MemoryMax=5365M' in _drop2 }}"]
       - ['every job sees the CodeQL budget', "{{ 'Environment=CODEQL_RAM=4564' in _drop1 and 'Environment=CODEQL_RAM=4564' in _drop2 }}"]
       - ['a trusted runner keeps its own tool cache', "{{ ('Environment=AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache-' ~ runner_user_prefix ~ '2') in _drop2 }}"]
+      - ['the flavour environment reaches every runner, and no other line names it', "{{ (runner_instance_env | dictsort | map('join', '=') | map('regex_replace', '^', 'Environment=') | list) | difference(_drop1) | length == 0 and (runner_instance_env | dictsort | map('join', '=') | map('regex_replace', '^', 'Environment=') | list) | difference(_drop2) | length == 0 and (runner_instance_env | length > 0 or _drop1 | select('match', '^Environment=(VSTS_SETUP_DOCKERGROUP|AZP_AGENT_DEFAULT_MAP_DOCKER_SOCKET_TO_FALSE)=') | list | length == 0) }}"]
       - ['the heavy environment reaches runner 1 only', "{{ (runner_heavy_env | dictsort | map('join', '=') | map('regex_replace', '^', 'Environment=') | list) | difference(_drop1) | length == 0 and _drop2 | select('match', '^Environment=(' ~ (runner_heavy_env.keys() | list + ['(?!)']) | join('|') ~ ')=') | list | length == 0 }}"]
       - ['untrusted with CodeQL off: no CODEQL_RAM, no shared tool cache, still capped', "{{ _dropu | select('match', '^Environment=(CODEQL_RAM|AGENT_TOOLSDIRECTORY)=') | list | length == 0 and 'MemoryMax=5365M' in _dropu }}"]
       - ['containers get the same budget in the user slice', "{{ ['MemoryLow=2104M', 'MemoryMax=6612M', 'TasksMax=8192'] | difference(_files['user-slice.conf-1'].splitlines()) | length == 0 and 'MemoryMax=5365M' in _files['user-slice.conf-2'].splitlines() }}"]

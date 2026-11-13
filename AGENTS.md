@@ -14,7 +14,7 @@ runners or Azure Pipelines agents. The repository root *is* the collection
 |-----------------------------------|----------------------------------------------------------------------------|
 | `roles/runner_host/`              | The vendor-neutral host role: preflight, de-privilege, wipe, prerequisites, users and rootless Docker, the unit, slice and resource policy, the disk guard, janitor and reboot guard, retiring surplus instances. |
 | `roles/runner_github/`            | GitHub Actions: the JIT helpers, the per-job wrapper, `/etc/github-runner/{env,pat}`, the runner trees. |
-| `roles/runner_azure_devops/`      | Azure Pipelines: adoption or registration, `azp-cycle`, `azp-run-once`, the agent trees. |
+| `roles/runner_azure_devops/`      | Azure Pipelines: adoption or registration, `azp-cycle`, `azp-run-once`, the agents' own `docker`, the agent trees. |
 | `roles/*/files/*.sh`              | Every runtime script, as a static file; installed without its `.sh`.       |
 | `playbooks/`                      | `github.yaml` and `azure_devops.yaml` converge; `verify`, `diagnose`, `drain` and `uninstall` take both flavours; `rotate_github_pat.yaml`. |
 | `inventory/example/`              | The documented inventory. Real ones live in the gitignored `inventory/local/`, which `ansible.cfg` reads by default. |
@@ -93,6 +93,7 @@ it set up converges without anything being renamed.
 | `runner_work_policy`       | `wipe`                          | `lru`                                     |
 | `runner_legacy_unit_globs` | `['actions.runner.*']`          | `['vsts.agent.*']`                        |
 | `runner_heavy_env`         | `{}`: the label travels in the JIT config | `{heavy: 'true'}`: an agent reports its environment as capabilities |
+| `runner_instance_env`      | `{}`                            | `{VSTS_SETUP_DOCKERGROUP: 'false', AZP_AGENT_DEFAULT_MAP_DOCKER_SOCKET_TO_FALSE: 'true'}`: a rootless box has no root Docker socket for a container job to stat or mount |
 
 `runner_unit_description`, `runner_unit_exec_start_pre`,
 `runner_unit_exec_start` and `runner_unit_exec_stop_post` fill the vendor lines
@@ -116,9 +117,10 @@ those read. The table names each script by its installed path; `<sbin>` is
 | `/usr/local/libexec/runner-hardening/gha-run-ephemeral`  | `roles/runner_github/files/gha-run-ephemeral.sh` | `0755` root, outside the tree a job can write; hands `run.sh` the JIT config in `ACTIONS_RUNNER_INPUT_JITCONFIG`, never on its command line, runs exactly one job, and on a stop waits for `run.sh` to finish before it cleans up |
 | `/usr/local/sbin/azp-cycle`, `azp-register`              | `roles/runner_azure_devops/files/azp-cycle.sh`, `azp-register.sh` | root-only; the backoff before a cycle and the job-less count after it; registration as root (`AGENT_ALLOW_RUNASROOT=1`) in a pristine, root-owned unpack, the PAT in `VSTS_AGENT_INPUT_TOKEN`, then the tree handed to `azp<n>`; removal through the REST API by the ids in `/var/lib/runner-hardening/azp/<n>.json` |
 | `/usr/local/libexec/runner-hardening/azp-run-once`       | `roles/runner_azure_devops/files/azp-run-once.sh` | `./run.sh --once` as the agent user |
+| `/usr/local/libexec/runner-hardening/azp-bin/docker`     | `roles/runner_azure_devops/files/azp-docker.sh` | first on every agent's `.path`; runs the agent's own `docker exec -u <its uid>` of a container job's step as container root, which rootless Docker makes the agent's own user, and hands every other call to the next `docker` on `PATH` unchanged |
 | `/etc/systemd/system/<unit>@.service`                    | `roles/runner_host/templates/runner@.service.j2` | the hardened unit template |
 | `/etc/systemd/system/<slice>`, `system.slice.d/10-<sbin>-protect.conf`, `user-<uid>.slice.d/10-<sbin>-limits.conf` | `roles/runner_host/templates/runner.slice.j2`, `protect.conf.j2`, `user-slice.conf.j2` | the aggregate boundary, the OS floor, the rootless containers' limits |
-| `/etc/systemd/system/<unit>@<n>.service.d/10-instance.conf` | `roles/runner_host/templates/instance.conf.j2` | the runner's paths, memory floor and ceiling, `CODEQL_RAM`, `AGENT_TOOLSDIRECTORY` (`trust=internal`), `runner_heavy_env` (heavy instances) |
+| `/etc/systemd/system/<unit>@<n>.service.d/10-instance.conf` | `roles/runner_host/templates/instance.conf.j2` | the runner's paths, memory floor and ceiling, `CODEQL_RAM`, `AGENT_TOOLSDIRECTORY` (`trust=internal`), `runner_instance_env`, `runner_heavy_env` (heavy instances) |
 | `/etc/runner-hardening/host.env`                         | `roles/runner_host/templates/host.env.j2`      | what the scripts read: the flavour, the count, trust, the thresholds, the keep list |
 
 ### The ephemeral loop is the core invariant
@@ -174,7 +176,7 @@ run-helper sets to 0 even on a terminated error.
 |-----------------------------------------|-------------------------------------------------------------------|
 | `/etc/runner-hardening/host.env`        | the flavour and host policy every runtime script reads; root `0644`, no secrets |
 | `/usr/local/lib/runner-hardening/`      | `lib.sh` and `vendor.sh`, sourced by the scripts; `tools/<name>/`, a `runner_extra_binaries` tool tree |
-| `/usr/local/libexec/runner-hardening/`  | the per-job wrappers, root `0755`, outside every tree a job can write |
+| `/usr/local/libexec/runner-hardening/`  | the per-job wrappers and the agents' own `docker` (`azp-bin/`), root `0755`, outside every tree a job can write |
 | `/usr/local/bin/<name>`                 | a `runner_extra_binaries` binary, or a link into its tool tree; root-owned, shared by every runner |
 | `/var/cache/runner-hardening/`          | the downloads behind `runner_extra_binaries`, root-only            |
 | `/etc/github-runner/env`                | the GitHub answers (`GHA_*`), in the installer's exact format      |
@@ -355,6 +357,14 @@ run-helper sets to 0 even on a terminated error.
   Ubuntu `26.04`'s `/tmp` is a small tmpfs every runner shares). Do not point
   `TMPDIR` back at `/tmp`, and do not drop `PrivateTmp=`, which is what makes
   `/var/tmp` private.
+- **An Azure DevOps container job's steps run as container root.** The agent
+  runs them as `docker exec -u <its own uid>`, which rootless Docker maps to a
+  subordinate uid that owns nothing of the agent's; `azp-docker`, first on
+  every agent's `.path`, makes that one call `-u 0`, the agent's own user.
+  Keep it first on `.path`, keep it rewriting only the agent worker's own
+  `exec -u <its uid>`, and do not answer a container job's permission error
+  with ACLs: a file made `0700` masks every named entry out, and what such a
+  uid leaves in `_work` neither the agent nor the disk guard can delete.
 - **Anything that changes system state is untestable here.** `make test`
   renders and parses; only the converge workflow, or a disposable Ubuntu VM,
   exercises a real box. Say so rather than claiming a change is verified when

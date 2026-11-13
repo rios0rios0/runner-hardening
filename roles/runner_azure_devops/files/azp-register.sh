@@ -97,17 +97,21 @@ scrub_environment() {
   done < <(compgen -e)
 }
 
+# bomless <file> - the file without the UTF-8 byte-order mark the agent writes
+# at the start of .agent, which not every jq skips
+bomless() { sed '1s/^\xEF\xBB\xBF//' -- "$1"; }
+
 # record <n> <.agent> - which agent this host registered, kept where no job can
 # write it, for removal to read instead of the instance's .agent
 record() {
   local rec tmp
   rec=$(record_of "$1")
-  jq -e '(.poolId | type) == "number" and (.agentId | type) == "number"' "$2" >/dev/null 2>&1 \
+  bomless "$2" | jq -e '(.poolId | type) == "number" and (.agentId | type) == "number"' >/dev/null 2>&1 \
     || die "$2 names no pool and agent id"
   mkdir -p "$AZP_STATE_DIR"
   chmod 0700 "$AZP_STATE_DIR"
   tmp="${rec}.new"
-  (umask 077; jq -c '{poolId, agentId, agentName}' "$2" > "$tmp")
+  (umask 077; bomless "$2" | jq -c '{poolId, agentId, agentName}' > "$tmp")
   mv -f "$tmp" "$rec"
 }
 

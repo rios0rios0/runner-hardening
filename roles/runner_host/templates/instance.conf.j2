@@ -27,6 +27,12 @@ Environment=CODEQL_RAM={{ runner_rp_codeql }}
 # they then go to the workspace, which no job outlives.
 Environment=AGENT_TOOLSDIRECTORY={{ toolcache }}
 {% endif %}
+{% if runner_instance_env | length > 0 %}
+# Set by the vendor role for every instance of its flavour.
+{% for name, value in runner_instance_env | dictsort %}
+Environment={{ name }}={{ value | string | replace('%', '%%') }}
+{% endfor %}
+{% endif %}
 {% if (_runner_host_n | int) <= (_runner_host_rp_heavy | int) and runner_heavy_env | length > 0 %}
 # Runners 1..{{ _runner_host_rp_heavy }} also take heavy jobs, and this is one of them.
 {% for name, value in runner_heavy_env | dictsort %}

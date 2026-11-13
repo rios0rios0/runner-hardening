@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed a converge failing on a host where an apt source for a repository in `runner_extra_apt_repositories` was already added by hand: apt refused every source over the two `Signed-By` values, so any other file naming a repository this role writes is now moved aside to `/var/lib/runner-hardening/apt-sources-moved-aside` first'
+time: '2026-11-13T07:22:40.920384774Z'

@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed the adoption of a real Azure Pipelines agent stopping at discovery: the agent writes `.agent` and `.credentials` as UTF-8 with a byte-order mark, which Python JSON parsing (`from_json`) rejects, so every task that parses them now strips it first'
+time: '2026-11-13T06:16:42.0350861Z'

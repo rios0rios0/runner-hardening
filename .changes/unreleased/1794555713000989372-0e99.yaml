@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed Docker CE failing to install over the distribution own Docker packages (`docker-compose-v2` ships the same `docker-compose` plugin file): on a dedicated host the packages Docker install guide lists as conflicting are now removed first'
+time: '2026-11-13T07:41:53.000953919Z'

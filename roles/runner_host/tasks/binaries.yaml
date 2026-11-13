@@ -16,6 +16,14 @@
     mode: '0700'
   when: "runner_extra_binaries | length > 0"
 
+# A dry run creates nothing, so on a first converge the cache is not there yet
+# and a download into it would fail; binary.yaml skips the download then.
+- name: 'Look for the download cache'
+  ansible.builtin.stat:
+    path: "{{ _runner_host_cache_dir }}"
+  register: '_runner_host_cache_stat'
+  when: "runner_extra_binaries | length > 0"
+
 - name: 'Install each extra binary'
   ansible.builtin.include_tasks: 'binary.yaml'
   loop: "{{ runner_extra_binaries }}"

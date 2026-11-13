@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed the old rootful daemon socket file surviving the dismantle: a stopped socket unit leaves `/run/docker.sock` behind, `root:docker` though nothing answers on it, so it is now removed with the rest of the rootful stack'
+time: '2026-11-13T08:22:31.565847302Z'

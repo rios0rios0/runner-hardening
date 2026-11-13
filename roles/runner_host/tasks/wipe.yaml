@@ -74,6 +74,8 @@
       ansible.builtin.file:
         path: "{{ _runner_host_image_store }}"
         state: 'absent'
+      # A directory's --diff lists every path inside it: millions of lines here.
+      diff: false
       loop: ['/var/lib/docker', '/var/lib/containerd']
       loop_control:
         loop_var: '_runner_host_image_store'
@@ -121,6 +123,8 @@
       ansible.builtin.file:
         path: "{{ _runner_host_old_work_dir }}"
         state: 'absent'
+      # A directory's --diff lists every path inside it: millions of lines here.
+      diff: false
       loop: >-
         {{ _runner_host_old_work.files | map(attribute='path')
            | reject('match', '^(' ~ (_spared | map('regex_escape') | join('|')) ~ ')(/|$)')
@@ -136,6 +140,8 @@
       ansible.builtin.file:
         path: '/opt/hostedtoolcache'
         state: 'absent'
+      # A directory's --diff lists every path inside it: millions of lines here.
+      diff: false
 
     - name: 'Remember that the wipe ran'
       ansible.builtin.copy:

@@ -1,0 +1,21 @@
+---
+# The Azure Pipelines agent writes .agent and .credentials as UTF-8 with a
+# byte-order mark, and Python's JSON parser (from_json) rejects a leading one.
+# Every task that parses those files strips it first; this pins that the strip
+# is what makes a real agent's .agent parse, and that it is needed at all.
+- name: 'An agent registration written with a byte-order mark parses'
+  hosts: 'localhost'
+  connection: 'local'
+  gather_facts: false
+  vars:
+    _bom_agent: "﻿{\n  \"agentId\": 164987,\n  \"agentName\": \"agent01\",\n  \"poolName\": \"your-pool\"\n}"
+  tasks:
+    - name: 'Check the strip makes the registration parse, and is needed'
+      ansible.builtin.assert:
+        that:
+          # given a registration as the agent writes it, when it is stripped and parsed, then it reads back
+          - "(_bom_agent | replace('﻿', '') | from_json).agentId == 164987"
+          - "(_bom_agent | replace('﻿', '')) is match('^\\s*\\{')"
+          # and without the strip the shape test the roles use would refuse it
+          - "_bom_agent is not match('^\\s*\\{')"
+        quiet: true

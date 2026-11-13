@@ -98,12 +98,15 @@
       notify: 'Restart idle runners'
 
     # run.sh does not read .path; azp-run-once applies it, as the agent's own
-    # runsvc.sh does. Jobs install their own tools in ~/.local/bin, so it comes
-    # first, and nothing of another account's home -- the one an adopted agent
-    # was configured from included -- is on it at all.
+    # runsvc.sh does. First the agents' own docker, which every docker call
+    # goes through to the next one on PATH, so that the agent finds it and runs
+    # a container job's steps as container root (azp-docker.sh says why). Then
+    # ~/.local/bin, where jobs install their own tools, and nothing of another
+    # account's home -- the one an adopted agent was configured from included --
+    # is on it at all.
     - name: "Write the PATH of agent {{ _runner_azp_n }}"
       ansible.builtin.copy:
-        content: "/home/{{ _runner_azp_user }}/.local/bin:{{ _runner_azp_system_path }}\n"
+        content: "{{ _runner_azp_bin_dir }}:/home/{{ _runner_azp_user }}/.local/bin:{{ _runner_azp_system_path }}\n"
         dest: "{{ _runner_azp_dir }}/.path"
         owner: "{{ _runner_azp_user }}"
         group: "{{ _runner_azp_user }}"
@@ -140,7 +143,8 @@
           {{ ((_runner_azp_env_now.stdout | default('') if _runner_azp_env_now.rc | default(1) == 0 else '')
               | string).splitlines() | select('match', '^[^=\s]+=') | list }}
         _owned_rx: >-
-          ^({{ (_runner_azp_env_owned + (runner_heavy_env | dict2items | map(attribute='key') | list))
+          ^({{ (_runner_azp_env_owned + (runner_heavy_env | dict2items | map(attribute='key') | list)
+                + (runner_instance_env | dict2items | map(attribute='key') | list))
                | map('regex_escape') | join('|') }})=
         _homes: >-
           {{ (ansible_facts['getent_passwd'] | default({}) | dict2items
