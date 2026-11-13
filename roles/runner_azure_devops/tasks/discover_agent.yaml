@@ -100,6 +100,8 @@
           {{ ansible_facts['getent_passwd'] | default({}) | dict2items | map(attribute='value.4')
              | map('regex_replace', '/+$', '') | reject('equalto', '') | list }}
 
+    # The agent writes .agent and .credentials as UTF-8 with a byte-order mark,
+    # which Python's JSON parser (from_json) rejects, so every parse strips it.
     # As the account that owns the directory, never as root: a .agent swapped
     # for a link after the check above can then reach only what that account
     # could read anyway. A root-owned directory is read as nobody.
@@ -116,7 +118,7 @@
           - "{{ _runner_azp_src }}/.agent"
       register: '_runner_azp_src_agent'
       changed_when: false
-      failed_when: "_runner_azp_src_agent.rc | default(1) != 0 or _runner_azp_src_agent.stdout | default('') is not match('^\\s*\\{')"
+      failed_when: "_runner_azp_src_agent.rc | default(1) != 0 or (_runner_azp_src_agent.stdout | default('') | replace('\ufeff', '')) is not match('^\\s*\\{')"
       # Read-only (cat, as the file's owner), so it runs in a dry run as well.
       check_mode: false
       vars:
@@ -148,7 +150,7 @@
           runner_azp_pool to match).
         quiet: true
       vars:
-        _agent: "{{ _runner_azp_src_agent.stdout | default('{}', true) | from_json }}"
+        _agent: "{{ _runner_azp_src_agent.stdout | default('{}', true) | replace('\ufeff', '') | from_json }}"
 
     # The move is a rename, which cannot be half done: a copy across
     # filesystems could, and would leave the credentials in two places.
@@ -181,4 +183,4 @@
                                      'id': _agent.agentId,
                                      'pool_id': _agent.poolId}] }}
       vars:
-        _agent: "{{ _runner_azp_src_agent.stdout | default('{}', true) | from_json }}"
+        _agent: "{{ _runner_azp_src_agent.stdout | default('{}', true) | replace('\ufeff', '') | from_json }}"
