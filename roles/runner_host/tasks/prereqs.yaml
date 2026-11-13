@@ -142,6 +142,22 @@
     update_cache: true
   when: "_runner_host_apt_written.results | selectattr('changed') | list | length > 0"
 
+# Docker CE refuses to install over the distribution's own Docker packages:
+# Ubuntu's docker-compose-v2 ships the same /usr/libexec/docker/cli-plugins/
+# docker-compose that docker-compose-plugin does, and dpkg stops on "trying to
+# overwrite". The list is the one Docker's install guide says to remove first.
+# Only on a dedicated host whose rootful Docker this role dismantles anyway.
+- name: 'Remove the distribution Docker packages that conflict with Docker CE'
+  ansible.builtin.apt:
+    name: ['docker.io', 'docker-doc', 'docker-compose', 'docker-compose-v2', 'podman-docker', 'containerd', 'runc']
+    state: 'absent'
+  environment:
+    NEEDRESTART_MODE: 'a'
+    NEEDRESTART_SUSPEND: '1'
+  when:
+    - "runner_host_dedicated | bool"
+    - "runner_dismantle_rootful_docker | bool"
+
 # After the sources: an extra package may come from one of them. A dry run
 # adds no source, so a package only a new source carries cannot be resolved.
 - name: 'Install Docker CE, the rootless extras and the extra packages'
