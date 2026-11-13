@@ -11,14 +11,29 @@
   loop_control:
     loop_var: '_runner_azp_n'
 
-- name: 'Read the registration of each agent'
-  ansible.builtin.slurp:
-    src: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
+# As each agent's own user, never as root: the tree is its jobs' to write, and
+# a .agent replaced with a link to a root-only file would be read and shown.
+- name: 'Read the registration of each agent, as its user'
+  ansible.builtin.command:
+    argv:
+      - 'setpriv'
+      - "--reuid={{ _runner_azp_user }}"
+      - "--regid={{ _runner_azp_user }}"
+      - '--init-groups'
+      - '--'
+      - 'cat'
+      - '--'
+      - "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
   register: '_runner_azp_agents'
+  changed_when: false
   failed_when: false
+  # Read-only (cat, as the agent user), so it runs in a dry run as well.
+  check_mode: false
   loop: "{{ runner_instances }}"
   loop_control:
     loop_var: '_runner_azp_n'
+  vars:
+    _runner_azp_user: "{{ runner_user_prefix }}{{ _runner_azp_n }}"
 
 - name: 'Summarise each agent'
   ansible.builtin.debug:
@@ -38,15 +53,24 @@
   vars:
     _read: >-
       {{ _runner_azp_agents.results | selectattr('_runner_azp_n', 'equalto', _runner_azp_unit._runner_azp_n)
-         | selectattr('content', 'defined') | map(attribute='content') | list }}
-    _agent: "{{ (_read | first | b64decode | from_json) if _read | length > 0 else {} }}"
+         | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | map(attribute='stdout')
+         | select('match', '^\s*\{') | list }}
+    _agent: "{{ (_read | first | from_json) if _read | length > 0 else {} }}"
     _adopted: "{{ _runner_azp_pending | selectattr('n', 'equalto', _runner_azp_unit._runner_azp_n | int) | list }}"
 
 - name: 'Summarise the host'
   ansible.builtin.debug:
     msg: "{{ _runner_azp_summary | select | list }}"
   vars:
-    _runner_azp_old_present: "{{ runner_old_users | select('in', ansible_facts['getent_passwd'] | default({})) | list }}"
+    # Only the accounts prepare actually de-privileged: one that does not
+    # exist, or that is protected (the admin account, SSH keys, a live
+    # session) and not forced, was left alone and must not read as locked.
+    _runner_azp_old_present: >-
+      {{ runner_old_users | default([]) | reject('equalto', 'none')
+         | select('in', ansible_facts['getent_passwd'] | default({}))
+         | reject('in', [] if (runner_force_deprivilege | default(false) | bool)
+                       else (_runner_host_protected_users | default([])))
+         | list }}
     _runner_azp_summary:
       - >-
         {{ runner_count_resolved }} Azure Pipelines agent(s) on {{ ansible_facts['hostname'] }}, in pool

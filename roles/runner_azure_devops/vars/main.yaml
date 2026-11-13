@@ -7,6 +7,12 @@ _runner_azp_libexec_dir: '/usr/local/libexec/runner-hardening'
 _runner_azp_env_file: '/etc/azure-pipelines-agent/env'
 # For the length of a converge's registrations only; removed in an always:.
 _runner_azp_pat_file: '/run/azp-register.pat'
+_runner_azp_admin: '/usr/local/sbin/azp-admin'
+# Which agent each instance is, as this host registered or adopted it: one
+# <n>.json per instance ({poolId, agentId, agentName}), root 0600. Removal reads
+# this, never the instance's .agent, which its jobs can rewrite to name
+# another agent in the pool. azp-register keeps the same path.
+_runner_azp_record_dir: '/var/lib/runner-hardening/azp'
 # One file per instance whose adoption has begun and not finished: written
 # before its directory moves, removed once the tree is its new user's. A
 # converge that dies in between finishes the job the next time.

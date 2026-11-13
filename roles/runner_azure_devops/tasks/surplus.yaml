@@ -3,7 +3,21 @@
 # removes them: an Azure Pipelines registration outlives its unit, so unlike a
 # GitHub JIT runner, a retired agent stays in the pool unless it is removed
 # from it. That takes the PAT; without one the agent is left there, offline,
-# and the summary says so.
+# and this says so.
+#
+# Which agent to remove comes from the record this host wrote when it
+# registered or adopted the agent, never from the instance's .agent: a job can
+# rewrite that to name any other agent in the pool, and the removal would then
+# delete that one. No record, no removal.
+
+- name: 'Look for the record of each agent above the count'
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_record_dir }}/{{ _runner_azp_n }}.json"
+    get_checksum: false
+  loop: "{{ runner_surplus_instances | default([]) }}"
+  loop_control:
+    loop_var: '_runner_azp_n'
+  register: '_runner_azp_surplus_records'
 
 - name: 'Look for a registration at each instance above the count'
   ansible.builtin.stat:
@@ -14,23 +28,46 @@
     loop_var: '_runner_azp_n'
   register: '_runner_azp_surplus_agents'
 
-- name: 'Note the registered agents above the count'
+- name: 'Note the agents above the count'
   ansible.builtin.set_fact:
-    _runner_azp_surplus: >-
-      {{ _runner_azp_surplus_agents.results | selectattr('stat.exists') | map(attribute='_runner_azp_n') | list }}
+    _runner_azp_surplus: "{{ _recorded }}"
+    _runner_azp_surplus_unrecorded: >-
+      {{ _runner_azp_surplus_agents.results | selectattr('stat.exists') | map(attribute='_runner_azp_n')
+         | reject('in', _recorded) | list }}
+  vars:
+    _recorded: >-
+      {{ _runner_azp_surplus_records.results | selectattr('stat.exists') | map(attribute='_runner_azp_n') | list }}
+
+# Never in a dry run: the PAT, the drain and the removal are all changes.
+- name: 'Report the agents a real run would remove from the pool'
+  ansible.builtin.debug:
+    msg: >-
+      Check mode: a real run would drain instance(s) {{ _runner_azp_surplus | join(', ') }} and remove
+      their agents from pool {{ runner_azp_pool }}, by the record this host keeps of each.
+  when:
+    - "ansible_check_mode"
+    - "_runner_azp_surplus | length > 0"
+    - "(runner_azp_pat | default('')) | length > 0"
 
 - name: 'Remove the agents above the count from the pool'
   when:
+    - "not ansible_check_mode"
     - "_runner_azp_surplus | length > 0"
     - "(runner_azp_pat | default('')) | length > 0"
   block:
+    # stdin, not copy's content: see register.yaml.
     - name: 'Hand the PAT to the removals, root-only'
-      ansible.builtin.copy:
-        content: "{{ runner_azp_pat }}"
-        dest: "{{ _runner_azp_pat_file }}"
-        owner: 'root'
-        group: 'root'
-        mode: '0600'
+      ansible.builtin.command:
+        argv:
+          - 'sh'
+          - '-c'
+          - 'umask 077 && exec install -m 0600 -o root -g root /dev/stdin "$1"'
+          - 'azp-register-pat'
+          - "{{ _runner_azp_pat_file }}"
+        stdin: "{{ runner_azp_pat }}"
+        stdin_add_newline: false
+      # Removed again by the always: below, so it leaves no change behind.
+      changed_when: false
       no_log: true
 
     # Drained first: removed from the pool mid-job, an agent fails the job it
@@ -38,17 +75,19 @@
     # tree change: retire takes these instances down for good next.
     - name: 'Let each agent above the count finish its job, then stop it'
       ansible.builtin.command:
-        argv: "{{ [_runner_azp_sbin_dir ~ '/' ~ runner_sbin_prefix ~ '-admin', 'drain'] + (_runner_azp_surplus | map('string') | list) }}"
+        argv: "{{ [_runner_azp_admin, 'drain'] + (_runner_azp_surplus | map('string') | list) }}"
       register: '_runner_azp_surplus_drain'
-      changed_when: "_runner_azp_surplus_drain.stdout is search('drained')"
+      changed_when: "_runner_azp_surplus_drain.stdout | default('') is search('drained')"
 
-    # Not fatal: an agent the pool no longer knows, or a PAT without the
-    # scope, leaves an offline entry in the pool -- untidy, and no reason to
-    # keep a box above the count it was given.
+    # Through the REST API, as root: the agent's own `config.sh remove` would
+    # run code from a tree its jobs can write, with the PAT. Not fatal: an
+    # agent the pool no longer knows is already gone, and a PAT without the
+    # scope leaves an offline entry -- untidy, and no reason to keep a box
+    # above the count it was given.
     - name: 'Remove agent'
       ansible.builtin.command:
         argv: ["{{ _runner_azp_sbin_dir }}/azp-register", 'remove', "{{ _runner_azp_n }}"]
-        removes: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
+        removes: "{{ _runner_azp_record_dir }}/{{ _runner_azp_n }}.json"
       loop: "{{ _runner_azp_surplus }}"
       loop_control:
         loop_var: '_runner_azp_n'
@@ -61,7 +100,7 @@
           Agent {{ _runner_azp_removal._runner_azp_n }} could not be removed from pool {{ runner_azp_pool }}
           ({{ (_runner_azp_removal.stderr_lines | default([]) + _runner_azp_removal.stdout_lines | default([]))[-2:]
               | join(' | ') }}): delete it there, under Organization settings > Agent pools > {{ runner_azp_pool }} > Agents.
-      loop: "{{ _runner_azp_removals.results | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | list }}"
+      loop: "{{ _runner_azp_removals.results | default([]) | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | list }}"
       loop_control:
         loop_var: '_runner_azp_removal'
         label: "{{ _runner_azp_removal._runner_azp_n }}"
@@ -81,3 +120,11 @@
   when:
     - "_runner_azp_surplus | length > 0"
     - "(runner_azp_pat | default('')) | length == 0"
+
+- name: 'Warn about the agents above the count this host has no record of'
+  ansible.builtin.debug:
+    msg: >-
+      Instance(s) {{ _runner_azp_surplus_unrecorded | join(', ') }} are retired from this host, but it holds no
+      record of which agents they were, so it removes none from pool {{ runner_azp_pool }}: delete them there
+      (Organization settings > Agent pools > {{ runner_azp_pool }} > Agents).
+  when: "_runner_azp_surplus_unrecorded | length > 0"

@@ -8,6 +8,14 @@
   ansible.builtin.set_fact:
     _runner_azp_pending: []
 
+# Whose home a directory to adopt must not be: see discover_agent.yaml.
+- name: 'Read the accounts of this host'
+  ansible.builtin.getent:
+    database: 'passwd'
+  # Read-only (the account database), so it runs in a dry run as well.
+  check_mode: false
+  when: "runner_azp_adopt | default({}) | length > 0"
+
 - name: 'Read each agent to adopt'
   ansible.builtin.include_tasks: 'discover_agent.yaml'
   loop: "{{ runner_azp_adopt | default({}) | dict2items }}"

@@ -23,15 +23,43 @@
       - "^{{ _runner_azp_adoption.src | regex_escape }}/bin(\\.[^/]+)?/Agent\\.(Listener|Worker)"
   register: '_runner_azp_still_running'
   changed_when: false
-  failed_when: "_runner_azp_still_running.rc > 1"
+  failed_when: "_runner_azp_still_running.rc | default(1) > 1"
+  # Read-only (it lists processes), so it runs in a dry run as well.
   check_mode: false
 
 - name: "Refuse to move an agent that is still running, for instance {{ _runner_azp_adoption.n }}"
   ansible.builtin.assert:
-    that: "_runner_azp_still_running.rc == 1"
+    that: "_runner_azp_still_running.rc | default(1) == 1"
     fail_msg: >-
       An agent still runs from {{ _runner_azp_adoption.src }}, outside any vsts.agent.* unit:
-      {{ _runner_azp_still_running.stdout_lines | join('; ') }}. Stop it, then converge again.
+      {{ _runner_azp_still_running.stdout_lines | default([]) | join('; ') }}. Stop it, then converge again.
+    quiet: true
+  when: "not ansible_check_mode"
+
+# A dry run does not stop the old units (prepare only does that for real), so
+# the old agent is still running here, as it should be. Said, not refused.
+- name: "Report what still runs from the directory to adopt, for instance {{ _runner_azp_adoption.n }}"
+  ansible.builtin.debug:
+    msg: >-
+      Check mode: running from {{ _runner_azp_adoption.src }} now:
+      {{ _runner_azp_still_running.stdout_lines | default([]) | join('; ') }}. A real run stops the
+      vsts.agent.* units first, and refuses to move it if anything still runs from there after that.
+  when:
+    - "ansible_check_mode"
+    - "_runner_azp_still_running.rc | default(1) == 0"
+
+# Checked in discover.yaml too; again here, before anything changes.
+- name: "Look again for SSH keys in the directory to adopt for instance {{ _runner_azp_adoption.n }}"
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_adoption.src }}/.ssh"
+    follow: false
+    get_checksum: false
+  register: '_runner_azp_src_ssh_again'
+
+- name: "Refuse to move a directory that holds SSH keys, for instance {{ _runner_azp_adoption.n }}"
+  ansible.builtin.assert:
+    that: "not _runner_azp_src_ssh_again.stat.exists"
+    fail_msg: "{{ _runner_azp_adoption.src }} holds an .ssh: it is a home, not an agent's directory, and is not moved."
     quiet: true
 
 # Looked at again right before it is cleared: discover.yaml saw no
@@ -76,6 +104,29 @@
     owner: 'root'
     group: 'root'
     mode: '0600'
+  # Its directory is made just above, which a dry run does not do.
+  when: "not ansible_check_mode"
+
+- name: 'Create the directory of the agent records'
+  ansible.builtin.file:
+    path: "{{ _runner_azp_record_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+
+# Which agent this is, kept root-side before the move: from here on its .agent
+# sits in a tree the new user's jobs can rewrite, and removing the agent from
+# the pool one day must not take the pool and agent ids from there.
+- name: "Record which agent is adopted, for instance {{ _runner_azp_adoption.n }}"
+  ansible.builtin.copy:
+    content: "{{ {'poolId': _runner_azp_adoption.pool_id, 'agentId': _runner_azp_adoption.id, 'agentName': _runner_azp_adoption.name} | to_json }}\n"
+    dest: "{{ _runner_azp_record_dir }}/{{ _runner_azp_adoption.n }}.json"
+    owner: 'root'
+    group: 'root'
+    mode: '0600'
+  # Its directory is made just above, which a dry run does not do.
+  when: "not ansible_check_mode"
 
 # -T: the destination is the new name of the directory, never a directory to
 # move it into. Same filesystem, checked in discover.yaml, so this is rename(2).
@@ -89,3 +140,12 @@
       - "{{ runner_base_dir }}/{{ _runner_azp_adoption.n }}"
     creates: "{{ runner_base_dir }}/{{ _runner_azp_adoption.n }}/.agent"
     removes: "{{ _runner_azp_adoption.src }}/.agent"
+  when: "not ansible_check_mode"
+
+- name: "Report the adoption a real run would make, for instance {{ _runner_azp_adoption.n }}"
+  ansible.builtin.debug:
+    msg: >-
+      Check mode: a real run would move {{ _runner_azp_adoption.src }} (agent {{ _runner_azp_adoption.name }},
+      id {{ _runner_azp_adoption.id }}) to {{ runner_base_dir }}/{{ _runner_azp_adoption.n }}, record it, and
+      hand it to {{ runner_user_prefix }}{{ _runner_azp_adoption.n }}.
+  when: "ansible_check_mode"

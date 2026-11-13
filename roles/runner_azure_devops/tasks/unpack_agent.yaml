@@ -1,8 +1,15 @@
 ---
-# Unpacks a fresh agent for instance _runner_azp_n, which holds no registration
-# and no complete agent. Unpacked beside its place and renamed into it only
-# once whole, so the place holds a complete agent or none: a converge that died
-# mid-unpack leaves only the staging directory, cleared on the next attempt.
+# Puts a fresh agent in place for instance _runner_azp_n, registered with the
+# pool when _runner_azp_register says so. Unpacked beside its place, in
+# _runner_azp_staging, and renamed into it only once whole, so the place holds
+# a complete agent or none: a converge that died half way leaves only the
+# staging directory, cleared on the next attempt.
+#
+# The registration happens in that staging copy, while it is still root's and
+# exactly what the verified package holds, never in the instance's own tree:
+# a job can rewrite all of that tree, and config.sh runs with the PAT in its
+# environment. A registration therefore replaces the whole tree, its _work
+# aside.
 
 - name: "Clear what an earlier attempt left for instance {{ _runner_azp_n }}"
   ansible.builtin.file:
@@ -17,11 +24,15 @@
     group: 'root'
     mode: '0700'
 
+# --no-same-owner: as root, tar would otherwise give every file the owner the
+# archive records, 1000:1000 for the agent package -- on a cloud image, the
+# admin account -- and azp-register refuses a tree that is not all root's.
 - name: "Unpack the agent package for instance {{ _runner_azp_n }}"
   ansible.builtin.unarchive:
     src: "{{ _runner_azp_download.dest }}"
     dest: "{{ _runner_azp_staging }}"
     remote_src: true
+    extra_opts: ['--no-same-owner']
 
 # As the installer does for the GitHub runner: the agent's own script for the
 # libraries its .NET runtime needs. Run here, while the tree is still root's
@@ -32,18 +43,25 @@
     argv: ["{{ _runner_azp_staging }}/bin/installdependencies.sh"]
     chdir: "{{ _runner_azp_staging }}"
   register: '_runner_azp_deps'
-  changed_when: "_runner_azp_deps.stdout is search('[1-9][0-9]* newly installed')"
+  changed_when: "_runner_azp_deps.stdout | default('') is search('[1-9][0-9]* newly installed')"
   failed_when: false
 
 - name: "Warn that the agent dependency script complained, for instance {{ _runner_azp_n }}"
   ansible.builtin.debug:
     msg: >-
-      bin/installdependencies.sh exited {{ _runner_azp_deps.rc }}:
+      bin/installdependencies.sh exited {{ _runner_azp_deps.rc | default('?') }}:
       {{ (_runner_azp_deps.stdout_lines | default([]))[-3:] | join(' | ') }}
-  when: "_runner_azp_deps.rc != 0"
+  when: "_runner_azp_deps.rc | default(0) != 0"
 
-# Extracted as root and then handed over, not unpacked as the agent user: that
-# would make the unpack depend on the archive being readable by that user.
+# As root, in the staging copy; azp-register refuses any tree that is not a
+# fresh, root-only unpack, and records the agent root-side for removal.
+- name: "Register the fresh agent with the pool, for instance {{ _runner_azp_n }}"
+  ansible.builtin.command:
+    argv: ["{{ _runner_azp_sbin_dir }}/azp-register", "{{ _runner_azp_n }}"]
+    creates: "{{ _runner_azp_staging }}/.agent"
+  when: "_runner_azp_register | bool"
+
+# Extracted and registered as root, then handed over.
 - name: "Hand the unpacked agent to its user, for instance {{ _runner_azp_n }}"
   ansible.builtin.file:
     path: "{{ _runner_azp_staging }}"
@@ -59,6 +77,14 @@
     path: "{{ _runner_azp_staging }}"
     state: 'directory'
     mode: '0750'
+
+# The work directory is the agent's warm cache (the lru work policy), and only
+# ever its own user's: kept across a registration that replaces the tree.
+- name: "Keep the work directory across the new tree, for instance {{ _runner_azp_n }}"
+  ansible.builtin.command:
+    argv: ['mv', '-T', '--', "{{ runner_base_dir }}/{{ _runner_azp_n }}/_work", "{{ _runner_azp_staging }}/_work"]
+    removes: "{{ runner_base_dir }}/{{ _runner_azp_n }}/_work"
+    creates: "{{ _runner_azp_staging }}/_work"
 
 - name: "Clear the place of instance {{ _runner_azp_n }}"
   ansible.builtin.file:

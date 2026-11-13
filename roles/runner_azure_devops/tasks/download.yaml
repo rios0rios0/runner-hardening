@@ -84,7 +84,8 @@
     path: "{{ _runner_azp_old_download }}"
     state: 'absent'
   loop: >-
-    {{ _runner_azp_old_downloads.files | map(attribute='path')
-       | reject('equalto', _runner_azp_download.dest) | list }}
+    {{ _runner_azp_old_downloads.files | default([]) | map(attribute='path')
+       | reject('equalto', _runner_azp_download.dest | default(_runner_azp_cache_dir ~ '/' ~ _runner_azp_package_prefix
+                                                                ~ _runner_azp_package.version ~ '.tar.gz')) | list }}
   loop_control:
     loop_var: '_runner_azp_old_download'

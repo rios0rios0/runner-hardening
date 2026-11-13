@@ -1,32 +1,70 @@
 ---
-# Registers each new agent (_runner_azp_new) with the pool, through
-# azp-register. The PAT reaches the box only here, as a module argument
-# (pipelined over the SSH session's stdin), written to a root-only file
-# azp-register reads, and removed whatever happens. It is never an argument,
-# never in an `environment:`, never stored.
-#
-# An instance that needs registering has no .agent, so it cannot be running a
-# job, and there is nothing to drain: azp-cycle refuses to start it until
-# azp-register has written that file.
+# Registers each new agent (_runner_azp_to_unpack) with the pool, in a fresh
+# root-only unpack of the verified package (unpack_agent.yaml), and swaps it
+# into the instance's place. The PAT reaches the box only here: piped over the
+# SSH session's stdin into a root-only file azp-register reads, and removed
+# whatever happens. It is never an argument, never in an `environment:`, never
+# in a temporary file of Ansible's own, never stored.
 
 - name: 'Register the new agents with the pool'
   block:
+    # stdin, not copy's content: copy uploads its content as a temporary file
+    # under the connecting user's ~/.ansible/tmp first. umask 077 as well as
+    # install's own mode, so the file is never readable by anyone else even
+    # for an instant, whichever install the box has.
     - name: 'Hand the PAT to the registrations, root-only'
-      ansible.builtin.copy:
-        content: "{{ runner_azp_pat }}"
-        dest: "{{ _runner_azp_pat_file }}"
-        owner: 'root'
-        group: 'root'
-        mode: '0600'
+      ansible.builtin.command:
+        argv:
+          - 'sh'
+          - '-c'
+          - 'umask 077 && exec install -m 0600 -o root -g root /dev/stdin "$1"'
+          - 'azp-register-pat'
+          - "{{ _runner_azp_pat_file }}"
+        stdin: "{{ runner_azp_pat }}"
+        stdin_add_newline: false
+      # Removed again by the always: below, so it leaves no change behind.
+      changed_when: false
       no_log: true
 
-    - name: 'Register agent'
+    # An instance that needs registering holds no registration, so it is not
+    # running a job -- unless one deleted its agent's files mid-job. Its tree
+    # is replaced whole, so its unit is let finish and stopped first; finish
+    # starts it again, on the new tree.
+    - name: 'Let each instance being registered again finish its job, then stop it'
       ansible.builtin.command:
-        argv: ["{{ _runner_azp_sbin_dir }}/azp-register", "{{ _runner_azp_n }}"]
-        creates: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
-      loop: "{{ _runner_azp_new }}"
+        argv: "{{ [_runner_azp_admin, 'drain'] + (_runner_azp_redone | map('string') | list) }}"
+      register: '_runner_azp_redrain'
+      changed_when: "_runner_azp_redrain.stdout | default('') is search('drained')"
+      when: "_runner_azp_redone | length > 0"
+
+    - name: 'Register a fresh agent for each new instance'
+      ansible.builtin.include_tasks: 'unpack_agent.yaml'
+      loop: "{{ _runner_azp_to_unpack }}"
       loop_control:
         loop_var: '_runner_azp_n'
+      vars:
+        _runner_azp_staging: "{{ runner_base_dir }}/.{{ _runner_azp_n }}.new"
+        _runner_azp_register: true
+
+  rescue:
+    - name: 'Put back the instances drained for a registration'
+      ansible.builtin.command:
+        argv: "{{ [_runner_azp_admin, 'undrain'] + (_runner_azp_redone | map('string') | list) }}"
+      register: '_runner_azp_undrain'
+      changed_when: "_runner_azp_undrain.rc | default(1) == 0"
+      failed_when: false
+      when: "_runner_azp_redone | length > 0"
+
+    - name: 'Fail with the step that failed'
+      ansible.builtin.fail:
+        msg: >-
+          {{ ansible_failed_task.name | default('a step') }} failed:
+          {{ ansible_failed_result.msg | default('see the task above') }}
+          {%- if _runner_azp_redone | length > 0 %}.
+          Instance(s) {{ _runner_azp_redone | join(', ') }} were drained to be registered again and
+          {{ 'have been put back' if (_runner_azp_undrain.rc | default(1)) == 0
+             else 'could NOT be put back: run ' ~ _runner_azp_admin ~ ' undrain ' ~ (_runner_azp_redone | join(' ')) }}
+          {%- endif %}
 
   always:
     - name: 'Remove the PAT from the box'
