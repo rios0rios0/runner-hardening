@@ -79,6 +79,50 @@
     label: "{{ _runner_host_apt_key._runner_host_apt_source.name }}"
   when: "not ansible_check_mode or _runner_host_apt_key.content is defined"
 
+# A source added by hand for a repository this role manages names it a second
+# time, usually with another key, and apt then refuses every source: "Conflicting
+# values set for option Signed-By". The role owns the repositories it writes, so
+# any other file naming one of them is moved aside, kept, never deleted.
+- name: 'Find other apt sources for the repositories this role writes'
+  ansible.builtin.find:
+    paths: '/etc/apt/sources.list.d'
+    patterns: ['*.list', '*.sources']
+    excludes: ["{{ _runner_host_apt_source.name }}.list"]
+    contains: "{{ '.*' ~ (_runner_host_apt_uri | regex_escape) ~ '/?([ \\t\\]]|$)' }}"
+    file_type: 'file'
+  loop: "{{ _runner_host_apt_sources }}"
+  loop_control:
+    loop_var: '_runner_host_apt_source'
+    label: "{{ _runner_host_apt_source.name }}"
+  vars:
+    _runner_host_apt_uri: "{{ _runner_host_apt_source.repo | regex_search('https?://[^ \\]]+') | default('', true) | regex_replace('/+$', '') }}"
+  register: '_runner_host_apt_dupes'
+  when: "(_runner_host_apt_source.repo | regex_search('https?://')) is not none"
+
+- name: 'Create the directory for the apt sources moved aside'
+  ansible.builtin.file:
+    path: "{{ _runner_host_state_dir }}/apt-sources-moved-aside"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+  when: "_runner_host_apt_dupe_paths | length > 0"
+  vars:
+    _runner_host_apt_dupe_paths: >-
+      {{ _runner_host_apt_dupes.results | default([]) | selectattr('files', 'defined')
+         | map(attribute='files') | flatten | map(attribute='path') | unique | list }}
+
+- name: 'Move the other sources for those repositories aside'
+  ansible.builtin.command:
+    argv: ['mv', '-f', '--', "{{ _runner_host_apt_dupe }}", "{{ _runner_host_state_dir }}/apt-sources-moved-aside/"]
+  loop: >-
+    {{ _runner_host_apt_dupes.results | default([]) | selectattr('files', 'defined')
+       | map(attribute='files') | flatten | map(attribute='path') | unique | list }}
+  loop_control:
+    loop_var: '_runner_host_apt_dupe'
+  register: '_runner_host_apt_moved'
+  changed_when: "_runner_host_apt_moved.rc == 0"
+
 - name: 'Write the apt sources'
   ansible.builtin.template:
     src: 'apt-source.list.j2'
