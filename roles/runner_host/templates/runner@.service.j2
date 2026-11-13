@@ -1,0 +1,126 @@
+# {{ _runner_host_managed }}
+[Unit]
+Description={{ runner_unit_description }}
+After=network-online.target
+Wants=network-online.target
+# Start limit DISABLED on purpose. An ephemeral runner restarts after every
+# job, and systemd's start limit counts attempts rather than failures - so a
+# healthy runner completing 20 quick jobs in 10 minutes would trip a burst
+# limit and be stopped for doing its job correctly. A broken unit is slowed by
+# its registration hook's own backoff instead (gha-jitconfig, azp-cycle pre),
+# which only a failing runner ever meets.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User={{ runner_user_prefix }}%i
+Group={{ runner_user_prefix }}%i
+WorkingDirectory={{ runner_base_dir }}/%i
+
+# Root-only, and BEFORE the registration is minted: between two jobs, the one
+# moment this runner is guaranteed idle. A no-op until the disk passes the soft
+# threshold; past it, frees space from this runner's own caches. An untrusted
+# runner is reset in full here, before every job. The "-" keeps this from ever
+# being the reason a runner does not start. It must stay the first line.
+ExecStartPre=-+/usr/local/sbin/{{ runner_sbin_prefix }}-diskguard %i
+# Root-only ("+"): registers this cycle, so the runner user never sees the
+# credential. It first waits out the backoff of a runner whose last starts
+# ran no job.
+{% for line in runner_unit_exec_start_pre %}
+ExecStartPre={{ line }}
+{% endfor %}
+# Runs exactly one job, then exits. Root-owned and outside every tree a job
+# can write, so no job can rewrite the wrapper the next job runs under.
+ExecStart={{ runner_unit_exec_start }}
+# Root-only: retires this cycle's registration, and counts a cycle that ran no
+# job toward the backoff unless the stop was asked for.
+{% for line in runner_unit_exec_stop_post %}
+ExecStopPost={{ line }}
+{% endfor %}
+
+Restart=always
+# Short on purpose. Every job ends in a restart, so this delay sits between
+# every two jobs a runner takes, while queued jobs wait for it: at 10s it was
+# most of a runner's turnaround. A longer one would only slow a runner that
+# keeps failing, and its registration hook already holds that one back (10s
+# to 5 min before it registers again, after starts that ran no job).
+RestartSec=1
+# NOT RestartSteps/RestartMaxDelaySec, for the same reason as the start limit:
+# systemd counts every restart and every job ends in one, so a healthy runner
+# that had finished six jobs waited the full RestartMaxDelaySec before each
+# next one. The backoff is the registration hook's, counted in cycles that ran
+# no job.
+# The start timeout covers every ExecStartPre. Emptying a runner's caches under
+# I/O load can take minutes; the 90s default would kill the guard mid-sweep.
+TimeoutStartSec=15min
+# control-group, not mixed: the wrapper is the main PID, and the runner is a
+# child. mixed would signal only the wrapper and leave the runner to be killed.
+KillMode=control-group
+TimeoutStopSec=300
+# continue, not systemd's default of stop. When the kernel OOM-kills a job's
+# process, stop tears the whole unit down: the runner logs "The runner has
+# received a shutdown signal", which reads as if somebody stopped it, and when
+# the killed process sits below a step's own - a compiler, an extractor - the
+# job is even reported as cancelled. With continue only that process dies, the
+# step fails as killed (SIGKILL, exit 137), and the job ends as the failure it
+# is. The runner still exits after the job, as it does after every job.
+OOMPolicy=continue
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+# PrivateTmp isolates /tmp and /var/tmp per job. Caveat: the rootless daemon
+# has its own, so a job doing 'docker run -v /tmp/x:/x' (or a mktemp path)
+# binds an empty dir. If a build fails in a way that smells like a missing bind
+# mount, drop this first.
+PrivateTmp=yes
+# Job temp files go to /var/tmp, not /tmp. Ubuntu 26.04 mounts /tmp as a tmpfs
+# sized at half the RAM, and PrivateTmp only makes each runner a directory on
+# it, so every runner on the box shares one small RAM disk - concurrent test
+# suites, each with an embedded database under $TMPDIR, filled it and failed
+# with ENOSPC on a mostly empty disk. A tmpfs page is also RAM, charged to the
+# job's own memory ceiling. The private /var/tmp is wiped at every stop just
+# the same, but it is on disk: on most boxes the one the runners' caches share,
+# so the disk guard keeps room on it. A separate /var gets no such sweep. Tools
+# that hardcode /tmp still land on the tmpfs.
+Environment=TMPDIR=/var/tmp
+ProtectSystem=strict
+ProtectHome=no
+ProtectProc=invisible
+# NOT ProcSubset=pid - it hides /proc/cpuinfo and /proc/meminfo, breaking nproc,
+# JVM ergonomics, Node, and most build-parallelism autodetection.
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- syscall filtering: deliberately OFF ------------------------------------
+# ProtectKernelModules, ProtectKernelLogs, ProtectClock, ProtectHostname,
+# RestrictSUIDSGID, RestrictRealtime and LockPersonality each install a seccomp
+# filter. On current systemd a filtered syscall returns ENOSYS, which reaches
+# build tooling as "Function not implemented" - GNU tar fails outright on it
+# while unpacking a composite action, before the job even starts.
+#
+# The confinement that actually contains a hostile job is above: an
+# unprivileged dedicated user, a read-only filesystem outside ReadWritePaths,
+# no capabilities, and no new privileges. Syscall filtering added little of
+# that and broke real builds, so it is off by default.
+#
+# If anything IS ever filtered, fail with EPERM rather than ENOSYS - "Permission
+# denied" is diagnosable, "Function not implemented" gets misread as a kernel
+# problem and sends you looking in the wrong place.
+SystemCallFilter=
+SystemCallErrorNumber=EPERM
+# NOT set on purpose: RestrictNamespaces, PrivateUsers, SystemCallFilter.
+# Rootless containers need user/mount/net namespaces and a broad syscall
+# surface; blocking them breaks 'container:' jobs and every docker build.
+
+# No CPUQuota. A ceiling here throttles a lone job to a fraction of the box.
+# Fair sharing under contention comes from CPUWeight in the drop-in.
+TasksMax=4096
+
+# ReadWritePaths, DOCKER_HOST and the memory ceilings arrive from a per-instance
+# drop-in, because they embed the runner user's numeric uid.
+
+[Install]
+WantedBy=multi-user.target

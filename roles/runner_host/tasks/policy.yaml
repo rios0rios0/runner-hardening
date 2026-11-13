@@ -1,0 +1,101 @@
+---
+# Pure: set_fact only, no host access, so test/ansible/policy.yaml can prove it
+# against the installer's own numbers for every input. Inputs:
+# runner_count_resolved, runner_mem_mb, runner_heavy_runners,
+# runner_codeql_ram and runner_slice_ceiling.
+#
+# Per-runner ceilings are generous on purpose (a lone job should get the whole
+# machine). That means the ceilings SUM to more than the box has. The aggregate
+# is bounded one level up instead, by a parent slice - so five busy runners
+# cannot exhaust the host, and when something must die it dies inside CI rather
+# than being chosen by the global OOM killer from every process on the system.
+#
+# Every division is Bash's $(( )), which truncates toward zero where Jinja's //
+# floors. The two differ only for a negative numerator - a box with less RAM
+# than the reserve - and the clamps below lift both to the same floor, but the
+# arithmetic is kept identical anyway rather than equal by luck.
+
+- name: 'Read the policy inputs the way the installer reads them'
+  ansible.builtin.set_fact:
+    _runner_host_rp_count: "{{ runner_count_resolved | int }}"
+    _runner_host_rp_mem: "{{ runner_mem_mb | int }}"
+    # ${GHA_HEAVY_RUNNERS:-1}; anything that is not a number counts as none.
+    _runner_host_rp_heavy: "{{ (_heavy | int) if _heavy is match('^[0-9]+$') else 0 }}"
+    # ${GHA_CODEQL_RAM:-auto}
+    _runner_host_rp_codeql_want: "{{ 'auto' if _codeql == '' else _codeql }}"
+    # ${GHA_SLICE_CEILING:-none}; anything but all or heavy lifts nobody.
+    _runner_host_rp_slice: "{{ runner_slice_ceiling | default('none', true) | string | trim }}"
+  vars:
+    _heavy: "{{ '1' if _heavy_raw == '' else _heavy_raw }}"
+    _heavy_raw: "{{ '' if runner_heavy_runners | default(none) is none else runner_heavy_runners | string | trim }}"
+    _codeql: "{{ '' if runner_codeql_ram | default(none) is none else runner_codeql_ram | string | trim }}"
+
+- name: 'Work out what the runners may share once the reserve is set aside'
+  ansible.builtin.set_fact:
+    # OS + one rootless daemon each.
+    _runner_host_rp_free: "{{ (_runner_host_rp_mem | int) - (1024 + 200 * (_runner_host_rp_count | int)) }}"
+
+- name: 'Work out the fair share and the unlifted ceiling'
+  ansible.builtin.set_fact:
+    _runner_host_rp_fair_raw: >-
+      {{ ((_runner_host_rp_free | int) // (_runner_host_rp_count | int)) if (_runner_host_rp_free | int) >= 0
+         else -((0 - (_runner_host_rp_free | int)) // (_runner_host_rp_count | int)) }}
+    _runner_host_rp_ceiling_raw: >-
+      {{ ((_scaled | int) // 100) if (_scaled | int) >= 0 else -((0 - (_scaled | int)) // 100) }}
+  vars:
+    _scaled: "{{ (_runner_host_rp_free | int) * 85 }}"
+
+- name: 'Guarantee each runner its fair share'
+  ansible.builtin.set_fact:
+    runner_rp_fair: "{{ [_runner_host_rp_fair_raw | int, 512] | max }}"
+
+# A lone job gets 85% of what is left once the OS and the rootless daemons are
+# reserved, and a runner beside it keeps something. Everything CI, added
+# together, must still leave the OS a working set: that is the aggregate.
+- name: 'Work out the ceiling, the aggregate and the OS floor'
+  ansible.builtin.set_fact:
+    runner_rp_ceiling: "{{ [_runner_host_rp_ceiling_raw | int, runner_rp_fair | int] | max }}"
+    runner_rp_aggregate: "{{ [(_runner_host_rp_mem | int) - 1024 - 100 * (_runner_host_rp_count | int), runner_rp_fair | int] | max }}"
+    runner_rp_sysmin: "{{ 768 if (_runner_host_rp_mem | int) >= 8000 else 512 }}"
+
+# CodeQL sizes its memory from the whole machine: codeql-action takes the
+# host's total RAM less a gigabyte, and cannot see the cgroup a runner lives
+# in. So every analysis on a box believes it has the box to itself, fills its
+# runner's ceiling, and swaps on top. codeql-action gives a CODEQL_RAM already
+# in its environment precedence over that estimate, so every runner exports
+# one: what a heavy job may take while each other runner keeps 1 GB, shared
+# between the heavy runners, and never past a runner's own ceiling - beyond
+# that it only buys swap. With no heavy runner any runner may be running an
+# analysis, so each gets the fair share. An explicit number is taken as given.
+- name: 'Work out the CodeQL budget a heavy job may take'
+  ansible.builtin.set_fact:
+    _runner_host_rp_codeql_auto: >-
+      {{ [[runner_rp_fair | int if (_shared | int) == 0 else
+           (((_left | int) // (_shared | int)) if (_left | int) >= 0 else -((0 - (_left | int)) // (_shared | int))),
+           runner_rp_ceiling | int] | min, runner_rp_fair | int] | max }}
+  vars:
+    _shared: "{{ [_runner_host_rp_heavy | int, _runner_host_rp_count | int] | min }}"
+    _left: "{{ (runner_rp_aggregate | int) - ((_runner_host_rp_count | int) - (_shared | int)) * 1024 }}"
+
+- name: 'Set the CODEQL_RAM every job sees'
+  ansible.builtin.set_fact:
+    runner_rp_codeql: >-
+      {{ '' if _runner_host_rp_codeql_want == 'off'
+         else (_runner_host_rp_codeql_want | int) if _runner_host_rp_codeql_want is match('^[1-9][0-9]*$')
+         else _runner_host_rp_codeql_auto }}
+
+# A runner's MemoryMax. runner_slice_ceiling lifts the runners it names to the
+# whole slice budget instead: heavy for runners 1..runner_heavy_runners, where
+# a job too large for the usual ceiling is routed, all for every runner. (A
+# one-runner box gains little: its ceiling is already its fair share.) The
+# slice still caps every runner together, so the cost lands on whatever shares
+# the box: a job beside a lifted runner can be reclaimed or OOM-killed sooner.
+- name: 'Work out each runner memory ceiling'
+  ansible.builtin.set_fact:
+    runner_rp_ceilings: "{{ [_lifted_to | int] * (_lifted | int) + [runner_rp_ceiling | int] * ((_runner_host_rp_count | int) - (_lifted | int)) }}"
+  vars:
+    _lifted_to: "{{ [runner_rp_aggregate | int, runner_rp_ceiling | int] | max }}"
+    _lifted: >-
+      {{ (_runner_host_rp_count | int) if _runner_host_rp_slice == 'all'
+         else ([_runner_host_rp_heavy | int, _runner_host_rp_count | int] | min) if _runner_host_rp_slice == 'heavy'
+         else 0 }}

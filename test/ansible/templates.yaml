@@ -1,0 +1,89 @@
+---
+# Renders runner_host's unit, slice, drop-ins, timers and host.env with sample
+# values for both flavours (contract section 2) into a scratch directory, and
+# checks the invariants every security claim rests on: the disk guard runs
+# before the registration is minted, a runner is back one second after its
+# job, systemd never backs a healthy runner off, an OOM kill fails a step
+# instead of stopping the runner, job temp files stay off the shared RAM disk,
+# and no systemd-oomd policy is set. Runs as non-root, offline:
+#
+#   ansible-playbook test/ansible/templates.yaml
+- name: 'Render the runner units and check their invariants'
+  hosts: 'localhost'
+  connection: 'local'
+  gather_facts: false
+  vars:
+    ansible_connection: 'local'
+    ansible_become: false
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    runner_host_dir: "{{ playbook_dir }}/../../roles/runner_host"
+    # The vendor roles' first set_fact, as the contract fixes it.
+    test_flavors:
+      github:
+        runner_flavor: 'github'
+        runner_user_prefix: 'gha'
+        runner_base_dir: '/opt/actions-runner'
+        runner_unit: 'gha-runner'
+        runner_slice: 'gha.slice'
+        runner_sbin_prefix: 'gha'
+        runner_config_dir: '/etc/github-runner'
+        runner_worker_pattern: 'Runner\.Worker'
+        runner_work_policy: 'wipe'
+        runner_legacy_unit_globs: ['actions.runner.*']
+        runner_unit_description: 'Ephemeral GitHub Actions runner %i'
+        runner_unit_exec_start_pre: ['+/usr/local/sbin/gha-jitconfig %i']
+        runner_unit_exec_start: '/usr/local/libexec/runner-hardening/gha-run-ephemeral %i'
+        runner_unit_exec_stop_post: ['+/usr/local/sbin/gha-jitreap %i']
+        runner_heavy_env: {}
+      azure_devops:
+        runner_flavor: 'azure_devops'
+        runner_user_prefix: 'azp'
+        runner_base_dir: '/opt/azure-pipelines-agent'
+        runner_unit: 'azp-agent'
+        runner_slice: 'azp.slice'
+        runner_sbin_prefix: 'azp'
+        runner_config_dir: '/etc/azure-pipelines-agent'
+        runner_worker_pattern: 'Agent\.Worker'
+        runner_work_policy: 'lru'
+        runner_legacy_unit_globs: ['vsts.agent.*']
+        runner_unit_description: 'Ephemeral Azure Pipelines agent %i'
+        runner_unit_exec_start_pre: ['+/usr/local/sbin/azp-cycle pre %i']
+        runner_unit_exec_start: '/usr/local/libexec/runner-hardening/azp-run-once %i'
+        runner_unit_exec_stop_post: ['+/usr/local/sbin/azp-cycle post %i']
+        runner_heavy_env: {heavy: 'true'}
+  tasks:
+    - name: 'Load the role constants'
+      ansible.builtin.include_vars:
+        file: "{{ runner_host_dir }}/vars/main.yaml"
+
+    - name: 'Make a scratch directory'
+      ansible.builtin.tempfile:
+        state: 'directory'
+        suffix: '-runner-host-templates'
+      register: 'test_scratch'
+
+    - name: 'Start with no results'
+      ansible.builtin.set_fact:
+        test_results: []
+
+    - name: 'Render and check each flavour'
+      ansible.builtin.include_tasks: 'templates_flavor.yaml'
+      loop: "{{ test_flavors | dict2items }}"
+      loop_control:
+        loop_var: 'test_flavor'
+        label: "{{ test_flavor.key }}"
+
+    - name: 'Remove the scratch directory'
+      ansible.builtin.file:
+        path: "{{ test_scratch.path }}"
+        state: 'absent'
+
+    - name: 'Report every check'
+      ansible.builtin.debug:
+        msg: "{{ test_results + [(test_results | select('match', '^  ok') | list | length | string) ~ ' passed, ' ~ (test_results | select('match', '^FAIL') | list | length | string) ~ ' failed'] }}"
+
+    - name: 'Fail when any check failed'
+      ansible.builtin.assert:
+        that: "test_results | select('match', '^FAIL') | list | length == 0"
+        fail_msg: "{{ test_results | select('match', '^FAIL') | list }}"
+        quiet: true

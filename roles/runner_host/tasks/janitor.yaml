@@ -1,0 +1,23 @@
+---
+# The daily backstop: it prunes Docker and checks the host's health, racing
+# live jobs, so it never deletes a cache outright. What bounds the disk is the
+# guard each runner runs before every job.
+
+- name: 'Write the janitor service and timer'
+  ansible.builtin.template:
+    src: "janitor.{{ _runner_host_janitor_unit }}.j2"
+    dest: "{{ _runner_host_systemd_dir }}/{{ runner_sbin_prefix }}-janitor.{{ _runner_host_janitor_unit }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  loop: ['service', 'timer']
+  loop_control:
+    loop_var: '_runner_host_janitor_unit'
+  register: '_runner_host_janitor_units'
+
+- name: 'Enable the janitor timer'
+  ansible.builtin.systemd_service:
+    name: "{{ runner_sbin_prefix }}-janitor.timer"
+    enabled: true
+    state: 'started'
+    daemon_reload: "{{ _runner_host_janitor_units.results | selectattr('changed') | list | length > 0 }}"

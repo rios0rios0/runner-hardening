@@ -1,0 +1,21 @@
+---
+# Only the accounts named in runner_old_users: the installer's wizard picked a
+# lone candidate by itself, but an inventory names the account to lock, or
+# none is touched. discover.yaml reports the candidates it sees.
+
+- name: 'De-privilege the old runner accounts'
+  when: "_runner_host_old_users | length > 0"
+  vars:
+    _runner_host_old_users: "{{ runner_old_users | reject('equalto', 'none') | list }}"
+  block:
+    - name: 'Refuse to de-privilege anything on a host that is not dedicated'
+      ansible.builtin.assert:
+        that: "runner_host_dedicated | bool"
+        fail_msg: 'runner_host_dedicated must be true before any account is de-privileged.'
+        quiet: true
+
+    - name: 'De-privilege each old account'
+      ansible.builtin.include_tasks: 'deprivilege_user.yaml'
+      loop: "{{ _runner_host_old_users }}"
+      loop_control:
+        loop_var: '_runner_host_old_user'

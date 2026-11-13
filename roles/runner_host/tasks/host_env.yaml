@@ -1,0 +1,60 @@
+---
+# For the vendor-neutral playbooks (verify, diagnose, drain, uninstall), which
+# run without a vendor role: the flavour facts come from the host.env a
+# converge wrote. A host without one yet is either one the old installer
+# hardened (it has /etc/github-runner/env) or one known by the inventory group
+# it sits in.
+
+- name: 'Read the host configuration'
+  ansible.builtin.slurp:
+    src: "{{ _runner_host_env_file }}"
+  register: '_runner_host_env_raw'
+  failed_when: false
+
+- name: 'Look for a host the old installer hardened'
+  ansible.builtin.stat:
+    path: '/etc/github-runner/env'
+  register: '_runner_host_legacy_env'
+
+# KEY="value" lines, unescaped the way the shell reads them.
+- name: 'Parse the host configuration'
+  ansible.builtin.set_fact:
+    _runner_host_env: "{{ dict(_lines | map('regex_replace', '^([A-Z_]+)=.*$', '\\1') | zip(_lines | map('regex_replace', '^[A-Z_]+=\"(.*)\"$', '\\1')
+      | map('regex_replace', '\\\\(.)', '\\1'))) }}"
+    _runner_host_group_flavor: >-
+      {{ 'github' if 'github_runners' in group_names
+         else 'azure_devops' if 'azure_devops_agents' in group_names else '' }}
+  vars:
+    _lines: >-
+      {{ (_runner_host_env_raw.content | default('') | b64decode).splitlines()
+         | select('match', '^[A-Z_]+=".*"$') | list }}
+
+- name: 'Work out the flavour of this host'
+  ansible.builtin.set_fact:
+    _runner_host_flavor: >-
+      {{ _runner_host_env['RUNNER_FLAVOR'] | default(
+           _runner_host_group_flavor if _runner_host_group_flavor | length > 0
+           else ('github' if _runner_host_legacy_env.stat.exists else ''), true) }}
+
+- name: 'Check that the flavour is known'
+  ansible.builtin.assert:
+    that: "_runner_host_flavor in _runner_host_flavors"
+    fail_msg: >-
+      {{ inventory_hostname }} has no {{ _runner_host_env_file }}, sits in neither
+      github_runners nor azure_devops_agents, and was not hardened by the old
+      installer: converge it with playbooks/github.yaml or playbooks/azure_devops.yaml first.
+    quiet: true
+
+# host.env wins over the fixed table: it records what this host was converged with.
+- name: 'Set the flavour facts'
+  ansible.builtin.set_fact:
+    runner_flavor: "{{ _runner_host_flavor }}"
+    runner_user_prefix: "{{ _runner_host_env['RUNNER_USER_PREFIX'] | default(_fixed.runner_user_prefix, true) }}"
+    runner_base_dir: "{{ _runner_host_env['RUNNER_BASE'] | default(_fixed.runner_base_dir, true) }}"
+    runner_unit: "{{ _runner_host_env['RUNNER_UNIT'] | default(_fixed.runner_unit, true) }}"
+    runner_slice: "{{ _runner_host_env['RUNNER_SLICE'] | default(_fixed.runner_slice, true) }}"
+    runner_sbin_prefix: "{{ _runner_host_env['RUNNER_SBIN_PREFIX'] | default(_fixed.runner_sbin_prefix, true) }}"
+    runner_config_dir: "{{ _runner_host_env['RUNNER_CONFIG_DIR'] | default(_fixed.runner_config_dir, true) }}"
+    runner_count_resolved: "{{ _runner_host_env['RUNNER_COUNT'] | default(0, true) | int }}"
+  vars:
+    _fixed: "{{ _runner_host_flavors[_runner_host_flavor] }}"

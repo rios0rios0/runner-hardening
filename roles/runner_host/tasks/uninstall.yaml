@@ -1,0 +1,104 @@
+---
+# Removes every runner, user and home this collection created, and every
+# file it installed, for the flavour host_env.yaml found. Left in place, and
+# said so: the vendor configuration directory (on GitHub hosts it holds the
+# admin PAT), /swapfile, and the state directory with the sudoers drop-ins the
+# de-privileging moved aside.
+
+- name: 'Refuse to uninstall without an explicit confirmation'
+  ansible.builtin.assert:
+    that:
+      - "runner_host_dedicated | bool"
+      - "runner_uninstall_confirm | default(false) | bool"
+    fail_msg: >-
+      This removes every runner, user and home on {{ inventory_hostname }}.
+      Run it with -e runner_uninstall_confirm=true on a host whose inventory
+      sets runner_host_dedicated: true.
+    quiet: true
+
+- name: 'Find every runner instance on this host'
+  ansible.builtin.import_tasks: 'instances.yaml'
+
+# A running job is finished rather than killed, as everywhere else.
+- name: 'Look for the admin tool'
+  ansible.builtin.stat:
+    path: "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+  register: '_runner_host_admin_tool'
+
+- name: 'Let every runner finish its job, then stop it'
+  ansible.builtin.command:
+    argv: "{{ ['/usr/local/sbin/' ~ runner_sbin_prefix ~ '-admin', 'drain'] + (_runner_host_existing_instances | map('string') | list) }}"
+  register: '_runner_host_uninstall_drain'
+  changed_when: "_runner_host_uninstall_drain.stdout is search('(?m)runner [0-9]+ drained$')"
+  failed_when: false
+  when:
+    - "_runner_host_admin_tool.stat.exists"
+    - "_runner_host_existing_instances | length > 0"
+
+- name: 'Remove each runner'
+  ansible.builtin.include_tasks: 'retire_instance.yaml'
+  loop: "{{ _runner_host_existing_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+
+- name: 'Read the timers'
+  ansible.builtin.systemd_service:
+    name: "{{ runner_sbin_prefix }}-{{ _runner_host_timer }}.timer"
+  loop: ['janitor', 'reboot']
+  loop_control:
+    loop_var: '_runner_host_timer'
+  register: '_runner_host_timers'
+
+- name: 'Stop and disable the timers'
+  ansible.builtin.systemd_service:
+    name: "{{ _runner_host_timer.status.Id }}"
+    enabled: false
+    state: 'stopped'
+  loop: "{{ _runner_host_timers.results | rejectattr('status.LoadState', 'equalto', 'not-found') | list }}"
+  loop_control:
+    loop_var: '_runner_host_timer'
+    label: "{{ _runner_host_timer.status.Id | default('?') }}"
+
+- name: 'Remove what this collection installed'
+  ansible.builtin.file:
+    path: "{{ _runner_host_installed }}"
+    state: 'absent'
+  loop: >-
+    {{ [_runner_host_systemd_dir ~ '/system.slice.d/10-' ~ runner_sbin_prefix ~ '-protect.conf',
+        _runner_host_systemd_dir ~ '/' ~ runner_slice,
+        _runner_host_systemd_dir ~ '/' ~ runner_unit ~ '@.service',
+        _runner_host_systemd_dir ~ '/' ~ runner_sbin_prefix ~ '-janitor.service',
+        _runner_host_systemd_dir ~ '/' ~ runner_sbin_prefix ~ '-janitor.timer',
+        _runner_host_systemd_dir ~ '/' ~ runner_sbin_prefix ~ '-reboot.service',
+        _runner_host_systemd_dir ~ '/' ~ runner_sbin_prefix ~ '-reboot.timer',
+        '/etc/sysctl.d/99-' ~ runner_sbin_prefix ~ '-rootless.conf',
+        '/etc/apt/apt.conf.d/52' ~ runner_sbin_prefix ~ '-unattended',
+        '/etc/needrestart/conf.d/90-' ~ runner_sbin_prefix ~ '.conf',
+        _runner_host_lib_dir, _runner_host_libexec_dir, _runner_host_etc_dir, _runner_host_cache_dir,
+        '/run/' ~ runner_unit]
+       + (['diskguard', 'janitor', 'reboot-if-idle', 'admin']
+          + _runner_host_vendor_sbin[runner_flavor] | default([]))
+         | map('regex_replace', '^(.*)$', '/usr/local/sbin/' ~ runner_sbin_prefix ~ '-\1') | list
+       + (runner_extra_binaries | default([]) | rejectattr('links', 'defined') | map(attribute='name')
+          | map('regex_replace', '^(.*)$', '/usr/local/bin/\1') | list)
+       + (runner_extra_binaries | default([]) | selectattr('links', 'defined') | map(attribute='links')
+          | map('dict2items') | flatten | map(attribute='key') | map('regex_replace', '^(.*)$', '/usr/local/bin/\1') | list) }}
+  loop_control:
+    loop_var: '_runner_host_installed'
+
+- name: 'Make systemd forget the removed units'
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: 'Look for a swapfile'
+  ansible.builtin.stat:
+    path: '/swapfile'
+  register: '_runner_host_uninstall_swap'
+
+- name: 'Report what was left in place'
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['left in place: ' ~ runner_config_dir ~ (' (contains the admin PAT)' if runner_flavor == 'github' else '')
+          ~ '. Remove it with: rm -rf ' ~ runner_config_dir,
+          'left in place: ' ~ _runner_host_state_dir ~ ' (the sudoers drop-ins de-privileging moved aside, and the wipe marker)']
+         + (['left in place: /swapfile and its /etc/fstab entry'] if _runner_host_uninstall_swap.stat.exists else []) }}

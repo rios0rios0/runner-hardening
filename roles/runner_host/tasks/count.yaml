@@ -1,0 +1,23 @@
+---
+# Pure: set_fact only, no host access (test/ansible/policy.yaml drives it).
+# Inputs: runner_count, runner_vcpus, runner_mem_mb.
+#
+# runner_count: auto is the installer's GHA_COUNT=auto: the smaller of the vCPU
+# count and what the RAM holds once ~1500 MB is reserved for the OS and the
+# rootless daemons, at 2000 MB per job, and never below 1. Bash's $(( ))
+# truncates toward zero where Jinja's // floors, hence the sign test.
+- name: 'Size the runner count from the machine'
+  ansible.builtin.set_fact:
+    _runner_host_count_by_mem: "{{ ((_free | int) // 2000) if (_free | int) >= 0 else -((0 - (_free | int)) // 2000) }}"
+  vars:
+    _free: "{{ (runner_mem_mb | int) - 1500 }}"
+
+- name: 'Work out the runner count'
+  ansible.builtin.set_fact:
+    runner_count_resolved: >-
+      {{ ([1, [runner_vcpus | int, _runner_host_count_by_mem | int] | min] | max)
+         if (runner_count | string | trim) == 'auto' else (runner_count | int) }}
+
+- name: 'List the runner instances'
+  ansible.builtin.set_fact:
+    runner_instances: "{{ range(1, (runner_count_resolved | int) + 1) | list }}"

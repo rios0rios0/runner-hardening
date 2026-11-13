@@ -1,0 +1,127 @@
+---
+# One dedicated unprivileged UNIX user per runner - no sudo, no docker group -
+# each with its own rootless Docker daemon, so container: jobs and buildx both
+# work with no root-owned docker socket anywhere on the box.
+
+# systemd chdirs into WorkingDirectory as the runner user. Every component of
+# the path must be traversable by that user or the unit dies at step CHDIR
+# with exit=200 and restart-loops, so the base is normalised explicitly.
+- name: 'Create the runner base directory'
+  ansible.builtin.file:
+    path: "{{ runner_base_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+- name: 'Create each runner group'
+  ansible.builtin.group:
+    name: "{{ runner_user_prefix }}{{ _runner_host_n }}"
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+
+- name: 'Create each runner user'
+  ansible.builtin.user:
+    name: "{{ runner_user_prefix }}{{ _runner_host_n }}"
+    group: "{{ runner_user_prefix }}{{ _runner_host_n }}"
+    home: "/home/{{ runner_user_prefix }}{{ _runner_host_n }}"
+    create_home: true
+    shell: '/bin/bash'
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+
+- name: 'Read the account database'
+  ansible.builtin.getent:
+    database: 'passwd'
+
+# Keyed by the instance number as a string: n -> uid.
+- name: 'Record each runner uid'
+  ansible.builtin.set_fact:
+    _runner_host_uids: >-
+      {{ dict(runner_instances | map('string') | zip(runner_instances | map('regex_replace', '^', runner_user_prefix)
+              | map('extract', ansible_facts['getent_passwd']) | map(attribute=1) | map('int'))) }}
+
+- name: 'Read the subordinate id files'
+  ansible.builtin.slurp:
+    src: "{{ _runner_host_subid_file }}"
+  loop: ['/etc/subuid', '/etc/subgid']
+  loop_control:
+    loop_var: '_runner_host_subid_file'
+  register: '_runner_host_subids'
+
+# useradd already gives a new account a range on current Ubuntu, and that one
+# is kept: rewriting it would orphan every file in the rootless data root, and
+# could overlap another account's range.
+- name: 'Give each runner subordinate ids where it has none'
+  ansible.builtin.lineinfile:
+    path: "{{ _runner_host_subid[0]._runner_host_subid_file }}"
+    line: "{{ runner_user_prefix }}{{ _runner_host_subid[1] }}:{{ 200000 + _runner_host_subid[1] * 65536 }}:65536"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  loop: "{{ _runner_host_subids.results | product(runner_instances) | list }}"
+  loop_control:
+    loop_var: '_runner_host_subid'
+    label: "{{ _runner_host_subid[0]._runner_host_subid_file }} {{ runner_user_prefix }}{{ _runner_host_subid[1] }}"
+  when: >-
+    (_runner_host_subid[0].content | b64decode).splitlines()
+    | select('match', '^' ~ runner_user_prefix ~ (_runner_host_subid[1] | string) ~ ':') | list | length == 0
+
+- name: 'Look for each runner linger flag'
+  ansible.builtin.stat:
+    path: "/var/lib/systemd/linger/{{ runner_user_prefix }}{{ _runner_host_n }}"
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+  register: '_runner_host_linger'
+
+- name: 'Look for each runner runtime directory'
+  ansible.builtin.stat:
+    path: "/run/user/{{ _runner_host_uids[_runner_host_n | string] }}"
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+  register: '_runner_host_runtime_dirs'
+
+# Lingering keeps each user manager, and with it the rootless daemon, running
+# with nobody logged in. enable-linger also starts a manager that stopped,
+# which is why a missing runtime directory reruns it.
+- name: 'Let each runner user manager run without a login'
+  ansible.builtin.command:
+    argv: ['loginctl', 'enable-linger', "{{ runner_user_prefix }}{{ _runner_host_pair[0]._runner_host_n }}"]
+  loop: "{{ _runner_host_linger.results | zip(_runner_host_runtime_dirs.results) | list }}"
+  loop_control:
+    loop_var: '_runner_host_pair'
+    label: "{{ runner_user_prefix }}{{ _runner_host_pair[0]._runner_host_n }}"
+  register: '_runner_host_enable_linger'
+  changed_when: "_runner_host_enable_linger.rc == 0"
+  when: "not (_runner_host_pair[0].stat.exists and _runner_host_pair[1].stat.exists)"
+
+- name: 'Wait for each runner runtime directory'
+  ansible.builtin.wait_for:
+    path: "/run/user/{{ _runner_host_uids[_runner_host_n | string] }}"
+    timeout: 15
+    msg: "lingering never produced /run/user/{{ _runner_host_uids[_runner_host_n | string] }} for {{ runner_user_prefix }}{{ _runner_host_n }}"
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+
+- name: 'Create each runner private tool cache'
+  ansible.builtin.file:
+    path: "{{ _runner_host_toolcache_prefix }}{{ runner_user_prefix }}{{ _runner_host_n }}"
+    state: 'directory'
+    owner: "{{ runner_user_prefix }}{{ _runner_host_n }}"
+    group: "{{ runner_user_prefix }}{{ _runner_host_n }}"
+    mode: '0700'
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+
+- name: 'Seed the runner homes'
+  ansible.builtin.include_tasks: 'seed.yaml'
+  when: "runner_home_seed | length > 0"
+
+- name: 'Give each runner its rootless Docker'
+  ansible.builtin.include_tasks: 'rootless.yaml'

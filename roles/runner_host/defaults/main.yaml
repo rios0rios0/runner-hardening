@@ -1,0 +1,80 @@
+---
+# The vendor-neutral half of a runner host: users, rootless Docker, the unit,
+# the memory policy and the housekeeping timers. A vendor role
+# (runner_github, runner_azure_devops) sets the flavour and drives the
+# converge through tasks_from: prepare, finish and retire.
+
+# Every destructive step asserts this. The role de-privileges accounts,
+# disables the rootful Docker daemon, deletes build state and owns the box's
+# memory policy, so it must only ever run on a machine that does nothing but CI.
+runner_host_dedicated: false
+
+# An integer, or 'auto': the smaller of the vCPU count and what the RAM holds
+# once ~1500 MB is reserved for the OS and the rootless daemons, at 2000 MB
+# per job; never below 1.
+runner_count: 'auto'
+
+# internal: caches stay warm between jobs. untrusted: before every job the
+# runner's home, tool cache, Docker and workspace are reset.
+runner_trust: 'internal'
+
+# Runners 1..N also take heavy jobs ('heavy'). 0 for none.
+runner_heavy_runners: 1
+
+# The CODEQL_RAM every job sees: 'auto' (sized from the box), 'off', or a number of MB.
+runner_codeql_ram: 'auto'
+
+# Which runners may grow to the whole slice budget: 'none', 'heavy' or 'all'.
+runner_slice_ceiling: 'none'
+
+# Over-privileged accounts to de-privilege: stripped of sudo/docker/lxd/...,
+# locked, their crontab removed and their processes killed. [] for none.
+runner_old_users: []
+
+# De-privilege an account the role protects (admin, SSH keys, live session).
+runner_force_deprivilege: false
+
+# Seconds a running job may take to finish before its runner is stopped anyway.
+runner_drain_timeout: 1800
+
+# Per-project apt packages on top of the base list.
+runner_extra_packages: []
+
+# Per-project CLIs no apt source ships: [{name, url, sha256, member}].
+# Each is downloaded and checksum-verified, and installed root-owned at
+# /usr/local/bin/<name>, where no job can swap it for the next one and every
+# runner shares one copy. member is the binary's path inside a .tar.gz or .zip;
+# omit it for a bare binary.
+runner_extra_binaries: []
+
+# [{name, key_url, repo}]: the key goes to /etc/apt/keyrings/<name>.asc and
+# the repo line to /etc/apt/sources.list.d/<name>.list.
+runner_extra_apt_repositories: []
+
+# Disk thresholds, in percent: past soft each runner frees its own caches
+# before its next job; past hard verify fails.
+runner_disk_soft_pct: 75
+runner_disk_hard_pct: 90
+
+# A cache entry no job has read in this many days is the first to go.
+runner_stale_days: 7
+
+# Extra $HOME-relative paths a home reset must keep.
+runner_home_keep_extra: []
+
+# {relative_path: source on the box}: copied once into every runner home, owner
+# fixed, mode kept. Every key is also kept by a home reset.
+runner_home_seed: {}
+
+runner_dismantle_rootful_docker: true
+runner_unattended_upgrades: true
+runner_reboot_guard: true
+
+# CI sets false: install and enable the units, but never start them.
+runner_start_units: true
+
+# Overridable for tests. The ansible_facts form of ansible_memtotal_mb and
+# ansible_processor_vcpus: the top-level fact variables are deprecated in
+# ansible-core 2.20 and removed in 2.24.
+runner_mem_mb: "{{ ansible_facts['memtotal_mb'] }}"
+runner_vcpus: "{{ ansible_facts['processor_vcpus'] }}"

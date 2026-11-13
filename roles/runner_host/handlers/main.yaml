@@ -1,0 +1,26 @@
+---
+# Each include_role of this role (prepare, finish, retire, summary) loads its
+# own copy of these handlers, and a notification reaches the copy loaded last.
+# finish flushes them once every unit, drop-in and script is in place.
+
+- name: 'Reload systemd'
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+# An ephemeral unit restarts after every job anyway, so a busy runner picks up
+# the new definition on its own once its job ends, and an idle one is
+# restarted now: a configuration change never waits on a drain or kills a job.
+# Only a runner that is already up is restarted, so a host converged with
+# runner_start_units: false stays stopped. The registered result doubles as a
+# "done" marker: when the vendor role notified one copy and finish another,
+# the first to run restarts the runners and the others skip.
+- name: 'Restart idle runners'
+  ansible.builtin.command:
+    argv:
+      - "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+      - 'restart-idle'
+  register: '_runner_host_restart_idle'
+  changed_when: "_runner_host_restart_idle.stdout is search('(?m)^restarted [0-9]+')"
+  when:
+    - "runner_start_units | bool"
+    - "_runner_host_restart_idle is not defined"

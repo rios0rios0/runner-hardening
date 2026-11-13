@@ -1,0 +1,50 @@
+---
+# The runner services installed the documented way (svc.sh): one long-lived
+# registration, one shared user, usually in the docker group. They come down
+# here, but gracefully - a job that is already running is finished, not
+# killed. Their directories are left exactly where they are: the Azure DevOps
+# role may adopt an agent's registration from one.
+
+- name: 'Retire the legacy runner services'
+  when: "_runner_host_legacy_units | length > 0"
+  block:
+    - name: 'Refuse to touch the legacy services on a host that is not dedicated'
+      ansible.builtin.assert:
+        that: "runner_host_dedicated | bool"
+        fail_msg: 'runner_host_dedicated must be true before legacy runner services are stopped and removed.'
+        quiet: true
+
+    # A unit's cgroup holds every process it started, so a job is visible here
+    # however deep below the listener it runs.
+    - name: 'Let each legacy runner finish the job it is on, then stop it'
+      ansible.builtin.command:
+        argv: >-
+          {{ ['/bin/bash', '-c', _runner_host_legacy_drain_script, 'legacy-drain',
+          runner_drain_timeout | string, runner_worker_pattern] + _runner_host_legacy_units }}
+      register: '_runner_host_legacy_drain'
+      changed_when: "_runner_host_legacy_drain.stdout is search('(?m)^stopped ')"
+
+    - name: 'Show how the legacy runners came down'
+      ansible.builtin.debug:
+        msg: "{{ _runner_host_legacy_drain.stdout_lines }}"
+
+    - name: 'Disable the legacy runner services'
+      ansible.builtin.systemd_service:
+        name: "{{ _runner_host_legacy_unit }}"
+        enabled: false
+        state: 'stopped'
+      loop: "{{ _runner_host_legacy_found }}"
+      loop_control:
+        loop_var: '_runner_host_legacy_unit'
+
+    - name: 'Remove the legacy runner unit files'
+      ansible.builtin.file:
+        path: "{{ _runner_host_systemd_dir }}/{{ _runner_host_legacy_unit }}"
+        state: 'absent'
+      loop: "{{ _runner_host_legacy_units }}"
+      loop_control:
+        loop_var: '_runner_host_legacy_unit'
+
+    - name: 'Make systemd forget the legacy runner services'
+      ansible.builtin.systemd_service:
+        daemon_reload: true

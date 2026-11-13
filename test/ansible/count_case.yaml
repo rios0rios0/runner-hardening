@@ -1,0 +1,16 @@
+---
+- name: "Work out the count: {{ count_case.name }}"
+  ansible.builtin.include_tasks: "{{ runner_host_tasks }}/count.yaml"
+  vars:
+    runner_count: "{{ count_case.count }}"
+    runner_vcpus: "{{ count_case.vcpus }}"
+    runner_mem_mb: "{{ count_case.mem }}"
+
+- name: "Compare it with the installer: {{ count_case.name }}"
+  ansible.builtin.set_fact:
+    test_results: "{{ test_results + [('  ok  ' if _passed else 'FAIL  ') ~ count_case.name ~ ('' if _passed else ': ' ~ _why)] }}"
+  vars:
+    _passed: >-
+      {{ runner_count_resolved | int == count_case.resolved
+         and runner_instances == range(1, count_case.resolved + 1) | list }}
+    _why: "expected {{ count_case.resolved }}, got {{ runner_count_resolved }} with instances {{ runner_instances }}"

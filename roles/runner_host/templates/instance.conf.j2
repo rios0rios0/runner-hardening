@@ -1,0 +1,35 @@
+{#
+  Runner n's own drop-in. Its paths, environment and memory embed the runner
+  user's numeric uid, which the unit template cannot know. Rendered per
+  instance with _runner_host_n and _runner_host_uid.
+#}
+{% set user = runner_user_prefix ~ _runner_host_n %}
+{% set toolcache = _runner_host_toolcache_prefix ~ user %}
+# {{ _runner_host_managed }}
+[Service]
+Slice={{ runner_slice }}
+ReadWritePaths={{ runner_base_dir }}/{{ _runner_host_n }} /home/{{ user }} {{ toolcache }} /run/user/{{ _runner_host_uid }}
+Environment=DOCKER_HOST=unix:///run/user/{{ _runner_host_uid }}/docker.sock
+Environment=XDG_RUNTIME_DIR=/run/user/{{ _runner_host_uid }}
+# Non-container job steps run as children of this unit, so this is the cgroup
+# that governs most builds. Weight, not quota: no ceiling on a lone job.
+CPUWeight=100
+IOWeight=100
+MemoryLow={{ runner_rp_fair }}M
+MemoryMax={{ runner_rp_ceilings[(_runner_host_n | int) - 1] }}M
+{% if runner_rp_codeql | string | length > 0 %}
+# What a CodeQL analysis may use; see roles/runner_host/tasks/policy.yaml.
+Environment=CODEQL_RAM={{ runner_rp_codeql }}
+{% endif %}
+{% if runner_trust == 'internal' %}
+# Tool installs (setup-* actions, Azure Pipelines tool installers) land in this
+# runner's own cache and stay warm between jobs. Left unset when untrusted:
+# they then go to the workspace, which no job outlives.
+Environment=AGENT_TOOLSDIRECTORY={{ toolcache }}
+{% endif %}
+{% if (_runner_host_n | int) <= (_runner_host_rp_heavy | int) and runner_heavy_env | length > 0 %}
+# Runners 1..{{ _runner_host_rp_heavy }} also take heavy jobs, and this is one of them.
+{% for name, value in runner_heavy_env | dictsort %}
+Environment={{ name }}={{ value | string | replace('%', '%%') }}
+{% endfor %}
+{% endif %}

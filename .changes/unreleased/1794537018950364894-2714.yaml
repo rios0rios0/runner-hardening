@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added the Ansible collection `rios0rios0.runner_hardening`, which replaces the shell installer: a vendor-neutral `runner_host` role (per-runner users, rootless Docker, the hardened unit, slice and resource policy, disk guard, janitor, reboot guard and the retirement of surplus instances) called by one role per CI vendor, plus playbooks to converge, verify, diagnose, drain and uninstall'
+time: '2026-11-13T02:30:18.950233214Z'

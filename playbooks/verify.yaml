@@ -1,0 +1,39 @@
+---
+# Post-flight checks on every runner host, changing nothing. A host whose
+# checks fail fails here, so the run's exit status says whether the fleet is
+# healthy.
+#
+#   ansible-playbook playbooks/verify.yaml [--limit build-01]
+- name: 'Verify the runner hosts'
+  hosts: 'runner_hosts'
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 'Load the flavour of this host'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'host_env'
+
+    - name: 'Check that this host has the admin tool'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'require_admin'
+
+    - name: 'Run the post-flight checks'
+      ansible.builtin.command:
+        argv:
+          - "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+          - 'verify'
+      register: 'runner_verify_result'
+      changed_when: false
+      failed_when: false
+
+    - name: 'Show the checks'
+      ansible.builtin.debug:
+        msg: "{{ runner_verify_result.stdout_lines + runner_verify_result.stderr_lines }}"
+
+    - name: 'Fail a host whose checks failed'
+      ansible.builtin.assert:
+        that: "runner_verify_result.rc == 0"
+        fail_msg: 'Checks failed on this host - see above, then playbooks/diagnose.yaml.'
+        quiet: true

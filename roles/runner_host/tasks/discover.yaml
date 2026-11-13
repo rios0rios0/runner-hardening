@@ -1,0 +1,113 @@
+---
+# Reads the host only: what is already here, before anything is changed.
+
+- name: 'Find the existing runner instances'
+  ansible.builtin.import_tasks: 'instances.yaml'
+
+- name: 'Pick out the legacy runner services'
+  ansible.builtin.import_tasks: 'legacy_units.yaml'
+
+- name: 'Read the legacy runner services'
+  ansible.builtin.systemd_service:
+    name: "{{ _runner_host_legacy_unit }}"
+  loop: "{{ _runner_host_legacy_units }}"
+  loop_control:
+    loop_var: '_runner_host_legacy_unit'
+  register: '_runner_host_legacy_status'
+
+# A unit systemd still lists after its file is gone has nothing to disable.
+- name: 'Keep the legacy services that still have a unit file'
+  ansible.builtin.set_fact:
+    _runner_host_legacy_found: >-
+      {{ _runner_host_legacy_status.results | default([])
+         | rejectattr('status.LoadState', 'equalto', 'not-found')
+         | map(attribute='_runner_host_legacy_unit') | list }}
+
+- name: 'Show the legacy runner services'
+  ansible.builtin.debug:
+    msg: "Legacy runner services, stopped and removed below: {{ _runner_host_legacy_units | join(', ') }}"
+  when: "_runner_host_legacy_units | length > 0"
+
+# ACCOUNT PROTECTION (from the installer)
+# The de-privileging step locks an account and kills its processes. Run it on
+# the box's admin user and you lock yourself out. Cloud images ship a NOPASSWD
+# sudo user at uid 1000 with the only authorized_keys on the system, and it
+# looks exactly like an "over-privileged user" to a naive scan.
+
+- name: 'Read the account databases'
+  ansible.builtin.getent:
+    database: "{{ _runner_host_database }}"
+  loop: ['passwd', 'group']
+  loop_control:
+    loop_var: '_runner_host_database'
+
+- name: 'List the live login sessions'
+  ansible.builtin.command:
+    argv: ['loginctl', 'list-sessions', '--no-legend']
+  register: '_runner_host_sessions'
+  changed_when: false
+  failed_when: false
+
+- name: 'Find the accounts that hold SSH keys'
+  ansible.builtin.find:
+    paths: '/home'
+    patterns: 'authorized_keys'
+    recurse: true
+    depth: 3
+    file_type: 'file'
+  register: '_runner_host_ssh_keys'
+
+- name: 'Find the accounts granted passwordless sudo'
+  ansible.builtin.command:
+    argv: ['grep', '-rhoE', '^[a-z_][a-z0-9_-]*[[:space:]]+ALL=\(ALL\)[[:space:]]+NOPASSWD', '/etc/sudoers.d/']
+  register: '_runner_host_nopasswd'
+  changed_when: false
+  failed_when: "_runner_host_nopasswd.rc > 1"
+
+# The account driving this play comes in through sudo (SUDO_USER), or is the
+# inventory's ansible_user.
+- name: 'Work out which accounts must never be locked'
+  ansible.builtin.set_fact:
+    _runner_host_invokers: "{{ _invokers }}"
+    _runner_host_protected_users: >-
+      {{ (_invokers
+          + (_runner_host_sessions.stdout_lines | map('split') | select | map(attribute=2, default='') | list)
+          + (ansible_facts['getent_passwd'] | dict2items | selectattr('value.1', 'equalto', '1000') | map(attribute='key') | list)
+          + (_runner_host_ssh_keys.files | map(attribute='pw_name') | list)
+          + (_runner_host_nopasswd.stdout_lines | map('split') | map('first') | list))
+         | reject('in', ['', 'root']) | unique | sort }}
+  vars:
+    _invokers: >-
+      {{ [ansible_facts['env']['SUDO_USER'] | default(''), ansible_user | default('')]
+         | reject('in', ['', 'root']) | unique | list }}
+
+# Reported, never acted on: only runner_old_users is de-privileged.
+- name: 'Work out which accounts look over-privileged'
+  ansible.builtin.set_fact:
+    _runner_host_old_user_candidates: >-
+      {{ ((_runner_host_legacy_status.results | default([]) | map(attribute='status')
+           | map(attribute='User', default='') | list)
+          + (ansible_facts['getent_group'] | dict2items | selectattr('key', 'in', _runner_host_candidate_groups)
+             | map(attribute='value') | map(attribute=2, default='') | map('split', ',') | flatten))
+         | reject('in', ['', 'root']) | reject('match', '^' ~ runner_user_prefix)
+         | reject('in', _runner_host_protected_users) | unique | sort }}
+
+- name: 'Report the accounts that look over-privileged'
+  ansible.builtin.debug:
+    msg: >-
+      Over-privileged or runner accounts found: {{ _runner_host_old_user_candidates | join(', ') }}.
+      {% if runner_old_users | length == 0 %}Nothing is de-privileged while runner_old_users is
+      empty; list the account that ran the jobs there.{% endif %}
+  when: "_runner_host_old_user_candidates | length > 0"
+
+- name: 'Report the accounts protected from de-privileging'
+  ansible.builtin.debug:
+    msg: >-
+      Protected from de-privileging (admin account, holds SSH keys, or has a
+      live session): {{ _runner_host_protected_users | join(', ') }}
+  when: "_runner_host_protected_users | length > 0"
+
+- name: 'Warn that a rootful Docker daemon is running'
+  ansible.builtin.debug:
+    msg: 'WARNING: the rootful docker.service is running: jobs can reach a root socket.'
+  when: "(ansible_facts['services'] | default({})).get('docker.service', {}).get('state', '') == 'running'"

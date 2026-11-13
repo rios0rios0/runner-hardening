@@ -1,0 +1,6 @@
+# {{ _runner_host_managed }}
+[Slice]
+# sshd, journald and systemd itself are never reclaimed below this. You keep
+# your shell even while CI is fighting for the last megabyte.
+MemoryAccounting=yes
+MemoryMin={{ runner_rp_sysmin }}M

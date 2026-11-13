@@ -1,0 +1,65 @@
+---
+# Installed first, so the admin tool can audit a box on its very first
+# converge, and so a vendor role can already drain and undrain through it.
+
+- name: 'Create the directories the runtime lives in'
+  ansible.builtin.file:
+    path: "{{ _runner_host_dir.path }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: "{{ _runner_host_dir.mode }}"
+  loop:
+    - {path: "{{ _runner_host_lib_dir }}", mode: '0755'}
+    - {path: "{{ _runner_host_libexec_dir }}", mode: '0755'}
+    - {path: "{{ _runner_host_etc_dir }}", mode: '0755'}
+    - {path: "{{ _runner_host_state_dir }}", mode: '0700'}
+  loop_control:
+    loop_var: '_runner_host_dir'
+
+# Runtime scripts source it at every start, so an idle runner is restarted to
+# pick up a new one rather than waiting for its next job.
+- name: 'Install the shared runtime library'
+  ansible.builtin.copy:
+    src: 'lib.sh'
+    dest: "{{ _runner_host_lib_dir }}/lib.sh"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+    validate: '/bin/bash -n %s'
+  notify: 'Restart idle runners'
+
+- name: 'Install the admin tool'
+  ansible.builtin.copy:
+    src: 'runner-admin.sh'
+    dest: "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+    validate: '/bin/bash -n %s'
+
+# Every runtime script takes its paths and thresholds from here, not from
+# values baked in at install time. A change to the trust level must reach an
+# idle runner before its next job, which the restart does: the disk guard reads
+# it before the runner registers again.
+- name: 'Write the host configuration the runtime scripts read'
+  ansible.builtin.template:
+    src: 'host.env.j2'
+    dest: "{{ _runner_host_env_file }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+  notify: 'Restart idle runners'
+
+- name: 'Audit the persistence surfaces a root-capable job could have used'
+  ansible.builtin.command:
+    argv:
+      - "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+      - 'audit'
+  register: '_runner_host_audit'
+  changed_when: false
+  failed_when: false
+
+- name: 'Show the audit'
+  ansible.builtin.debug:
+    msg: "{{ _runner_host_audit.stdout_lines + _runner_host_audit.stderr_lines }}"

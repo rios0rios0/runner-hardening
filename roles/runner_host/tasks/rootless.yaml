@@ -1,0 +1,91 @@
+---
+# Rootless Docker per runner: container: jobs and docker build keep working
+# with no root-owned socket for a job to reach. Only a runner whose socket is
+# missing is (re)installed, so a converge never restarts a daemon in use.
+
+- name: 'Look for each runner rootless Docker socket'
+  ansible.builtin.stat:
+    path: "/run/user/{{ _runner_host_uids[_runner_host_n | string] }}/docker.sock"
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+  register: '_runner_host_sockets'
+
+- name: 'List the runners that need their rootless Docker set up'
+  ansible.builtin.set_fact:
+    _runner_host_need_docker: >-
+      {{ _runner_host_sockets.results | rejectattr('stat.issock', 'defined') | map(attribute='_runner_host_n') | list
+         + (_runner_host_sockets.results | selectattr('stat.issock', 'defined') | rejectattr('stat.issock')
+            | map(attribute='_runner_host_n') | list) }}
+
+- name: 'Set up rootless Docker'
+  when: "_runner_host_need_docker | length > 0"
+  vars:
+    # The runner's own uid, a clean environment, and the paths its user manager
+    # and daemon live under. setpriv, like the runtime scripts' as_runner.
+    _runner_host_uid: "{{ _runner_host_uids[_runner_host_n | string] }}"
+    _runner_host_as_user:
+      - 'setpriv'
+      - "--reuid={{ runner_user_prefix }}{{ _runner_host_n }}"
+      - "--regid={{ runner_user_prefix }}{{ _runner_host_n }}"
+      - '--init-groups'
+      - '--'
+      - 'env'
+      - '-i'
+      - "HOME=/home/{{ runner_user_prefix }}{{ _runner_host_n }}"
+      - "USER={{ runner_user_prefix }}{{ _runner_host_n }}"
+      - "LOGNAME={{ runner_user_prefix }}{{ _runner_host_n }}"
+      - "XDG_RUNTIME_DIR=/run/user/{{ _runner_host_uid }}"
+      - "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ _runner_host_uid }}/bus"
+      - "DOCKER_HOST=unix:///run/user/{{ _runner_host_uid }}/docker.sock"
+      - "PATH=/usr/bin:/usr/sbin:/bin:/sbin:/home/{{ runner_user_prefix }}{{ _runner_host_n }}/bin"
+  block:
+    - name: 'Install each missing rootless Docker daemon'
+      ansible.builtin.command:
+        argv: "{{ _runner_host_as_user + ['dockerd-rootless-setuptool.sh', 'install', '--force'] }}"
+      loop: "{{ _runner_host_need_docker }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+      register: '_runner_host_rootless_setup'
+      changed_when: "_runner_host_rootless_setup.rc == 0"
+      failed_when: false
+
+    - name: 'Fail on a rootless Docker that would not install'
+      ansible.builtin.fail:
+        msg: >-
+          rootless docker setup failed for {{ runner_user_prefix }}{{ _runner_host_failed._runner_host_n }}
+          (try: journalctl --user -u docker -M {{ runner_user_prefix }}{{ _runner_host_failed._runner_host_n }}@):
+          {{ (_runner_host_failed.stderr_lines | default([]))[-5:] | join(' / ') }}
+      loop: "{{ _runner_host_rootless_setup.results | rejectattr('rc', 'equalto', 0) | list }}"
+      loop_control:
+        loop_var: '_runner_host_failed'
+        label: "{{ runner_user_prefix }}{{ _runner_host_failed._runner_host_n }}"
+
+    - name: 'Enable each new rootless Docker daemon'
+      ansible.builtin.command:
+        argv: "{{ _runner_host_as_user + ['systemctl', '--user', 'enable', '--now', 'docker.service'] }}"
+      loop: "{{ _runner_host_need_docker }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+      register: '_runner_host_rootless_enable'
+      changed_when: "_runner_host_rootless_enable.rc == 0"
+      failed_when: false
+
+    - name: 'Wait for each new rootless Docker socket'
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ _runner_host_uids[_runner_host_n | string] }}/docker.sock"
+        timeout: 40
+        msg: "rootless docker socket never appeared for {{ runner_user_prefix }}{{ _runner_host_n }}"
+      loop: "{{ _runner_host_need_docker }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+
+    - name: 'Create each new runner buildx builder'
+      ansible.builtin.command:
+        argv: "{{ _runner_host_as_user + ['docker', 'buildx', 'create', '--name', runner_sbin_prefix, '--driver', 'docker-container', '--use'] }}"
+      loop: "{{ _runner_host_need_docker }}"
+      loop_control:
+        loop_var: '_runner_host_n'
+      register: '_runner_host_buildx'
+      changed_when: "_runner_host_buildx.rc == 0"
+      failed_when: false

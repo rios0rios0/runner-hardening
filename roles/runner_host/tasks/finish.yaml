@@ -1,0 +1,61 @@
+---
+# Entry point 2 of 3, included by the vendor role once its helpers, its
+# configuration and the runner or agent trees are in place (contract
+# section 6). Writes the unit and the memory policy, brings every instance up,
+# installs the housekeeping timers and verifies the host.
+
+# The guard runs before every job, so an idle runner is restarted to run the
+# new one before its next job rather than after it.
+- name: 'Install the disk guard'
+  ansible.builtin.copy:
+    src: 'runner-diskguard.sh'
+    dest: "/usr/local/sbin/{{ runner_sbin_prefix }}-diskguard"
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+    validate: '/bin/bash -n %s'
+  notify: 'Restart idle runners'
+
+- name: 'Install the janitor'
+  ansible.builtin.copy:
+    src: 'runner-janitor.sh'
+    dest: "/usr/local/sbin/{{ runner_sbin_prefix }}-janitor"
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+    validate: '/bin/bash -n %s'
+
+- name: 'Work out the memory policy'
+  ansible.builtin.import_tasks: 'policy.yaml'
+
+- name: 'Write the unit, the slice and the drop-ins, and bring every runner up'
+  ansible.builtin.import_tasks: 'units.yaml'
+
+- name: 'Install the janitor timer'
+  ansible.builtin.import_tasks: 'janitor.yaml'
+
+- name: 'Configure unattended security upgrades'
+  ansible.builtin.import_tasks: 'unattended.yaml'
+
+- name: 'Install the reboot guard'
+  ansible.builtin.import_tasks: 'reboot_guard.yaml'
+
+# The previous non-ephemeral runner keeps its registration after its service
+# is removed - it sits there permanently offline, cluttering the runner list.
+# Through the admin tool, so there is exactly one implementation of the reap.
+- name: 'Reap the stale registrations this host left behind'
+  ansible.builtin.command:
+    argv:
+      - "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+      - 'reap'
+  register: '_runner_host_reap'
+  changed_when: "_runner_host_reap.stdout is search('reaped [1-9]')"
+  failed_when: false
+
+- name: 'Show the reap'
+  ansible.builtin.debug:
+    msg: "{{ _runner_host_reap.stdout_lines + _runner_host_reap.stderr_lines }}"
+  when: "(_runner_host_reap.stdout + _runner_host_reap.stderr) | length > 0"
+
+- name: 'Verify the host'
+  ansible.builtin.import_tasks: 'verify.yaml'

@@ -1,0 +1,141 @@
+---
+# Take one runner off this box completely: unit, drop-ins, rootless Docker,
+# user, home, runner tree and tool cache. The user manager is stopped before
+# the processes are killed, not by it: a manager killed mid-shutdown is left
+# behind as a failed user@<uid>.service once its user no longer exists. The
+# tree goes last, so a removal interrupted halfway is found and finished by
+# the next converge.
+
+- name: "Read the unit of runner {{ _runner_host_n }}"
+  ansible.builtin.systemd_service:
+    name: "{{ runner_unit }}@{{ _runner_host_n }}.service"
+  register: '_runner_host_retire_unit'
+
+- name: "Stop and disable runner {{ _runner_host_n }}"
+  ansible.builtin.systemd_service:
+    name: "{{ runner_unit }}@{{ _runner_host_n }}.service"
+    enabled: false
+    state: 'stopped'
+  when: "_runner_host_retire_unit.status.LoadState | default('not-found') != 'not-found'"
+
+- name: "Clear the failed state of runner {{ _runner_host_n }}"
+  ansible.builtin.command:
+    argv: ['systemctl', 'reset-failed', "{{ runner_unit }}@{{ _runner_host_n }}.service"]
+  changed_when: false
+  failed_when: false
+
+# Includes any 20-sandbox-relax.conf and the drain override.
+- name: "Remove the drop-ins of runner {{ _runner_host_n }}"
+  ansible.builtin.file:
+    path: "{{ _runner_host_systemd_dir }}/{{ runner_unit }}@{{ _runner_host_n }}.service.d"
+    state: 'absent'
+
+- name: "Read the account of runner {{ _runner_host_n }}"
+  ansible.builtin.getent:
+    database: 'passwd'
+    key: "{{ runner_user_prefix }}{{ _runner_host_n }}"
+    fail_key: false
+
+- name: "Remove the account of runner {{ _runner_host_n }}"
+  when: "ansible_facts['getent_passwd'][_runner_host_user] is not none"
+  vars:
+    _runner_host_user: "{{ runner_user_prefix }}{{ _runner_host_n }}"
+    _runner_host_uid: "{{ ansible_facts['getent_passwd'][_runner_host_user][1] }}"
+  block:
+    - name: "Remove the container memory drop-in of runner {{ _runner_host_n }}"
+      ansible.builtin.file:
+        path: "{{ _runner_host_systemd_dir }}/user-{{ _runner_host_uid }}.slice.d"
+        state: 'absent'
+
+    - name: "Stop the rootless Docker of runner {{ _runner_host_n }}"
+      ansible.builtin.command:
+        argv:
+          - 'setpriv'
+          - "--reuid={{ _runner_host_user }}"
+          - "--regid={{ _runner_host_user }}"
+          - '--init-groups'
+          - '--'
+          - 'env'
+          - '-i'
+          - "HOME=/home/{{ _runner_host_user }}"
+          - "USER={{ _runner_host_user }}"
+          - "LOGNAME={{ _runner_host_user }}"
+          - "XDG_RUNTIME_DIR=/run/user/{{ _runner_host_uid }}"
+          - "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ _runner_host_uid }}/bus"
+          - 'PATH=/usr/bin:/usr/sbin:/bin:/sbin'
+          - 'systemctl'
+          - '--user'
+          - 'disable'
+          - '--now'
+          - 'docker.service'
+      register: '_runner_host_retire_docker'
+      changed_when: "_runner_host_retire_docker.rc == 0"
+      failed_when: false
+
+    - name: "Stop the lingering of runner {{ _runner_host_n }}"
+      ansible.builtin.command:
+        argv: ['loginctl', 'disable-linger', "{{ _runner_host_user }}"]
+        removes: "/var/lib/systemd/linger/{{ _runner_host_user }}"
+
+    - name: "Read the user manager of runner {{ _runner_host_n }}"
+      ansible.builtin.systemd_service:
+        name: "user@{{ _runner_host_uid }}.service"
+      register: '_runner_host_retire_manager'
+
+    - name: "Stop the user manager of runner {{ _runner_host_n }}"
+      ansible.builtin.systemd_service:
+        name: "user@{{ _runner_host_uid }}.service"
+        state: 'stopped'
+      when: "_runner_host_retire_manager.status.ActiveState | default('inactive') in ['active', 'activating', 'deactivating']"
+
+    - name: "Kill what is left of runner {{ _runner_host_n }}"
+      ansible.builtin.command:
+        argv: ['pkill', '-KILL', '-u', "{{ _runner_host_user }}"]
+      register: '_runner_host_retire_pkill'
+      changed_when: "_runner_host_retire_pkill.rc == 0"
+      failed_when: "_runner_host_retire_pkill.rc > 1"
+
+    - name: "Remove the user and home of runner {{ _runner_host_n }}"
+      ansible.builtin.user:
+        name: "{{ _runner_host_user }}"
+        state: 'absent'
+        remove: true
+
+    - name: "Remove the subordinate ids of runner {{ _runner_host_n }}"
+      ansible.builtin.lineinfile:
+        path: "{{ _runner_host_subid_file }}"
+        regexp: "^{{ _runner_host_user }}:"
+        state: 'absent'
+      loop: ['/etc/subuid', '/etc/subgid']
+      loop_control:
+        loop_var: '_runner_host_subid_file'
+
+    - name: "Clear the failed state of the user manager of runner {{ _runner_host_n }}"
+      ansible.builtin.command:
+        argv: ['systemctl', 'reset-failed', "user@{{ _runner_host_uid }}.service"]
+      changed_when: false
+      failed_when: false
+
+- name: "Find the runtime files of runner {{ _runner_host_n }}"
+  ansible.builtin.find:
+    paths: "/run/{{ runner_unit }}"
+    patterns: "{{ _runner_host_n }}.*"
+  register: '_runner_host_retire_runtime'
+
+- name: "Remove the runtime files of runner {{ _runner_host_n }}"
+  ansible.builtin.file:
+    path: "{{ _runner_host_runtime_file }}"
+    state: 'absent'
+  loop: "{{ _runner_host_retire_runtime.files | map(attribute='path') | list }}"
+  loop_control:
+    loop_var: '_runner_host_runtime_file'
+
+- name: "Remove the tree and tool cache of runner {{ _runner_host_n }}"
+  ansible.builtin.file:
+    path: "{{ _runner_host_tree }}"
+    state: 'absent'
+  loop:
+    - "{{ _runner_host_toolcache_prefix }}{{ runner_user_prefix }}{{ _runner_host_n }}"
+    - "{{ runner_base_dir }}/{{ _runner_host_n }}"
+  loop_control:
+    loop_var: '_runner_host_tree'

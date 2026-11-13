@@ -1,0 +1,228 @@
+---
+# Nothing here changes the host. It refuses to start on a box or with answers
+# the installer would also have refused, before anything destructive runs.
+
+- name: 'Gather the facts this role reads'
+  ansible.builtin.setup:
+    gather_subset: ['!all', 'min', 'hardware']
+  when: >-
+    ansible_facts['distribution'] is not defined
+    or ansible_facts['memtotal_mb'] is not defined
+    or ansible_facts['mounts'] is not defined
+
+- name: 'Refuse a host that is not dedicated to CI'
+  ansible.builtin.assert:
+    that: "runner_host_dedicated | bool"
+    fail_msg: >-
+      runner_host_dedicated is not true for {{ inventory_hostname }}. This role
+      de-privileges accounts, disables the rootful Docker daemon, deletes build
+      state and takes over the box's memory policy. Set it to true only for a
+      machine that does nothing but run CI jobs.
+    quiet: true
+
+- name: 'Check that the vendor role set the flavour'
+  ansible.builtin.assert:
+    that:
+      - "runner_flavor is defined and runner_flavor in _runner_host_flavor_noun"
+      - "runner_user_prefix is defined and runner_user_prefix is match('^[a-z][a-z0-9]*$')"
+      - "runner_base_dir is defined and runner_base_dir is match('^/[A-Za-z0-9._/-]*[A-Za-z0-9]$')"
+      - "runner_unit is defined and runner_unit is match('^[a-z][a-z0-9-]*$')"
+      - "runner_slice is defined and runner_slice is match('^[a-z][a-z0-9-]*[.]slice$')"
+      - "runner_sbin_prefix is defined and runner_sbin_prefix is match('^[a-z][a-z0-9]*$')"
+      - "runner_config_dir is defined and runner_config_dir is match('^/[A-Za-z0-9._/-]+$')"
+      - "runner_worker_pattern is defined and runner_worker_pattern | length > 0"
+      - "runner_work_policy is defined and runner_work_policy in ['wipe', 'lru']"
+      - "runner_legacy_unit_globs is defined and runner_legacy_unit_globs is sequence and runner_legacy_unit_globs is not string"
+      - "runner_unit_description is defined and runner_unit_description | length > 0"
+      - "runner_unit_exec_start_pre is defined and runner_unit_exec_start_pre is sequence and runner_unit_exec_start_pre is not string"
+      - "runner_unit_exec_start is defined and runner_unit_exec_start is string"
+      - "runner_unit_exec_stop_post is defined and runner_unit_exec_stop_post is sequence and runner_unit_exec_stop_post is not string"
+      - "runner_heavy_env is defined and runner_heavy_env is mapping"
+    fail_msg: >-
+      The flavour facts are missing or malformed. runner_host is included by a
+      vendor role (runner_github, runner_azure_devops), which sets them first.
+    quiet: true
+
+- name: 'Check the account the play runs as'
+  ansible.builtin.assert:
+    that: "ansible_facts['effective_user_id'] | int == 0"
+    fail_msg: 'Run as root: set become: true on the play.'
+    quiet: true
+
+- name: 'Check the operating system'
+  ansible.builtin.assert:
+    that: "ansible_facts['distribution'] == 'Ubuntu'"
+    fail_msg: >-
+      Found {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] | default('') }}.
+      This role targets Ubuntu only: the Docker CE source it adds is Ubuntu's.
+    quiet: true
+
+- name: 'Check the architecture'
+  ansible.builtin.assert:
+    that: "ansible_facts['architecture'] == 'x86_64'"
+    fail_msg: "The runner and agent builds this installs are x64; found {{ ansible_facts['architecture'] }}."
+    quiet: true
+
+- name: 'Check the kernel'
+  ansible.builtin.assert:
+    that: "(ansible_facts['kernel'] | regex_search('^[0-9]+[.][0-9]+') | default('0.0', true)) is version('5.11', '>=')"
+    fail_msg: "Kernel {{ ansible_facts['kernel'] }} is too old for rootless overlayfs (need >= 5.11)."
+    quiet: true
+
+- name: 'Look for the unified cgroup hierarchy'
+  ansible.builtin.stat:
+    path: '/sys/fs/cgroup/cgroup.controllers'
+  register: '_runner_host_cgroup2'
+
+- name: 'Check that cgroup v2 is active'
+  ansible.builtin.assert:
+    that: "_runner_host_cgroup2.stat.exists"
+    fail_msg: 'cgroup v2 is required (this box is on cgroup v1): the memory policy and rootless Docker both depend on it.'
+    quiet: true
+
+# The installer's wizard refused these answers. Leading zeros are refused, not
+# trimmed: bash arithmetic reads 08 as octal and dies on it far from here.
+- name: 'Check the answers'
+  ansible.builtin.assert:
+    that:
+      - "runner_trust in ['internal', 'untrusted']"
+      - "(runner_count | string | trim) == 'auto' or ((runner_count | string | trim) is match('^[0-9]+$') and runner_count | int >= 1)"
+      - "(runner_heavy_runners | string | trim) is match('^(0|[1-9][0-9]*)$')"
+      - "(runner_codeql_ram | string | trim) is match('^(auto|off|[1-9][0-9]*)$')"
+      - "runner_slice_ceiling in ['none', 'heavy', 'all']"
+      - "runner_old_users is sequence and runner_old_users is not string"
+      - "runner_old_users | reject('match', '^[a-z_][a-z0-9_-]*[$]?$') | list | length == 0"
+      - "'root' not in runner_old_users"
+      - "runner_old_users | select('match', '^' ~ runner_user_prefix ~ '[0-9]+$') | list | length == 0"
+      - "(runner_drain_timeout | string) is match('^[0-9]+$')"
+      - "(runner_disk_soft_pct | string) is match('^[0-9]+$') and (runner_disk_hard_pct | string) is match('^[0-9]+$')"
+      - "0 < runner_disk_soft_pct | int < runner_disk_hard_pct | int <= 100"
+      - "(runner_stale_days | string) is match('^[1-9][0-9]*$')"
+      - "(runner_mem_mb | string) is match('^[0-9]+$') and (runner_vcpus | string) is match('^[1-9][0-9]*$')"
+    fail_msg: >-
+      An answer is out of range: runner_trust is internal or untrusted;
+      runner_count is auto or a positive integer; runner_heavy_runners is 0 or
+      a positive integer without leading zeros; runner_codeql_ram is auto, off
+      or a number of MB; runner_slice_ceiling is none, heavy or all;
+      runner_old_users lists account names, never root nor one of this role's
+      own {{ runner_user_prefix }}<n> users; runner_drain_timeout is a number of
+      seconds; 0 < runner_disk_soft_pct < runner_disk_hard_pct <= 100;
+      runner_stale_days is a positive number of days.
+    quiet: true
+
+# A path with a space would split RUNNER_HOME_KEEP, which is space-separated,
+# and an absolute or ../ path would reach outside the home it is meant to keep.
+- name: 'Check the home paths to keep and to seed'
+  ansible.builtin.assert:
+    that:
+      - "runner_home_keep_extra is sequence and runner_home_keep_extra is not string"
+      - "runner_home_seed is mapping"
+      - "(runner_home_keep_extra + (runner_home_seed | list)) | reject('match', _relative) | list | length == 0"
+      - "(runner_home_keep_extra + (runner_home_seed | list)) | select('match', '(^|.*/)[.][.](/.*|$)') | list | length == 0"
+      - "runner_home_seed.values() | map('string') | reject('match', '^/\\S+$') | list | length == 0"
+    fail_msg: >-
+      runner_home_keep_extra and the keys of runner_home_seed are paths
+      relative to a runner's home, without spaces or '..'; every value of
+      runner_home_seed is an absolute path on the host.
+    quiet: true
+  vars:
+    _relative: '^[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*$'
+
+- name: 'Check the extra packages and apt sources'
+  ansible.builtin.assert:
+    that:
+      - "runner_extra_packages is sequence and runner_extra_packages is not string"
+      - "runner_extra_apt_repositories is sequence and runner_extra_apt_repositories is not string"
+      - "runner_extra_apt_repositories | rejectattr('name', 'defined') | list | length == 0"
+      - "runner_extra_apt_repositories | rejectattr('key_url', 'defined') | list | length == 0"
+      - "runner_extra_apt_repositories | rejectattr('repo', 'defined') | list | length == 0"
+      - "runner_extra_apt_repositories | map(attribute='name') | reject('match', '^[a-z0-9][a-z0-9._-]*$') | list | length == 0"
+      - "runner_extra_apt_repositories | map(attribute='key_url') | reject('match', '^https://') | list | length == 0"
+      - "'docker' not in (runner_extra_apt_repositories | map(attribute='name'))"
+      - "_unsigned | length == 0"
+    fail_msg: >-
+      runner_extra_packages is a list of package names, and every entry of
+      runner_extra_apt_repositories has a name (lowercase, not 'docker', which
+      this role manages), an https key_url, and a repo line whose signed-by
+      names the key this role stores, /etc/apt/keyrings/<name>.asc.
+      {{ ('Not so for: ' ~ (_unsigned | join(', '))) if _unsigned | length > 0 else '' }}
+    quiet: true
+  vars:
+    # The entries whose repo line does not trust the key this role stores.
+    _unsigned: >-
+      {% set out = [] %}{% for r in runner_extra_apt_repositories if r is mapping %}{% if (r.repo | default('') | string)
+      is not search('signed-by=/etc/apt/keyrings/' ~ (r.name | default('') | string | regex_escape) ~ '[.]asc([], ]|$)') %}{%
+      set _ = out.append(r.name | default('?')) %}{% endif %}{% endfor %}{{ out }}
+
+# Installed as /usr/local/bin/<name>, so a name is one path component, and a
+# member is a relative path that stays inside its archive.
+- name: 'Check the extra binaries'
+  ansible.builtin.assert:
+    that:
+      - "runner_extra_binaries is sequence and runner_extra_binaries is not string"
+      - "runner_extra_binaries | rejectattr('name', 'defined') | list | length == 0"
+      - "runner_extra_binaries | rejectattr('url', 'defined') | list | length == 0"
+      - "runner_extra_binaries | rejectattr('sha256', 'defined') | list | length == 0"
+      - "runner_extra_binaries | map(attribute='name') | map('string') | reject('match', '^[A-Za-z0-9_+-][A-Za-z0-9._+-]*$') | list | length == 0"
+      - "runner_extra_binaries | map(attribute='name') | list | unique | length == runner_extra_binaries | length"
+      - "runner_extra_binaries | map(attribute='url') | map('string') | reject('match', '^https://') | list | length == 0"
+      - "runner_extra_binaries | map(attribute='sha256') | map('string') | map('lower') | reject('match', '^[0-9a-f]{64}$') | list | length == 0"
+      - "(_members + _targets) | reject('match', '^[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*$') | list | length == 0"
+      - "(_members + _targets) | select('match', '(^|.*/)[.][.](/.*|$)') | list | length == 0"
+      - "runner_extra_binaries | selectattr('links', 'defined') | map(attribute='links') | reject('mapping') | list | length == 0"
+      - "runner_extra_binaries | selectattr('links', 'defined') | rejectattr('member', 'defined') | list | length == 0"
+      - "_commands | reject('match', '^[A-Za-z0-9_+-][A-Za-z0-9._+-]*$') | list | length == 0"
+      - "_commands | unique | length == _commands | length"
+    fail_msg: >-
+      Every entry of runner_extra_binaries has a name (one path component, used
+      as /usr/local/bin/<name>), an https url and the sha256 of what the url
+      serves. member, when set, is a relative path inside the .tar.gz or .zip,
+      without '..': a file, or a directory together with links, which maps each
+      command to put in /usr/local/bin to its relative path inside that
+      directory. No two entries may install the same command.
+    quiet: true
+  vars:
+    _members: "{{ runner_extra_binaries | selectattr('member', 'defined') | map(attribute='member') | map('string') | select | list }}"
+    _links: "{{ runner_extra_binaries | selectattr('links', 'defined') | map(attribute='links') | select('mapping') | list }}"
+    _targets: "{{ _links | map('dict2items') | flatten | map(attribute='value') | map('string') | list }}"
+    # The names that land in /usr/local/bin: a tool tree installs its links only.
+    _commands: >-
+      {{ (runner_extra_binaries | rejectattr('links', 'defined') | map(attribute='name') | map('string') | list)
+         + (_links | map('dict2items') | flatten | map(attribute='key') | map('string') | list) }}
+
+# Environment= values are unquoted in the drop-in, and systemd reads a % as a
+# specifier there.
+- name: 'Check the environment the heavy runners get'
+  ansible.builtin.assert:
+    that:
+      - "runner_heavy_env.keys() | map('string') | reject('match', '^[A-Za-z_][A-Za-z0-9_]*$') | list | length == 0"
+      - "runner_heavy_env.values() | map('string') | reject('match', '^[A-Za-z0-9._,:/=@+-]*$') | list | length == 0"
+    fail_msg: 'runner_heavy_env maps variable names to plain values: no spaces, quotes, backslashes or %.'
+    quiet: true
+
+- name: 'Warn that many runners on few vCPUs will thrash'
+  ansible.builtin.debug:
+    msg: "WARNING: {{ runner_count }} runners on {{ runner_vcpus }} vCPU will thrash."
+  when:
+    - "(runner_count | string | trim) != 'auto'"
+    - "runner_count | int > (runner_vcpus | int) * 2"
+
+- name: 'Warn that every runner will take heavy jobs'
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ runner_heavy_runners }} heavy runners on a box with
+      {{ runner_count }}: every runner takes heavy jobs.
+  when:
+    - "(runner_count | string | trim) != 'auto'"
+    - "runner_heavy_runners | int > runner_count | int"
+
+- name: 'Warn that kept paths survive an untrusted reset'
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: with runner_trust untrusted, the reset before every job keeps
+      runner_home_keep_extra and every runner_home_seed path, so a fork PR can
+      leave something there for the next job. Keep both empty on untrusted
+      runners unless that is acceptable.
+  when:
+    - "runner_trust == 'untrusted'"
+    - "(runner_home_keep_extra | length > 0) or (runner_home_seed | length > 0)"

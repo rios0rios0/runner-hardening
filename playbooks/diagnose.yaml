@@ -1,0 +1,33 @@
+---
+# Why a runner will not stay up: unit state, the restart backoff, cache
+# sizes, the journal and the runner's own logs, per instance. Changes nothing
+# and never fails a host.
+#
+#   ansible-playbook playbooks/diagnose.yaml --limit build-01
+- name: 'Diagnose the runner hosts'
+  hosts: 'runner_hosts'
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 'Load the flavour of this host'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'host_env'
+
+    - name: 'Check that this host has the admin tool'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'require_admin'
+
+    - name: 'Collect the diagnostics'
+      ansible.builtin.command:
+        argv:
+          - "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+          - 'diagnose'
+      register: 'runner_diagnose_result'
+      changed_when: false
+      failed_when: false
+
+    - name: 'Show the diagnostics'
+      ansible.builtin.debug:
+        msg: "{{ runner_diagnose_result.stdout_lines + runner_diagnose_result.stderr_lines }}"

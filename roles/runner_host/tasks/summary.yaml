@@ -1,0 +1,48 @@
+---
+# Entry point the vendor roles include last: one short summary per host - the
+# instances and their unit state, the memory policy, and the next steps. The
+# vendor adds its own lines (labels, a runs-on or demands example) through
+# runner_summary_lines.
+
+- name: 'Read the state of every runner unit'
+  ansible.builtin.systemd_service:
+    name: "{{ runner_unit }}@{{ _runner_host_n }}.service"
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_host_n'
+  register: '_runner_host_summary_units'
+
+- name: 'Summarise this host'
+  ansible.builtin.debug:
+    msg: "{{ _lines }}"
+  vars:
+    _noun: "{{ _runner_host_flavor_noun[runner_flavor] }}"
+    _units: >-
+      {% set out = [] %}{% for r in _runner_host_summary_units.results %}{%
+      set n = r._runner_host_n %}{% set s = r.status | default({}) %}{%
+      set _ = out.append('  ' ~ runner_unit ~ '@' ~ n ~ ' (' ~ runner_user_prefix ~ n ~ '): '
+        ~ s.ActiveState | default('?') ~ '/' ~ s.SubState | default('?')
+        ~ ', ' ~ s.UnitFileState | default('?')
+        ~ ', >= ' ~ runner_rp_fair ~ ' MB guaranteed, up to ' ~ runner_rp_ceilings[n - 1] ~ ' MB'
+        ~ (', heavy' if n <= (_runner_host_rp_heavy | int) else '')) %}{% endfor %}{{ out }}
+    _lines: >-
+      {{ [runner_count_resolved ~ ' ephemeral ' ~ _noun ~ '(s) on ' ~ ansible_facts['hostname'] | default(inventory_hostname)
+          ~ ', trust ' ~ runner_trust]
+         + _units
+         + ['memory: all ' ~ runner_count_resolved ~ ' together capped at ' ~ runner_rp_aggregate ~ ' MB by '
+            ~ runner_slice ~ '; the OS keeps ' ~ runner_rp_sysmin ~ ' MB; '
+            ~ (('CODEQL_RAM=' ~ runner_rp_codeql ~ ' MB') if runner_rp_codeql | string | length > 0
+               else 'CODEQL_RAM unset - CodeQL sizes itself from the whole box')]
+         + (['retired: ' ~ (runner_surplus_instances | join(', '))] if runner_surplus_instances | default([]) | length > 0 else [])
+         + (['units installed and enabled but not started (runner_start_units: false)'] if not (runner_start_units | bool) else [])
+         + ['watch: journalctl -fu ' ~ "'" ~ runner_unit ~ "@*'" ~ ' ; systemctl status ' ~ "'" ~ runner_unit ~ "@*'",
+            'housekeeping: ' ~ runner_sbin_prefix ~ '-diskguard before every job (past ' ~ runner_disk_soft_pct
+            ~ '% disk, that runner frees its own caches); ' ~ runner_sbin_prefix ~ '-janitor.timer daily'
+            ~ ((' ; ' ~ runner_sbin_prefix ~ '-reboot.timer 02:00-05:00, only when no runner is busy')
+               if runner_reboot_guard | bool else '')]
+         + (['the old accounts are locked but still present - delete them when satisfied: '
+             ~ (runner_old_users | reject('equalto', 'none') | map('regex_replace', '^(.*)$', 'pkill -u \1; userdel -r \1')
+                | join(' ; '))]
+            if runner_old_users | reject('equalto', 'none') | list | length > 0 else [])
+         + (runner_summary_lines | default([]))
+         + ['next: playbooks/verify.yaml re-checks the host; playbooks/diagnose.yaml explains a runner that will not stay up'] }}

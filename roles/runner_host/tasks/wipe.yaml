@@ -1,0 +1,129 @@
+---
+# Destroys the build state the old setup left: the rootful Docker stack and
+# its image store, the old accounts' caches, every stray _work directory.
+# Once per host, ever (the marker): the installer wiped on every run because
+# it drained its own runners first, and a converge does not. The sweep never
+# enters a tree this role owns or one a vendor role is about to adopt, so it
+# cannot race a live job, and it never deletes as root inside a directory a
+# job can write.
+
+- name: 'Check whether the one-time wipe already ran'
+  ansible.builtin.stat:
+    path: "{{ _runner_host_wipe_marker }}"
+  register: '_runner_host_wiped'
+
+- name: 'Destroy the poisoned build state'
+  when: "not _runner_host_wiped.stat.exists"
+  block:
+    - name: 'Refuse to wipe a host that is not dedicated'
+      ansible.builtin.assert:
+        that: "runner_host_dedicated | bool"
+        fail_msg: 'runner_host_dedicated must be true before any build state is destroyed.'
+        quiet: true
+
+    - name: 'Look for a docker client'
+      ansible.builtin.stat:
+        path: '/usr/bin/docker'
+      register: '_runner_host_docker_cli'
+
+    - name: 'Ask whether a rootful Docker daemon answers'
+      ansible.builtin.command:
+        argv: ['docker', 'info']
+      register: '_runner_host_docker_info'
+      changed_when: false
+      failed_when: false
+      when:
+        - "runner_dismantle_rootful_docker | bool"
+        - "_runner_host_docker_cli.stat.exists"
+
+    - name: 'Prune the rootful Docker daemon'
+      ansible.builtin.command:
+        argv: "{{ _runner_host_prune }}"
+      loop:
+        - ['docker', 'system', 'prune', '-af', '--volumes']
+        - ['docker', 'builder', 'prune', '-af']
+      loop_control:
+        loop_var: '_runner_host_prune'
+      register: '_runner_host_rootful_prune'
+      changed_when: "_runner_host_rootful_prune.stdout is not search('Total reclaimed space:\\s+0B')"
+      failed_when: false
+      when:
+        - "runner_dismantle_rootful_docker | bool"
+        - "_runner_host_docker_info.rc | default(1) == 0"
+
+    # The whole rootful stack, not just docker.service. containerd is a root
+    # daemon holding root-owned image layers; with rootless Docker running per
+    # user, nothing on this box needs it any more.
+    - name: 'Disable the rootful container stack'
+      ansible.builtin.systemd_service:
+        name: "{{ _runner_host_rootful_unit }}"
+        enabled: false
+        state: 'stopped'
+      loop: "{{ ['docker.socket', 'docker.service', 'containerd.service'] | select('in', _present) | list }}"
+      loop_control:
+        loop_var: '_runner_host_rootful_unit'
+      when: "runner_dismantle_rootful_docker | bool"
+      vars:
+        # docker.socket ships with docker.service; service facts list services only.
+        _present: >-
+          {{ (ansible_facts['services'] | default({}) | list)
+             + (['docker.socket'] if 'docker.service' in (ansible_facts['services'] | default({})) else []) }}
+
+    - name: 'Remove the root-owned image stores of the old setup'
+      ansible.builtin.file:
+        path: "{{ _runner_host_image_store }}"
+        state: 'absent'
+      loop: ['/var/lib/docker', '/var/lib/containerd']
+      loop_control:
+        loop_var: '_runner_host_image_store'
+      when: "runner_dismantle_rootful_docker | bool"
+
+    - name: 'Clear the caches under the old accounts homes'
+      ansible.builtin.file:
+        path: "{{ ansible_facts['getent_passwd'][_runner_host_cache[0]][4] }}/{{ _runner_host_cache[1] }}"
+        state: 'absent'
+      loop: >-
+        {{ runner_old_users | reject('equalto', 'none') | select('in', ansible_facts['getent_passwd'])
+           | product(_runner_host_old_user_caches) | list }}
+      loop_control:
+        loop_var: '_runner_host_cache'
+      when: "ansible_facts['getent_passwd'][_runner_host_cache[0]][4] is match('^/.+')"
+
+    - name: 'Find the _work directories the old setup left behind'
+      ansible.builtin.find:
+        paths: ['/opt', '/home']
+        patterns: '_work'
+        file_type: 'directory'
+        recurse: true
+        depth: 4
+      register: '_runner_host_old_work'
+
+    # Never inside a tree this role owns (the runner base, every runner home
+    # and tool cache), nor inside a directory a vendor role will adopt.
+    - name: 'Delete the stray _work directories'
+      ansible.builtin.file:
+        path: "{{ _runner_host_old_work_dir }}"
+        state: 'absent'
+      loop: >-
+        {{ _runner_host_old_work.files | map(attribute='path')
+           | reject('match', '^(' ~ (_spared | map('regex_escape') | join('|')) ~ ')(/|$)')
+           | reject('match', '^/home/' ~ (runner_user_prefix | regex_escape) ~ '[0-9]+(/|$)')
+           | reject('match', '^' ~ (_runner_host_toolcache_prefix | regex_escape) ~ (runner_user_prefix | regex_escape) ~ '[0-9]+(/|$)')
+           | sort | list }}
+      loop_control:
+        loop_var: '_runner_host_old_work_dir'
+      vars:
+        _spared: "{{ [runner_base_dir] + (runner_azp_adopt | default({}) | dict2items | map(attribute='value') | map('string') | list) }}"
+
+    - name: 'Remove the shared hosted tool cache'
+      ansible.builtin.file:
+        path: '/opt/hostedtoolcache'
+        state: 'absent'
+
+    - name: 'Remember that the wipe ran'
+      ansible.builtin.copy:
+        content: "One-time wipe of the old build state, done on {{ now(utc=true).isoformat() }}.\n"
+        dest: "{{ _runner_host_wipe_marker }}"
+        owner: 'root'
+        group: 'root'
+        mode: '0600'

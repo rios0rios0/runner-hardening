@@ -1,0 +1,43 @@
+---
+# Takes runners out of service without killing a job: each finishes the job
+# it is on (bounded by runner_drain_timeout, as stored on the host) and then
+# stays stopped. All of a host's runners, or only those listed:
+#
+#   ansible-playbook playbooks/drain.yaml --limit build-01
+#   ansible-playbook playbooks/drain.yaml --limit build-01 -e '{"runner_drain_instances": [2, 3]}'
+#
+# They come back with the next converge (playbooks/github.yaml or
+# playbooks/azure_devops.yaml), or on the host with: <prefix>-admin undrain
+- name: 'Drain runners'
+  hosts: 'runner_hosts'
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 'Load the flavour of this host'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'host_env'
+
+    - name: 'Check that this host has the admin tool'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'require_admin'
+
+    - name: 'Check the instances asked for'
+      ansible.builtin.assert:
+        that:
+          - "runner_drain_instances | default([]) is sequence"
+          - "runner_drain_instances | default([]) is not string"
+          - "runner_drain_instances | default([]) | map('string') | reject('match', '^[1-9][0-9]*$') | list | length == 0"
+        fail_msg: 'runner_drain_instances is a list of runner numbers, such as [2, 3].'
+        quiet: true
+
+    - name: 'Let each runner finish its job, then keep it stopped'
+      ansible.builtin.command:
+        argv: "{{ ['/usr/local/sbin/' ~ runner_sbin_prefix ~ '-admin', 'drain'] + (runner_drain_instances | default([]) | map('string') | list) }}"
+      register: 'runner_drain_result'
+      changed_when: "runner_drain_result.stdout is search('(?m)runner [0-9]+ drained$')"
+
+    - name: 'Show the drain'
+      ansible.builtin.debug:
+        msg: "{{ runner_drain_result.stdout_lines + runner_drain_result.stderr_lines }}"

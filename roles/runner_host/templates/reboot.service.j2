@@ -1,0 +1,6 @@
+# {{ _runner_host_managed }}
+[Unit]
+Description=Reboot the runner host if updates require it and no job is running
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/{{ runner_sbin_prefix }}-reboot-if-idle

@@ -1,0 +1,32 @@
+---
+# The admin tool's post-flight checks. A failure warns rather than failing the
+# converge, as the installer did: the box is up, and the output says what to
+# review before it takes real traffic.
+
+- name: 'Give the runners a moment to register'
+  ansible.builtin.wait_for:
+    timeout: 5
+  when:
+    - "runner_start_units | bool"
+    - >-
+      (_runner_host_started.results | default([]) | selectattr('changed', 'defined')
+      | selectattr('changed') | list | length > 0)
+      or (_runner_host_restart_idle.changed | default(false))
+
+- name: 'Run the post-flight checks'
+  ansible.builtin.command:
+    argv:
+      - "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+      - 'verify'
+  register: '_runner_host_verify'
+  changed_when: false
+  failed_when: false
+
+- name: 'Show the checks'
+  ansible.builtin.debug:
+    msg: "{{ _runner_host_verify.stdout_lines + _runner_host_verify.stderr_lines }}"
+
+- name: 'Warn that some checks failed'
+  ansible.builtin.debug:
+    msg: 'WARNING: some checks failed - review them before sending real traffic.'
+  when: "_runner_host_verify.rc != 0"
