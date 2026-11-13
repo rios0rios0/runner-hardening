@@ -1,0 +1,32 @@
+---
+# Finishes the adoption of instance _runner_azp_n: an agent tree in place whose
+# files some other account still owns, or whose adoption record is still
+# there. Every step is idempotent, so a converge that died half way through
+# this simply runs it again. The record goes last, once the tree is its new
+# user's.
+
+# Written by the over-privileged account the agent ran as, so a poisoned
+# workspace -- a planted git hook, a tampered cache -- would otherwise be the
+# first thing the new user's jobs run in.
+- name: "Drop the work directory an adopted agent brought from its old account, for instance {{ _runner_azp_n }}"
+  ansible.builtin.file:
+    path: "{{ runner_base_dir }}/{{ _runner_azp_n }}/_work"
+    state: 'absent'
+  when: "not (runner_azp_adopt_keep_work | bool)"
+
+# follow: false is what keeps this inside the tree. Followed, a link in it --
+# a job's, or one in a workspace kept with runner_azp_adopt_keep_work -- would
+# hand whatever it points at, anywhere on the box, to the agent user.
+- name: "Hand the adopted tree to its new user, for instance {{ _runner_azp_n }}"
+  ansible.builtin.file:
+    path: "{{ runner_base_dir }}/{{ _runner_azp_n }}"
+    state: 'directory'
+    owner: "{{ runner_user_prefix }}{{ _runner_azp_n }}"
+    group: "{{ runner_user_prefix }}{{ _runner_azp_n }}"
+    recurse: true
+    follow: false
+
+- name: "Mark the adoption finished, for instance {{ _runner_azp_n }}"
+  ansible.builtin.file:
+    path: "{{ _runner_azp_adopt_state_dir }}/{{ _runner_azp_n }}"
+    state: 'absent'

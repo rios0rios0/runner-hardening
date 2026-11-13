@@ -1,0 +1,208 @@
+---
+# After prepare: the agent users exist, the old units are down and their
+# account is de-privileged. Every instance ends up with a registered agent in a
+# tree of its own -- adopted, or unpacked and registered -- or, in CI only,
+# unpacked and left unregistered.
+#
+# A tree is never replaced once it holds an agent: a registered agent updates
+# itself from the pool, an adopted one included, so the role has no version of
+# its own to impose.
+
+# systemd chdirs into WorkingDirectory as the agent user, and every component
+# of the path must be traversable by that user, or the unit dies at step CHDIR
+# with exit 200 and restart-loops. Pinned rather than inherited.
+- name: 'Create the agent base directory'
+  ansible.builtin.file:
+    path: "{{ runner_base_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+- name: 'Name each agent'
+  ansible.builtin.set_fact:
+    _runner_azp_names: "{{ _runner_azp_names | default({}) | combine({_runner_azp_n | string: runner_azp_agent_name}) }}"
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_azp_n'
+  vars:
+    # The name the agent-name template uses (contract section 8).
+    n: "{{ _runner_azp_n }}"
+
+- name: 'Check the agent names'
+  ansible.builtin.assert:
+    that:
+      - "_runner_azp_names.values() | map('string') | map('trim') | select('equalto', '') | list | length == 0"
+      - "_runner_azp_names.values() | map('string') | select('search', _runner_azp_unsafe_rx) | list | length == 0"
+      - "_runner_azp_names.values() | unique | list | length == _runner_azp_names | length"
+    fail_msg: >-
+      runner_azp_agent_name must give every instance its own non-empty name, with no quotes, $,
+      backquotes or backslashes; it gave {{ _runner_azp_names.values() | list }}. A name another agent
+      in the pool already has is taken over from it on registration.
+    quiet: true
+
+- name: 'Write the Azure DevOps configuration'
+  ansible.builtin.template:
+    src: 'env.j2'
+    dest: "{{ _runner_azp_env_file }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0600'
+
+- name: 'Look at what each instance holds'
+  ansible.builtin.stat:
+    path: "{{ runner_base_dir }}/{{ _runner_azp_check | join('/') }}"
+    get_checksum: false
+  loop: "{{ runner_instances | product(['.agent', '.credentials', 'bin/Agent.Listener']) | list }}"
+  loop_control:
+    loop_var: '_runner_azp_check'
+    label: "{{ _runner_azp_check | join('/') }}"
+  register: '_runner_azp_held'
+
+# Adopting: its directory still holds the registration, moved below.
+# Registered: .agent and .credentials, written by config.sh in that order.
+# New: neither, so an agent is unpacked (unless one is) and registered.
+- name: 'Sort the instances by what they need'
+  ansible.builtin.set_fact:
+    _runner_azp_adopting: "{{ _runner_azp_pending | map(attribute='n') | list }}"
+    _runner_azp_registered: "{{ runner_instances | select('in', _agent) | select('in', _creds) | list }}"
+    _runner_azp_broken: "{{ runner_instances | select('in', _agent) | reject('in', _creds) | list }}"
+    _runner_azp_new: >-
+      {{ runner_instances | reject('in', _agent) | reject('in', _pending) | list }}
+    _runner_azp_to_unpack: >-
+      {{ runner_instances | reject('in', _agent) | reject('in', _pending) | reject('in', _listener) | list }}
+  vars:
+    _held: "{{ _runner_azp_held.results | selectattr('stat.exists') | map(attribute='_runner_azp_check') | list }}"
+    _agent: "{{ _held | selectattr('1', 'equalto', '.agent') | map('first') | list }}"
+    _creds: "{{ _held | selectattr('1', 'equalto', '.credentials') | map('first') | list }}"
+    _listener: "{{ _held | selectattr('1', 'equalto', 'bin/Agent.Listener') | map('first') | list }}"
+    _pending: "{{ _runner_azp_pending | map(attribute='n') | list }}"
+
+# config.sh writes .credentials before .agent, and `config.sh remove` deletes
+# them the other way round, so .agent alone is a removal that stopped half way
+# or a hand edit. config.sh refuses a tree with an .agent in it at all.
+- name: 'Refuse an agent whose registration is half gone'
+  ansible.builtin.assert:
+    that: "_runner_azp_broken | length == 0"
+    fail_msg: >-
+      Instance(s) {{ _runner_azp_broken | join(', ') }} hold an .agent but no .credentials, which no agent
+      can start with. Remove {{ runner_base_dir }}/<n>/.agent from each to register it again (with
+      runner_azp_pat), or restore its .credentials.
+    quiet: true
+
+- name: 'Check that every new agent can be registered'
+  ansible.builtin.assert:
+    that: >-
+      _runner_azp_new | length == 0
+      or (runner_azp_pat | default('')) | length > 0
+      or runner_azp_skip_registration | bool
+    fail_msg: >-
+      Instance(s) {{ _runner_azp_new | join(', ') }} hold no registered agent, and nothing can register
+      one: set runner_azp_pat (a PAT with the Agent Pools (read, manage) scope), adopt an existing agent
+      with runner_azp_adopt, or lower runner_count.
+    quiet: true
+
+- name: 'Adopt the agents registered the default way'
+  ansible.builtin.include_tasks: 'adopt_agent.yaml'
+  loop: "{{ _runner_azp_pending }}"
+  loop_control:
+    loop_var: '_runner_azp_adoption'
+    label: "{{ _runner_azp_adoption.n }}: {{ _runner_azp_adoption.src }}"
+
+# An adoption is finished once the tree is its new user's. Either sign of one
+# that is not: the record written before the move, which survives a converge
+# that died after it, or an .agent some other account owns -- a tree moved
+# into place by hand.
+- name: 'Look for adoption records an earlier converge left'
+  ansible.builtin.stat:
+    path: "{{ _runner_azp_adopt_state_dir }}/{{ _runner_azp_n }}"
+    get_checksum: false
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_azp_n'
+  register: '_runner_azp_records'
+
+- name: 'Look at who owns each registration'
+  ansible.builtin.stat:
+    path: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
+    get_checksum: false
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_azp_n'
+  register: '_runner_azp_owners'
+
+- name: 'Finish the adoptions'
+  ansible.builtin.include_tasks: 'finish_adoption.yaml'
+  loop: "{{ _runner_azp_owners.results }}"
+  loop_control:
+    loop_var: '_runner_azp_owner'
+    label: "{{ _runner_azp_owner._runner_azp_n }}"
+  when:
+    - "_runner_azp_owner.stat.exists"
+    - >-
+      _runner_azp_owner._runner_azp_n in _runner_azp_recorded
+      or _runner_azp_owner.stat.pw_name != runner_user_prefix ~ _runner_azp_owner._runner_azp_n
+  vars:
+    _runner_azp_n: "{{ _runner_azp_owner._runner_azp_n }}"
+    _runner_azp_recorded: >-
+      {{ _runner_azp_records.results | selectattr('stat.exists') | map(attribute='_runner_azp_n') | list }}
+
+# A record whose instance holds no agent has nothing left to finish.
+- name: 'Forget the adoption records with nothing to finish'
+  ansible.builtin.file:
+    path: "{{ _runner_azp_adopt_state_dir }}/{{ _runner_azp_record._runner_azp_n }}"
+    state: 'absent'
+  loop: "{{ _runner_azp_records.results | selectattr('stat.exists') | list }}"
+  loop_control:
+    loop_var: '_runner_azp_record'
+    label: "{{ _runner_azp_record._runner_azp_n }}"
+  when: "_runner_azp_record._runner_azp_n not in _runner_azp_with_agent"
+  vars:
+    _runner_azp_with_agent: >-
+      {{ _runner_azp_owners.results | selectattr('stat.exists') | map(attribute='_runner_azp_n') | list }}
+
+- name: 'Unpack the new agents'
+  when: "_runner_azp_to_unpack | length > 0"
+  block:
+    - name: 'Download the agent'
+      ansible.builtin.import_tasks: 'download.yaml'
+
+    - name: 'Unpack an agent for each new instance'
+      ansible.builtin.include_tasks: 'unpack_agent.yaml'
+      loop: "{{ _runner_azp_to_unpack }}"
+      loop_control:
+        loop_var: '_runner_azp_n'
+      vars:
+        # Beside the place, on its filesystem, so the final move is a rename;
+        # hidden, so nothing that lists instances ever counts it as one.
+        _runner_azp_staging: "{{ runner_base_dir }}/.{{ _runner_azp_n }}.new"
+
+- name: 'Register the new agents'
+  ansible.builtin.import_tasks: 'register.yaml'
+  when:
+    - "_runner_azp_new | length > 0"
+    - "(runner_azp_pat | default('')) | length > 0"
+
+- name: 'Report the agents left unregistered'
+  ansible.builtin.debug:
+    msg: >-
+      Instance(s) {{ _runner_azp_new | join(', ') }} are unpacked but not registered
+      (runner_azp_skip_registration): their units cannot start until a converge with runner_azp_pat
+      registers them.
+  when:
+    - "_runner_azp_new | length > 0"
+    - "(runner_azp_pat | default('')) | length == 0"
+
+# The account database, for the .env check: whose homes are not an agent's own.
+- name: 'Read the accounts of this host'
+  ansible.builtin.getent:
+    database: 'passwd'
+
+- name: 'Settle the files of each agent'
+  ansible.builtin.include_tasks: 'agent_files.yaml'
+  loop: "{{ runner_instances }}"
+  loop_control:
+    loop_var: '_runner_azp_n'
+  vars:
+    _runner_azp_dir: "{{ runner_base_dir }}/{{ _runner_azp_n }}"
+    _runner_azp_user: "{{ runner_user_prefix }}{{ _runner_azp_n }}"

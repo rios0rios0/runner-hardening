@@ -1,0 +1,63 @@
+---
+# Azure Pipelines agents: the variables of the runner_azure_devops role. What
+# the host does with them (count, trust, memory policy, de-privileging, disk)
+# is runner_host's, and documented in its defaults.
+
+# Required: the organisation every agent on the host belongs to.
+runner_azp_url: ''
+# Required: the agent pool every agent on the host joins.
+runner_azp_pool: ''
+
+# How a NEW agent is named in the pool; `n` is its instance number. An adopted
+# agent keeps the name it was registered with.
+runner_azp_agent_name: "{{ ansible_facts['hostname'] }}-{{ n }}"
+
+# A PAT with the Agent Pools (read, manage) scope. Only registering a new agent
+# or removing one needs it, and it never stays on the box: it is written to the
+# root-only /run/azp-register.pat for the length of the registrations and
+# deleted straight after. Undefined or empty means "not supplied", so an
+# inventory can read it from the environment whether or not that is set:
+#   runner_azp_pat: "{{ lookup('ansible.builtin.env', 'RUNNER_AZP_PAT') }}"
+# Never pass it with -e: a command line is readable through /proc.
+runner_azp_pat: ''
+
+# The agent version a fresh install downloads: 'latest', or a release such as
+# '4.264.2'. Installed and adopted agents update themselves from the pool.
+runner_azp_version: 'latest'
+
+# Agents already registered on the host, adopted instead of registered again,
+# as {instance number: directory}:
+#   runner_azp_adopt:
+#     1: '/home/agent/myagent'
+# The old vsts.agent.* units are stopped first, once their running jobs are
+# done. Each directory is then moved to /opt/azure-pipelines-agent/<n> (a
+# rename: it must be on the same filesystem), handed to azp<n>, and keeps
+# .agent, .credentials and .credentials_rsaparams byte for byte, so the pool
+# sees the same agent, name and id. No PAT is needed. While an adoption is
+# pending, runner_count must be a number that covers every key.
+runner_azp_adopt: {}
+# An adopted agent's _work was written by the over-privileged account it ran
+# as, so it goes unless this says otherwise.
+runner_azp_adopt_keep_work: false
+
+# The home of the account the adopted agents ran as. This role reads nothing
+# from it; set it so runner_host's runner_home_seed can name what each new
+# agent user starts with, copied once into every agent home:
+#   runner_azp_adopt_home: '/home/agent'
+#   runner_home_seed:
+#     '.local/bin': "{{ runner_azp_adopt_home }}/.local/bin"
+# Only what that account installed can be carried over this way, not its
+# caches: when it is in runner_old_users, the one-time wipe in prepare clears
+# ~/.cache, ~/.npm, ~/.m2, ~/.gradle, ~/.nuget and the like from it first, as
+# build state an over-privileged account wrote. Each agent's .path is
+# rewritten to its own ~/.local/bin and the standard system PATH, so nothing in
+# the old home stays on any agent's PATH. Undefined or empty means none.
+#
+# With runner_trust: 'untrusted', seed nothing into ~/.local/bin: a seeded path
+# survives every home reset, and ~/.local/bin is first on every agent's PATH,
+# so whatever one job put there would run in the next.
+runner_azp_adopt_home: ''
+
+# CI only: leave the instances nothing can register (no PAT, nothing to adopt)
+# unpacked but unregistered, instead of failing.
+runner_azp_skip_registration: false

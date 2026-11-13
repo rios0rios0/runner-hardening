@@ -1,0 +1,64 @@
+---
+# Reads the host only, before prepare. Prepare stops every vsts.agent.* unit
+# and de-privileges the account those agents ran as, so whatever would keep an
+# agent from being adopted or registered has to stop the converge here, while
+# the old agents still work.
+
+- name: 'Start with no adoption pending'
+  ansible.builtin.set_fact:
+    _runner_azp_pending: []
+
+- name: 'Read each agent to adopt'
+  ansible.builtin.include_tasks: 'discover_agent.yaml'
+  loop: "{{ runner_azp_adopt | default({}) | dict2items }}"
+  loop_control:
+    loop_var: '_runner_azp_adopt_item'
+    label: "{{ _runner_azp_adopt_item.key }}: {{ _runner_azp_adopt_item.value }}"
+  vars:
+    _runner_azp_n: "{{ _runner_azp_adopt_item.key | int }}"
+    _runner_azp_src: "{{ _runner_azp_adopt_item.value | string }}"
+    _runner_azp_dest: "{{ runner_base_dir }}/{{ _runner_azp_adopt_item.key | int }}"
+
+# runner_count's own default (auto) is runner_host's, which is not visible
+# before prepare: hence the default('auto') wherever it is read here.
+- name: 'Check that the count covers every agent being adopted'
+  ansible.builtin.assert:
+    that:
+      - "runner_count | default('auto') | string is match('^[1-9][0-9]*$')"
+      - "runner_count | default(0) | int >= _runner_azp_pending | map(attribute='n') | max"
+    fail_msg: >-
+      Set runner_count to at least {{ _runner_azp_pending | map(attribute='n') | max }}: instance(s)
+      {{ _runner_azp_pending | map(attribute='n') | join(', ') }} adopt an agent (got runner_count
+      {{ runner_count | default('auto') }}). An 'auto' count is only known once the host is prepared,
+      and preparing it stops the agents being adopted.
+    quiet: true
+  when: "_runner_azp_pending | length > 0"
+
+- name: 'Look for a registered agent at each instance'
+  ansible.builtin.stat:
+    path: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
+    get_checksum: false
+  loop: "{{ range(1, (runner_count | default(0) | int) + 1) | list }}"
+  loop_control:
+    loop_var: '_runner_azp_n'
+  register: '_runner_azp_early'
+  when: "runner_count | default('auto') | string is match('^[1-9][0-9]*$')"
+
+# The same check runs again after prepare, for an 'auto' count; this one only
+# makes it fail before anything has changed.
+- name: 'Check that every agent still to register can be registered'
+  ansible.builtin.assert:
+    that: >-
+      _runner_azp_unregistered | length == 0
+      or (runner_azp_pat | default('')) | length > 0
+      or runner_azp_skip_registration | default(false) | bool
+    fail_msg: >-
+      Instance(s) {{ _runner_azp_unregistered | join(', ') }} hold no registered agent, and nothing can
+      register one: set runner_azp_pat (a PAT with the Agent Pools (read, manage) scope), adopt an
+      existing agent with runner_azp_adopt, or lower runner_count.
+    quiet: true
+  vars:
+    _runner_azp_unregistered: >-
+      {{ _runner_azp_early.results | default([]) | selectattr('stat', 'defined')
+         | rejectattr('stat.exists') | map(attribute='_runner_azp_n')
+         | reject('in', _runner_azp_pending | map(attribute='n') | list) | list }}

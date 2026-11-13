@@ -1,0 +1,90 @@
+---
+# The agent package, for fresh installs only: an adopted agent keeps its own
+# binaries, and every registered agent updates itself from the pool.
+#
+# 'latest' asks GitHub which release that is, and takes the download URL and
+# its SHA-256 from that release's notes. A pinned version asks nothing: the
+# releases API allows 60 unauthenticated calls an hour per address, which CI
+# runners sharing one exhaust, so its URL is built from the documented pattern
+# and the archive is checked by unpacking it.
+
+- name: 'Ask GitHub which agent release is the latest'
+  ansible.builtin.uri:
+    url: "{{ _runner_azp_releases_api }}/latest"
+    headers:
+      Accept: 'application/vnd.github+json'
+    return_content: true
+  register: '_runner_azp_release'
+  check_mode: false
+  when: "runner_azp_version == 'latest'"
+
+- name: 'Find the Linux x64 package in the release notes'
+  ansible.builtin.set_fact:
+    _runner_azp_package: >-
+      {{ {'version': _version,
+          'url': _row[0] | default(''),
+          'checksum': ('sha256:' ~ (_row[1] | lower)) if (_row | length) > 1 else ''} }}
+  vars:
+    _version: "{{ _runner_azp_release.json.tag_name | default('') | regex_replace('^v', '') }}"
+    _row: >-
+      {{ _runner_azp_release.json.body | default('')
+         | regex_search(_runner_azp_notes_rx_head ~ (_version | regex_escape) ~ _runner_azp_notes_rx_tail, '\1', '\2')
+         | default([], true) }}
+  when: "runner_azp_version == 'latest'"
+
+# The CDN moved in 2025 (vstsagentpackage.azureedge.net is gone); this is the
+# pattern every release's notes give since.
+- name: 'Use the pinned agent release'
+  ansible.builtin.set_fact:
+    _runner_azp_package:
+      version: "{{ runner_azp_version }}"
+      url: >-
+        https://download.agent.dev.azure.com/agent/{{ runner_azp_version }}/{{ _runner_azp_package_prefix }}{{ runner_azp_version }}.tar.gz
+      checksum: ''
+  when: "runner_azp_version != 'latest'"
+
+- name: 'Check the agent release was found'
+  ansible.builtin.assert:
+    that:
+      - "_runner_azp_package.version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')"
+      - "_runner_azp_package.url is match('^https://')"
+      - "runner_azp_version != 'latest' or _runner_azp_package.checksum | length > 0"
+    fail_msg: >-
+      The latest agent release's notes give no Linux x64 package and checksum
+      ({{ _runner_azp_package }}). Pin runner_azp_version to a release from
+      https://github.com/microsoft/azure-pipelines-agent/releases and converge again.
+    quiet: true
+
+- name: "Download agent {{ _runner_azp_package.version }}"
+  ansible.builtin.get_url:
+    url: "{{ _runner_azp_package.url }}"
+    dest: "{{ _runner_azp_cache_dir }}/{{ _runner_azp_package_prefix }}{{ _runner_azp_package.version }}.tar.gz"
+    checksum: "{{ _runner_azp_package.checksum }}"
+    owner: 'root'
+    group: 'root'
+    # Unconditional, as the installer did: a copy cached by an earlier run may
+    # carry another mode.
+    mode: '0644'
+  register: '_runner_azp_download'
+  retries: 3
+  delay: 5
+  until: "_runner_azp_download is succeeded"
+
+- name: 'Find older agent downloads'
+  ansible.builtin.find:
+    paths: "{{ _runner_azp_cache_dir }}"
+    patterns: "{{ _runner_azp_package_prefix }}*.tar.gz"
+    file_type: 'file'
+  register: '_runner_azp_old_downloads'
+
+# Every converge that meets a new release downloads it, and nothing else would
+# remove the one before.
+- name: 'Remove the older agent downloads'
+  ansible.builtin.file:
+    path: "{{ _runner_azp_old_download }}"
+    state: 'absent'
+  loop: >-
+    {{ _runner_azp_old_downloads.files | map(attribute='path')
+       | reject('equalto', _runner_azp_download.dest) | list }}
+  loop_control:
+    loop_var: '_runner_azp_old_download'

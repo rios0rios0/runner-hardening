@@ -1,0 +1,35 @@
+---
+# Registers each new agent (_runner_azp_new) with the pool, through
+# azp-register. The PAT reaches the box only here, as a module argument
+# (pipelined over the SSH session's stdin), written to a root-only file
+# azp-register reads, and removed whatever happens. It is never an argument,
+# never in an `environment:`, never stored.
+#
+# An instance that needs registering has no .agent, so it cannot be running a
+# job, and there is nothing to drain: azp-cycle refuses to start it until
+# azp-register has written that file.
+
+- name: 'Register the new agents with the pool'
+  block:
+    - name: 'Hand the PAT to the registrations, root-only'
+      ansible.builtin.copy:
+        content: "{{ runner_azp_pat }}"
+        dest: "{{ _runner_azp_pat_file }}"
+        owner: 'root'
+        group: 'root'
+        mode: '0600'
+      no_log: true
+
+    - name: 'Register agent'
+      ansible.builtin.command:
+        argv: ["{{ _runner_azp_sbin_dir }}/azp-register", "{{ _runner_azp_n }}"]
+        creates: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
+      loop: "{{ _runner_azp_new }}"
+      loop_control:
+        loop_var: '_runner_azp_n'
+
+  always:
+    - name: 'Remove the PAT from the box'
+      ansible.builtin.file:
+        path: "{{ _runner_azp_pat_file }}"
+        state: 'absent'

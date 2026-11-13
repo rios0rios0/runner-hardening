@@ -1,0 +1,83 @@
+---
+# The instances above the count (runner_surplus_instances), before retire
+# removes them: an Azure Pipelines registration outlives its unit, so unlike a
+# GitHub JIT runner, a retired agent stays in the pool unless it is removed
+# from it. That takes the PAT; without one the agent is left there, offline,
+# and the summary says so.
+
+- name: 'Look for a registration at each instance above the count'
+  ansible.builtin.stat:
+    path: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
+    get_checksum: false
+  loop: "{{ runner_surplus_instances | default([]) }}"
+  loop_control:
+    loop_var: '_runner_azp_n'
+  register: '_runner_azp_surplus_agents'
+
+- name: 'Note the registered agents above the count'
+  ansible.builtin.set_fact:
+    _runner_azp_surplus: >-
+      {{ _runner_azp_surplus_agents.results | selectattr('stat.exists') | map(attribute='_runner_azp_n') | list }}
+
+- name: 'Remove the agents above the count from the pool'
+  when:
+    - "_runner_azp_surplus | length > 0"
+    - "(runner_azp_pat | default('')) | length > 0"
+  block:
+    - name: 'Hand the PAT to the removals, root-only'
+      ansible.builtin.copy:
+        content: "{{ runner_azp_pat }}"
+        dest: "{{ _runner_azp_pat_file }}"
+        owner: 'root'
+        group: 'root'
+        mode: '0600'
+      no_log: true
+
+    # Drained first: removed from the pool mid-job, an agent fails the job it
+    # is running. Not put back if what follows fails, unlike a drain for a
+    # tree change: retire takes these instances down for good next.
+    - name: 'Let each agent above the count finish its job, then stop it'
+      ansible.builtin.command:
+        argv: "{{ [_runner_azp_sbin_dir ~ '/' ~ runner_sbin_prefix ~ '-admin', 'drain'] + (_runner_azp_surplus | map('string') | list) }}"
+      register: '_runner_azp_surplus_drain'
+      changed_when: "_runner_azp_surplus_drain.stdout is search('drained')"
+
+    # Not fatal: an agent the pool no longer knows, or a PAT without the
+    # scope, leaves an offline entry in the pool -- untidy, and no reason to
+    # keep a box above the count it was given.
+    - name: 'Remove agent'
+      ansible.builtin.command:
+        argv: ["{{ _runner_azp_sbin_dir }}/azp-register", 'remove', "{{ _runner_azp_n }}"]
+        removes: "{{ runner_base_dir }}/{{ _runner_azp_n }}/.agent"
+      loop: "{{ _runner_azp_surplus }}"
+      loop_control:
+        loop_var: '_runner_azp_n'
+      register: '_runner_azp_removals'
+      failed_when: false
+
+    - name: 'Warn about the agents that could not be removed from the pool'
+      ansible.builtin.debug:
+        msg: >-
+          Agent {{ _runner_azp_removal._runner_azp_n }} could not be removed from pool {{ runner_azp_pool }}
+          ({{ (_runner_azp_removal.stderr_lines | default([]) + _runner_azp_removal.stdout_lines | default([]))[-2:]
+              | join(' | ') }}): delete it there, under Organization settings > Agent pools > {{ runner_azp_pool }} > Agents.
+      loop: "{{ _runner_azp_removals.results | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | list }}"
+      loop_control:
+        loop_var: '_runner_azp_removal'
+        label: "{{ _runner_azp_removal._runner_azp_n }}"
+
+  always:
+    - name: 'Remove the PAT from the box'
+      ansible.builtin.file:
+        path: "{{ _runner_azp_pat_file }}"
+        state: 'absent'
+
+- name: 'Warn that the agents above the count stay in the pool'
+  ansible.builtin.debug:
+    msg: >-
+      Instance(s) {{ _runner_azp_surplus | join(', ') }} are retired from this host, but their agents stay
+      registered, offline, in pool {{ runner_azp_pool }}: converge with runner_azp_pat to remove them, or
+      delete them there (Organization settings > Agent pools > {{ runner_azp_pool }} > Agents).
+  when:
+    - "_runner_azp_surplus | length > 0"
+    - "(runner_azp_pat | default('')) | length == 0"

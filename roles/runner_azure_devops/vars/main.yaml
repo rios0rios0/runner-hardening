@@ -1,0 +1,66 @@
+---
+# Fixed paths and lists. Not tunables: everything tunable is in defaults.
+
+_runner_azp_sbin_dir: '/usr/local/sbin'
+_runner_azp_lib_dir: '/usr/local/lib/runner-hardening'
+_runner_azp_libexec_dir: '/usr/local/libexec/runner-hardening'
+_runner_azp_env_file: '/etc/azure-pipelines-agent/env'
+# For the length of a converge's registrations only; removed in an always:.
+_runner_azp_pat_file: '/run/azp-register.pat'
+# One file per instance whose adoption has begun and not finished: written
+# before its directory moves, removed once the tree is its new user's. A
+# converge that dies in between finishes the job the next time.
+_runner_azp_adopt_state_dir: '/var/lib/runner-hardening/azp-adopt'
+# Where a fresh install's download is kept, as the installer kept the GitHub
+# runner's: /var/cache/<package file>.
+_runner_azp_cache_dir: '/var/cache'
+_runner_azp_package_prefix: 'vsts-agent-linux-x64-'
+
+_runner_azp_releases_api: 'https://api.github.com/repos/microsoft/azure-pipelines-agent/releases'
+# The download URL is taken from the release notes, with its SHA-256, rather
+# than built: the agent CDN moved once already (to download.agent.dev.azure.com,
+# in 2025), and the notes are what moved with it. A notes row reads
+#   | Linux x64 | [vsts-agent-linux-x64-<v>.tar.gz](<url>) | <sha256> |
+_runner_azp_notes_rx_head: '\[vsts-agent-linux-x64-'
+_runner_azp_notes_rx_tail: '\.tar\.gz\]\((https://[^)\s]+)\)\s*\|\s*([0-9a-fA-F]{64})'
+
+# Ubuntu's own default PATH (/etc/environment). An agent's .path is its user's
+# ~/.local/bin, where jobs install their tools, then this.
+_runner_azp_system_path: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin'
+
+# The agent reads .env at every start and sets each line in its environment
+# OVER what its unit set, so a key the unit or this collection owns must not
+# be there at all: a stale copy would silently win.
+_runner_azp_env_owned:
+  - 'PATH'                      # .path's, applied by azp-run-once
+  - 'HOME'
+  - 'USER'
+  - 'LOGNAME'
+  - 'SHELL'
+  - 'XDG_RUNTIME_DIR'           # the drop-in's, for this agent's own rootless daemon
+  - 'DOCKER_HOST'
+  - 'DBUS_SESSION_BUS_ADDRESS'
+  - 'AGENT_TOOLSDIRECTORY'      # the drop-in's, set only when trust is internal
+  - 'CODEQL_RAM'                # the drop-in's, sized from the box
+  - 'TMPDIR'                    # the unit's: a private /var/tmp
+  - 'AGENT_DIAGLOGPATH'         # the backoff counts jobs by the worker logs in _diag
+  - 'WORKER_DIAGLOGPATH'
+# What every agent's .env holds when it does not say otherwise. DOCKER_BUILDKIT
+# as on GitHub boxes; LANG because env.sh snapshots it, so every agent has one.
+_runner_azp_env_defaults:
+  - 'LANG=C.UTF-8'
+  - 'DOCKER_BUILDKIT=1'
+# A .env line whose value reaches into another account's home: the home, at
+# the start of the value or after a separator, then the end, / or a separator.
+_runner_azp_env_value_rx_head: "^[^=]+=(.*[:=\\s\"'])?("
+_runner_azp_env_value_rx_tail: ")([/:\\s\"']|$)"
+# The accounts a person or root logs in with: uid 0, or 1000 to 59999.
+_runner_azp_login_uid_rx: '^(0|[1-9][0-9]{3}|[1-5][0-9]{4})$'
+
+# An agent registered with a visualstudio.com URL is the same organisation as
+# https://dev.azure.com/<org>; the agent stores the URL with a trailing slash.
+_runner_azp_vs_url_rx: '^https?://([^./]+)\.visualstudio\.com'
+_runner_azp_vs_url_to: 'https://dev.azure.com/\1'
+
+# What may stand in a value written into the double-quoted env file.
+_runner_azp_unsafe_rx: '["$`\\\n]'
