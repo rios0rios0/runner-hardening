@@ -1,0 +1,56 @@
+---
+# The runtime half of a GitHub runner: the root-only JIT helpers, the one-job
+# wrapper, and the GitHub hooks for the shared runtime scripts. All four are
+# static files, identical on every box: they read their paths and answers from
+# the config files at run time, so nothing is baked in here.
+#
+# Each script is parsed before it replaces the one in place (copy's validate
+# runs bash -n on the temporary file), so a damaged file can never become the
+# helper the next runner start executes. copy renames the new file over the
+# old one, so a running wrapper keeps reading the copy it opened.
+#
+# A changed helper or wrapper restarts the idle runners: one registered under
+# the old gha-jitconfig keeps its labels until it takes a job, and a runner
+# whose labels no longer match what is queued may never take one.
+
+- name: 'Install the root-only JIT helpers'
+  ansible.builtin.copy:
+    src: "{{ item }}.sh"
+    dest: "/usr/local/sbin/{{ item }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+    validate: '/bin/bash -n %s'
+  loop:
+    - 'gha-jitconfig'
+    - 'gha-jitreap'
+  notify: 'Restart idle runners'
+
+# Root-owned and outside the job-writable tree: the old in-tree copy was the
+# runner user's, so a job could edit the script that runs the next job.
+- name: 'Create the root-owned directory for the job wrapper'
+  ansible.builtin.file:
+    path: "{{ _runner_github_libexec }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+- name: 'Install the one-job wrapper'
+  ansible.builtin.copy:
+    src: 'gha-run-ephemeral.sh'
+    dest: "{{ _runner_github_libexec }}/gha-run-ephemeral"
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+    validate: '/bin/bash -n %s'
+  notify: 'Restart idle runners'
+
+- name: 'Install the GitHub hooks for the shared runtime'
+  ansible.builtin.copy:
+    src: 'vendor.sh'
+    dest: '/usr/local/lib/runner-hardening/vendor.sh'
+    owner: 'root'
+    group: 'root'
+    mode: '0644'
+    validate: '/bin/bash -n %s'

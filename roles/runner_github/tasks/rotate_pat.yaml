@@ -1,0 +1,151 @@
+---
+# rotate-pat: replace the admin PAT, validated before it touches disk, without
+# restarting a runner. The stored PAT is a live dependency: gha-jitconfig
+# exchanges it for a JIT config every time a runner starts, which is after
+# every job, and gha-jitreap deletes the registration with it at every stop.
+# Both read the file each time, so the new token is in use from each runner's
+# next cycle -- and a typo must never reach the file, or every runner on the
+# box stops registering.
+#
+# The scope comes from this host's /etc/github-runner/env, not the inventory:
+# that file is what gha-jitconfig registers with, so it is the scope the new
+# token has to work for.
+
+- name: 'Require the new PAT'
+  ansible.builtin.assert:
+    that: "(runner_github_new_pat | default('', true) | string | trim) | length > 0"
+    fail_msg: >-
+      Set runner_github_new_pat (from a vault, or an environment variable) to the
+      replacement admin PAT: a classic PAT with scope admin:org (or repo for a
+      single repository), or a fine-grained PAT with "Self-hosted runners: Read
+      and write".
+    quiet: true
+
+- name: 'Check that the new PAT fits on one header line'
+  ansible.builtin.assert:
+    that: >-
+      runner_github_new_pat | string | trim is match('^\S+$')
+    fail_msg: 'runner_github_new_pat must be a single token, with no whitespace inside it.'
+    quiet: true
+
+- name: 'Read the answers this host stores'
+  ansible.builtin.slurp:
+    src: "{{ _runner_github_env_file }}"
+  register: '_runner_github_rotate_env'
+  failed_when: false
+  check_mode: false
+
+- name: 'Note where this host registers its runners'
+  ansible.builtin.set_fact:
+    _runner_github_rotate_stored: >-
+      {{ dict((_runner_github_rotate_env.content | default('') | b64decode)
+              | regex_findall('^([A-Z_]+)="([^"]*)"$', multiline=True)) }}
+
+- name: 'Require a host that has been converged'
+  ansible.builtin.assert:
+    that:
+      - "_runner_github_rotate_stored.GHA_SCOPE | default('') in ['org', 'repo']"
+      - "_runner_github_rotate_stored.GHA_ORG | default('') | length > 0"
+    fail_msg: >-
+      no configuration found at {{ _runner_github_env_file }} - converge this host with
+      playbooks/github.yaml first.
+    quiet: true
+
+- name: "Note the API path of this host's runners"
+  ansible.builtin.set_fact:
+    _runner_github_rotate_path: >-
+      {{ '/orgs/' ~ _runner_github_rotate_stored.GHA_ORG ~ '/actions/runners'
+         if _runner_github_rotate_stored.GHA_SCOPE == 'org'
+         else '/repos/' ~ _runner_github_rotate_stored.GHA_ORG ~ '/' ~ _runner_github_rotate_stored.GHA_REPO | default('') ~ '/actions/runners' }}
+
+# Is the one on disk still good? It tells the operator whether the fleet is
+# already broken or merely rotating ahead of expiry. Informational only: a
+# rotation is exactly what fixes a stored token that no longer works.
+- name: 'Look for the PAT this host stores now'
+  ansible.builtin.stat:
+    path: "{{ _runner_github_pat_file }}"
+    get_checksum: false
+  register: '_runner_github_rotate_old'
+
+- name: 'Read the PAT this host stores now'
+  ansible.builtin.slurp:
+    src: "{{ _runner_github_pat_file }}"
+  register: '_runner_github_rotate_old_pat'
+  no_log: true
+  check_mode: false
+  when: "_runner_github_rotate_old.stat.exists and _runner_github_rotate_old.stat.size > 0"
+
+- name: 'Ask GitHub whether the stored PAT still works'
+  ansible.builtin.uri:
+    url: "{{ _runner_github_api }}{{ _runner_github_rotate_path }}?per_page=1"
+    method: 'GET'
+    headers:
+      Authorization: "Bearer {{ _runner_github_rotate_old_pat.content | b64decode | trim }}"
+      Accept: 'application/vnd.github+json'
+      X-GitHub-Api-Version: "{{ _runner_github_api_version }}"
+    timeout: 30
+  register: '_runner_github_rotate_old_check'
+  failed_when: false
+  no_log: true
+  check_mode: false
+  when: "_runner_github_rotate_old_pat is not skipped"
+
+- name: 'Report the PAT this host stores now'
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('[!] no PAT stored at ' ~ _runner_github_pat_file) if _runner_github_rotate_old_pat is skipped
+         else _runner_github_rotate_old_reports[_runner_github_rotate_old_status]
+              | default('[!] could not check the current PAT (HTTP ' ~ _runner_github_rotate_old_status ~ ')') }}
+  vars:
+    _runner_github_rotate_old_status: "{{ _runner_github_rotate_old_check.status | default(-1) | string }}"
+    _runner_github_rotate_old_reports:
+      '200': >-
+        the PAT currently on disk still works{{ (' (expires '
+        ~ _runner_github_rotate_old_check.github_authentication_token_expiration ~ ')')
+        if _runner_github_rotate_old_check.github_authentication_token_expiration is defined else '' }}
+      '401': '[x] the PAT currently on disk is REJECTED (401) - runners stop registering on their next cycle'
+      '403': '[x] the PAT currently on disk lacks runner-admin permission (403)'
+
+# validate_token fails the play on a bad token, and nothing has been written
+# yet, so a bad token leaves the old one intact.
+- name: 'Check the new PAT against the GitHub API'
+  ansible.builtin.include_tasks: 'validate_pat.yaml'
+  vars:
+    _runner_github_api_pat: "{{ runner_github_new_pat }}"
+    _runner_github_api_scope: "{{ _runner_github_rotate_stored.GHA_SCOPE }}"
+    _runner_github_api_org: "{{ _runner_github_rotate_stored.GHA_ORG }}"
+    _runner_github_api_repo: "{{ _runner_github_rotate_stored.GHA_REPO | default('') }}"
+
+- name: 'Keep the configuration directory root-only'
+  ansible.builtin.file:
+    path: "{{ _runner_github_config_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0700'
+
+# copy writes a temporary file beside the destination and renames it over:
+# an atomic swap, never a half-written file for a runner starting meanwhile.
+- name: 'Store the new PAT where only root can read it'
+  ansible.builtin.copy:
+    content: "{{ runner_github_new_pat | string | trim }}"
+    dest: "{{ _runner_github_pat_file }}"
+    owner: 'root'
+    group: 'root'
+    mode: '0600'
+  register: '_runner_github_rotate_write'
+  no_log: true
+  diff: false
+
+- name: 'Report the rotation'
+  ansible.builtin.debug:
+    msg:
+      - >-
+        {{ ('stored at ' ~ _runner_github_pat_file ~ ' (0600 root:root)')
+           if _runner_github_rotate_write is changed
+           else 'this host already stored the new PAT; nothing changed' }}
+      - >-
+        No runner restarted: gha-jitconfig reads the file at every start, and every
+        runner starts again after each job, so the new PAT is in use from each
+        runner's next job.
+      - 'Once every host reports it, revoke the old token in GitHub so it cannot be used again.'

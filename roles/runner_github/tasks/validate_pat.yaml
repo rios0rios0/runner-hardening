@@ -1,0 +1,144 @@
+---
+# validate_token, and the group check from choose_runner_group, against the
+# GitHub API. Shared by the converge and by playbooks/rotate_github_pat.yaml,
+# which hands in the new token. The includer sets:
+#   _runner_github_api_pat     the token to check
+#   _runner_github_api_scope   org | repo
+#   _runner_github_api_org     the organisation, or the repository owner
+#   _runner_github_api_repo    the repository, when the scope is repo
+#   _runner_github_api_group   the runner group id: looked up only at org scope,
+#                              and only when it is not 1 (Default)
+#
+# It runs on the box, as the installer did: that proves this box can reach the
+# API it registers through. The token travels only as a uri header under
+# no_log, and ansible.cfg's pipelining sends module arguments on the SSH
+# session's stdin. It is never an argv entry, which /proc/<pid>/cmdline would
+# show to every local user, the runner users included.
+
+- name: 'Ask GitHub whether the token can administer runners at this scope'
+  ansible.builtin.uri:
+    url: "{{ _runner_github_api }}{{ _runner_github_api_path }}"
+    method: 'GET'
+    headers:
+      Authorization: "Bearer {{ _runner_github_api_pat | string | trim }}"
+      Accept: 'application/vnd.github+json'
+      X-GitHub-Api-Version: "{{ _runner_github_api_version }}"
+    timeout: 30
+  vars:
+    _runner_github_api_path: >-
+      {{ '/orgs/' ~ _runner_github_api_org ~ '/actions/runners'
+         if _runner_github_api_scope == 'org'
+         else '/repos/' ~ _runner_github_api_org ~ '/' ~ _runner_github_api_repo ~ '/actions/runners' }}
+  register: '_runner_github_api_check'
+  failed_when: false
+  no_log: true
+  check_mode: false
+
+- name: 'Stop on a token GitHub does not accept'
+  ansible.builtin.fail:
+    msg: "{{ _runner_github_api_messages[_runner_github_api_status] | default(_runner_github_api_unexpected) }}"
+  vars:
+    _runner_github_api_status: "{{ _runner_github_api_check.status | default(-1) | string }}"
+    _runner_github_api_target: >-
+      {{ _runner_github_api_org ~ (('/' ~ _runner_github_api_repo) if _runner_github_api_scope == 'repo' else '') }}
+    _runner_github_api_messages:
+      '401': 'token rejected (401). It is invalid, expired, or revoked.'
+      '403': >-
+        token authenticated but lacks runner-admin permission (403). Classic PAT: add
+        scope admin:org (or repo for a single repository). Fine-grained PAT: add
+        "Self-hosted runners: Read and write" and authorise SSO. Fix the token and
+        run again.
+      '404': "{{ _runner_github_api_target }} not found, or the token cannot see it (404)"
+      '-1': >-
+        network failure talking to the GitHub API
+        ({{ _runner_github_api_check.msg | default('no response') }})
+    _runner_github_api_unexpected: >-
+      unexpected API response {{ _runner_github_api_status }}:
+      {{ (_runner_github_api_check.json | default({})).message | default(_runner_github_api_check.msg | default('')) }}
+  when: "_runner_github_api_check.status | default(-1) | int != 200"
+
+- name: 'Report the runners GitHub already lists at this scope'
+  ansible.builtin.debug:
+    msg: "GitHub currently lists {{ _runner_github_api_check.json.total_count }} runner(s) at this scope"
+  when: "(_runner_github_api_check.json | default({})).total_count | default(0) | int > 0"
+
+# Every runner registration goes through this PAT. When it expires every unit
+# restart-loops into backoff and CI stops with no obvious cause. GitHub returns
+# the expiry on every authenticated response.
+- name: 'Work out how long the token has left'
+  ansible.builtin.set_fact:
+    _runner_github_pat_expiry: "{{ _runner_github_api_expiry }}"
+    # Whole days, truncated toward zero as the installer's bash arithmetic did.
+    _runner_github_pat_days: >-
+      {{ ((((_runner_github_api_expiry | regex_replace(' (UTC|GMT)$', ' +0000'))
+            | to_datetime('%Y-%m-%d %H:%M:%S %z')).timestamp() - now().timestamp()) / 86400) | int
+         if _runner_github_api_expiry is match('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ([+-][0-9]{4}|UTC|GMT)$')
+         else '' }}
+  vars:
+    _runner_github_api_expiry: "{{ _runner_github_api_check.github_authentication_token_expiration | default('') | trim }}"
+
+- name: 'Stop on a token that has already expired'
+  ansible.builtin.fail:
+    msg: "this PAT expired {{ 0 - (_runner_github_pat_days | int) }} day(s) ago"
+  when: "_runner_github_pat_days | string | length > 0 and _runner_github_pat_days | int < 0"
+
+- name: 'Report how long the token has left'
+  ansible.builtin.debug:
+    msg: "{{ _runner_github_pat_reports[_runner_github_pat_state] }}"
+  vars:
+    _runner_github_pat_state: >-
+      {{ 'none' if _runner_github_pat_expiry | length == 0
+         else 'unreadable' if _runner_github_pat_days | string | length == 0
+         else 'soon' if _runner_github_pat_days | int <= 30
+         else 'fine' }}
+    _runner_github_pat_reports:
+      none: 'PAT has no expiry set (never expires - convenient, but rotate it deliberately)'
+      unreadable: "[!] could not read the PAT's expiry '{{ _runner_github_pat_expiry }}'; check it in GitHub"
+      soon: >-
+        [!] this PAT expires in {{ _runner_github_pat_days }} day(s) ({{ _runner_github_pat_expiry }}).
+        When it lapses every runner on every box in the fleet stops registering.
+        Rotate it with playbooks/rotate_github_pat.yaml.
+      fine: "PAT valid for another {{ _runner_github_pat_days }} day(s)"
+
+# choose_runner_group never checked a group it was given, and a wrong one only
+# showed up as every runner failing to register, in backoff, on every start.
+# Group 1 always exists, and a repository's runners always land in it.
+- name: 'Look up the runner group the runners are pinned to'
+  ansible.builtin.uri:
+    url: "{{ _runner_github_api }}/orgs/{{ _runner_github_api_org }}/actions/runner-groups/{{ _runner_github_api_group | int }}"
+    method: 'GET'
+    headers:
+      Authorization: "Bearer {{ _runner_github_api_pat | string | trim }}"
+      Accept: 'application/vnd.github+json'
+      X-GitHub-Api-Version: "{{ _runner_github_api_version }}"
+    timeout: 30
+  register: '_runner_github_group_check'
+  failed_when: false
+  no_log: true
+  check_mode: false
+  when: "_runner_github_api_scope == 'org' and _runner_github_api_group | default(1) | int != 1"
+
+- name: 'Stop on a runner group the organisation does not have'
+  ansible.builtin.fail:
+    msg: >-
+      {{ _runner_github_group_missing if _runner_github_group_check.status | default(-1) | int == 404
+         else _runner_github_group_unreadable }}
+  vars:
+    _runner_github_group_missing: >-
+      runner group {{ _runner_github_api_group }} does not exist in {{ _runner_github_api_org }},
+      or the token cannot see it (404). Set runner_github_group_id to an existing
+      group's id; 1 is Default.
+    _runner_github_group_unreadable: >-
+      cannot read runner group {{ _runner_github_api_group }} in {{ _runner_github_api_org }}
+      (HTTP {{ _runner_github_group_check.status | default(-1) }}) - typically a Free-plan
+      organisation, which has only group 1 (Default). Set runner_github_group_id: 1
+      and separate trusted and untrusted fleets with distinct labels instead; keep
+      public repositories off self-hosted runners.
+  when: "_runner_github_group_check is not skipped and _runner_github_group_check.status | default(-1) | int != 200"
+
+- name: 'Report the runner group'
+  ansible.builtin.debug:
+    msg: >-
+      runner group {{ _runner_github_api_group }}: {{ _runner_github_group_check.json.name | default('?') }}
+      (visibility: {{ _runner_github_group_check.json.visibility | default('?') }})
+  when: "_runner_github_group_check is not skipped"

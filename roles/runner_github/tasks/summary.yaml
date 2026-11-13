@@ -1,0 +1,33 @@
+---
+# The GitHub half of the installer's summary: where the runners register, the
+# labels they register with, and how a workflow reaches them. runner_host's
+# own summary, included right after, covers the instances, their units, the
+# memory policy and the old accounts. Read-only.
+
+- name: 'Summarise where the runners register and how to use them'
+  ansible.builtin.debug:
+    msg: "{{ _runner_github_summary | select | list }}"
+  vars:
+    _runner_github_heavy: "{{ runner_heavy_runners | int }}"
+    _runner_github_target: >-
+      {{ runner_github_org ~ (('/' ~ runner_github_repo) if runner_github_scope == 'repo' else '') }}
+    _runner_github_runs_on: "{{ runner_github_labels | replace(',', ', ') }}"
+    _runner_github_summary:
+      - >-
+        {{ runner_count_resolved }} ephemeral runner(s) on {{ ansible_facts['hostname'] }},
+        registering at {{ _runner_github_target }} in runner group {{ runner_github_group_id }}
+        on actions/runner {{ _runner_github_version }}, with labels {{ runner_github_labels }}
+      - >-
+        {{ '' if _runner_github_heavy | int == 0
+           else 'every runner also takes the label heavy'
+             if _runner_github_heavy | int >= runner_count_resolved | int
+           else 'runners 1 to ' ~ _runner_github_heavy ~ ' also take the label heavy' }}
+      - "use them in a workflow: runs-on: [{{ _runner_github_runs_on }}]"
+      - >-
+        {{ ('send the heaviest job - a CodeQL analysis - to the heavy runners, so no more than '
+            ~ _runner_github_heavy ~ ' of them share this box: runs-on: [' ~ _runner_github_runs_on ~ ', heavy]')
+           if _runner_github_heavy | int > 0 else '' }}
+      - >-
+        still worth doing, outside this box: restrict the runner group to the
+        repositories allowed to use it; require approval for outside contributors
+        (Settings > Actions > General); rotate the PAT if it has ever been used elsewhere

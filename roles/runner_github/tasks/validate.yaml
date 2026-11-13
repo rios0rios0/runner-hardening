@@ -1,0 +1,157 @@
+---
+# Every answer is checked before anything touches the box. Most of them end up
+# inside double-quoted assignments in /etc/github-runner/env, which root
+# scripts source, so a value that could close the quotes or expand ($, `, \)
+# is refused here rather than trusted there.
+#
+# runner_host's variables are checked only when the inventory sets them: its
+# defaults are not visible to this role until prepare is included, and an
+# unset one takes that default, which is valid.
+
+- name: 'Check the registration scope'
+  ansible.builtin.assert:
+    that: "runner_github_scope in ['org', 'repo']"
+    fail_msg: >-
+      runner_github_scope must be org or repo, got '{{ runner_github_scope }}'. Use org
+      to register at the organisation (it is what makes runner groups usable),
+      or repo for a single repository.
+    quiet: true
+
+- name: 'Check the organisation'
+  ansible.builtin.assert:
+    that: "runner_github_org is string and runner_github_org is match('^[A-Za-z0-9][A-Za-z0-9_-]*$')"
+    fail_msg: >-
+      runner_github_org is required: set it to the organisation login, or to the
+      repository owner when runner_github_scope is repo (letters, digits, - and
+      _ only), got '{{ runner_github_org }}'.
+    quiet: true
+
+- name: 'Check the repository'
+  ansible.builtin.assert:
+    that: "runner_github_repo is string and runner_github_repo is match('^[A-Za-z0-9._-]+$')"
+    fail_msg: >-
+      runner_github_scope is repo, so runner_github_repo must name the repository,
+      without its owner (letters, digits, ., - and _ only), got '{{ runner_github_repo }}'.
+    quiet: true
+  when: "runner_github_scope == 'repo'"
+
+- name: 'Point out a repository that the organisation scope ignores'
+  ansible.builtin.debug:
+    msg: >-
+      [!] runner_github_repo is set to '{{ runner_github_repo }}' but runner_github_scope
+      is org, so it is ignored and stored empty. Set runner_github_scope: repo to
+      register the runners at that repository instead.
+  when: "runner_github_scope == 'org' and runner_github_repo | length > 0"
+
+- name: 'Check the runner group'
+  ansible.builtin.assert:
+    that: "runner_github_group_id | string is match('^[1-9][0-9]*$')"
+    fail_msg: >-
+      runner_github_group_id must be a runner group id, a positive whole number
+      (1 is Default), got '{{ runner_github_group_id }}'.
+    quiet: true
+
+- name: 'Check the labels'
+  ansible.builtin.assert:
+    that: "runner_github_labels is string and runner_github_labels is match('^[A-Za-z0-9._:/+=@-]+(,[A-Za-z0-9._:/+=@-]+)*$')"
+    fail_msg: >-
+      runner_github_labels must be comma-separated labels with no spaces, such as
+      self-hosted,linux,x64,internal (each label: letters, digits and . _ : / + = @ -),
+      got '{{ runner_github_labels }}'.
+    quiet: true
+
+- name: 'Check the runner release'
+  ansible.builtin.assert:
+    that: "runner_github_version | string is match('^(latest|v?[0-9]+[.][0-9]+[.][0-9]+)$')"
+    fail_msg: >-
+      runner_github_version must be latest, or an actions/runner release such as
+      2.338.2, got '{{ runner_github_version }}'.
+    quiet: true
+
+- name: 'Check the PAT validation switch'
+  ansible.builtin.assert:
+    # A string too: `-e runner_github_validate_pat=false` arrives as one.
+    that: "runner_github_validate_pat is boolean or runner_github_validate_pat | string | lower in ['true', 'false']"
+    fail_msg: >-
+      runner_github_validate_pat must be true or false (false only where the PAT is
+      a dummy, as in CI), got '{{ runner_github_validate_pat }}'.
+    quiet: true
+
+- name: 'Check the trust level'
+  ansible.builtin.assert:
+    that: "runner_trust is not defined or runner_trust in ['internal', 'untrusted']"
+    fail_msg: >-
+      runner_trust must be internal or untrusted, got '{{ runner_trust | default('') }}'.
+      internal keeps caches warm between jobs, for internal and trusted
+      repositories only; untrusted resets the runner's home, tool cache, Docker
+      and workspace before every job, for public repositories and fork pull
+      requests.
+    quiet: true
+
+- name: 'Check the heavy runner count'
+  ansible.builtin.assert:
+    # Leading zeros are refused, not trimmed: the runtime's bash arithmetic
+    # reads 08 as octal and dies on it far from here.
+    that: "runner_heavy_runners is not defined or runner_heavy_runners | string is match('^(0|[1-9][0-9]*)$')"
+    fail_msg: >-
+      runner_heavy_runners must be 0 or a positive whole number with no leading zero
+      (how many runners, from runner 1, also take the label heavy), got
+      '{{ runner_heavy_runners | default('') }}'.
+    quiet: true
+
+- name: 'Check the CodeQL memory budget'
+  ansible.builtin.assert:
+    that: "runner_codeql_ram is not defined or runner_codeql_ram | string is match('^(auto|off|[1-9][0-9]*)$')"
+    fail_msg: >-
+      runner_codeql_ram must be auto, off or a number of MB, got
+      '{{ runner_codeql_ram | default('') }}'.
+    quiet: true
+
+- name: 'Check the slice ceiling'
+  ansible.builtin.assert:
+    that: "runner_slice_ceiling is not defined or runner_slice_ceiling in ['none', 'heavy', 'all']"
+    fail_msg: >-
+      runner_slice_ceiling must be none, heavy or all, got
+      '{{ runner_slice_ceiling | default('') }}'.
+    quiet: true
+
+- name: 'Check the old over-privileged accounts'
+  ansible.builtin.assert:
+    that: >-
+      runner_old_users is not defined
+      or (runner_old_users is sequence and runner_old_users is not string and runner_old_users is not mapping
+          and runner_old_users | select('match', '^[A-Za-z0-9._-]+$') | list | length == runner_old_users | length)
+    fail_msg: >-
+      runner_old_users must be a list of account names, [] for none (the first one
+      is what the v0.1.0 installer reads back as GHA_OLD_USER), got
+      {{ runner_old_users | default([]) }}.
+    quiet: true
+
+# fleet.sh never invented a default: a fleet.conf key left out was not sent,
+# so the host kept the answer it stored. The worst case was trust -- defaulting
+# it to internal takes a box that runs fork PRs and stops it resetting between
+# jobs. An inventory has no "not sent": a host it does not give runner_trust
+# gets runner_host's default, internal. So a host stored as untrusted keeps
+# that answer only by saying so, and this stops the converge until it does.
+- name: 'Read the answers this host already stores'
+  ansible.builtin.slurp:
+    src: "{{ _runner_github_env_file }}"
+  register: '_runner_github_stored_env'
+  failed_when: false
+  check_mode: false
+
+- name: 'Note the stored trust level'
+  ansible.builtin.set_fact:
+    _runner_github_stored_trust: >-
+      {{ (dict((_runner_github_stored_env.content | default('') | b64decode)
+               | regex_findall('^([A-Z_]+)="([^"]*)"$', multiline=True))).GHA_TRUST | default('') }}
+
+- name: 'Refuse to quietly stop resetting a host stored as untrusted'
+  ansible.builtin.assert:
+    that: "runner_trust is defined or _runner_github_stored_trust != 'untrusted'"
+    fail_msg: >-
+      This host is stored as GHA_TRUST="untrusted" in {{ _runner_github_env_file }}, and
+      the inventory gives it no runner_trust, whose default is internal: the
+      converge would stop resetting each runner between jobs. Set runner_trust for
+      this host -- untrusted to keep it, internal to change it on purpose.
+    quiet: true

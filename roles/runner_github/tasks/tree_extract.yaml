@@ -1,0 +1,104 @@
+---
+# Install the wanted release as tree _runner_github_n: fill a staging copy
+# beside the tree, then swap it in with two renames on the same filesystem. A
+# converge that fails before the swap leaves the old tree exactly as it was,
+# which is what lets the rescue in main.yaml put a drained runner back
+# unchanged; the installer's rm -rf first left nothing to put back.
+#
+# The staging copy is root-owned until it is complete. Extract as root, then
+# hand the tree over, rather than extracting as the runner user: that made
+# extraction depend on the tarball being readable by the runner user, which is
+# an avoidable coupling.
+
+- name: 'Clear what an interrupted converge left beside the tree'
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: 'absent'
+  loop:
+    - "{{ _runner_github_staging }}"
+    - "{{ _runner_github_retired }}"
+
+# Always created afresh, by root, since any leftover was just removed.
+- name: 'Create the staging copy, root-only while it fills'
+  ansible.builtin.file:
+    path: "{{ _runner_github_staging }}"
+    state: 'directory'
+    mode: '0700'
+
+- name: 'Extract the runner release into the staging copy'
+  ansible.builtin.unarchive:
+    src: "{{ _runner_github_tarball }}"
+    dest: "{{ _runner_github_staging }}"
+    remote_src: true
+    # As root, tar restores the archive's owner: a uid that may well be
+    # another runner user's on this box.
+    extra_opts: ['--no-same-owner']
+
+# From the root-owned copy, before it is handed over: run as root from a tree
+# its runner user already owns, the script would be that user's to edit first.
+# Once per converge, because the packages are the box's, not a tree's. A
+# complaint is a warning, as it was in the installer.
+- name: 'Install the system packages the runner needs'
+  ansible.builtin.command:
+    argv: ["{{ _runner_github_staging }}/bin/installdependencies.sh"]
+  environment:
+    DEBIAN_FRONTEND: 'noninteractive'
+    NEEDRESTART_MODE: 'a'
+    NEEDRESTART_SUSPEND: '1'
+  register: '_runner_github_dependencies'
+  changed_when: "'Setting up ' in _runner_github_dependencies.stdout"
+  failed_when: false
+  when: "_runner_github_n | int == _runner_github_extract | first | int"
+
+- name: 'Warn that installdependencies.sh complained'
+  ansible.builtin.debug:
+    msg: >-
+      [!] installdependencies.sh complained (exit {{ _runner_github_dependencies.rc }}):
+      {{ (_runner_github_dependencies.stderr_lines + _runner_github_dependencies.stdout_lines) | last | default('') }}
+  when: "_runner_github_dependencies is not skipped and _runner_github_dependencies.rc != 0"
+
+# follow: false changes the links in the tree, never what they point at.
+- name: 'Hand the staging copy to the runner user'
+  ansible.builtin.file:
+    path: "{{ _runner_github_staging }}"
+    state: 'directory'
+    owner: "{{ _runner_github_user }}"
+    group: "{{ _runner_github_user }}"
+    recurse: true
+    follow: false
+
+# tar restores the archive's mode onto the target dir; pin it rather than
+# inherit it.
+- name: 'Pin the mode of the tree itself'
+  ansible.builtin.file:
+    path: "{{ _runner_github_staging }}"
+    state: 'directory'
+    owner: "{{ _runner_github_user }}"
+    group: "{{ _runner_github_user }}"
+    mode: '0750'
+
+- name: 'Move the tree being replaced aside'
+  ansible.builtin.command:
+    argv: ['mv', '-T', '--', "{{ _runner_github_tree_dir }}", "{{ _runner_github_retired }}"]
+    removes: "{{ _runner_github_tree_dir }}"
+
+# The v0.1.0 unit runs <tree>/run-ephemeral.sh. Until finish installs the unit
+# that runs the root-owned wrapper instead, a runner put back after a failed
+# converge starts that old unit on this new tree, so the old wrapper comes
+# along; main.yaml removes it once finish has replaced the unit. A rename moves
+# a link a job may have planted there; it never follows one.
+- name: 'Carry the old one-job wrapper over until the unit stops naming it'
+  ansible.builtin.command:
+    argv: ['mv', '-T', '--', "{{ _runner_github_retired }}/run-ephemeral.sh", "{{ _runner_github_staging }}/run-ephemeral.sh"]
+    removes: "{{ _runner_github_retired }}/run-ephemeral.sh"
+
+- name: 'Put the new tree in place'
+  ansible.builtin.command:
+    argv: ['mv', '-T', '--', "{{ _runner_github_staging }}", "{{ _runner_github_tree_dir }}"]
+    removes: "{{ _runner_github_staging }}"
+    creates: "{{ _runner_github_tree_dir }}"
+
+- name: 'Remove the replaced tree'
+  ansible.builtin.file:
+    path: "{{ _runner_github_retired }}"
+    state: 'absent'

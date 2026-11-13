@@ -1,0 +1,113 @@
+---
+# The GitHub Actions vendor role. runner_host prepares the box, this role adds
+# what is GitHub's -- the admin PAT, the JIT helpers, the stored answers, the
+# runner trees -- and runner_host finishes and retires around it. The order
+# encodes dependencies: trace what each step assumes before moving one.
+
+# runner_host reads these names for both vendor roles, so they carry no role
+# prefix. The values are the installer's names on purpose: a fleet it
+# installed converges with its users, homes, units and caches as they are.
+- name: 'Set the GitHub flavour of the shared runner host'
+  ansible.builtin.set_fact:
+    runner_flavor: 'github'
+    runner_user_prefix: 'gha'
+    runner_base_dir: '/opt/actions-runner'
+    runner_unit: 'gha-runner'
+    runner_slice: 'gha.slice'
+    runner_sbin_prefix: 'gha'
+    runner_config_dir: '/etc/github-runner'
+    runner_worker_pattern: 'Runner\.Worker'
+    runner_work_policy: 'wipe'
+    runner_legacy_unit_globs: ['actions.runner.*']
+    runner_unit_description: 'Ephemeral GitHub Actions runner %i'
+    runner_unit_exec_start_pre: ['+/usr/local/sbin/gha-jitconfig %i']
+    runner_unit_exec_start: '/usr/local/libexec/runner-hardening/gha-run-ephemeral %i'
+    runner_unit_exec_stop_post: ['+/usr/local/sbin/gha-jitreap %i']
+    # Labels travel in the JIT config, so a heavy runner needs no environment.
+    runner_heavy_env: {}
+
+- name: 'Check every answer before anything touches the box'
+  ansible.builtin.import_tasks: 'validate.yaml'
+
+- name: 'Check and store the admin PAT'
+  ansible.builtin.import_tasks: 'credentials.yaml'
+
+# public: the stored answers and the summary read runner_host's defaults
+# (runner_trust, runner_heavy_runners, ...). A private include_role hides them
+# from this role again as soon as prepare returns.
+- name: 'Prepare the host'
+  ansible.builtin.include_role:
+    name: 'rios0rios0.runner_hardening.runner_host'
+    tasks_from: 'prepare'
+    public: true
+
+- name: 'Start with no runner drained'
+  ansible.builtin.set_fact:
+    _runner_github_drained: []
+
+# The rescue is the installer's undrain EXIT trap: without it, any later
+# failure -- a lost apt lock, a full disk, a unit that does not verify -- would
+# leave the drained runners with Restart=no and the box out of the pool, which
+# is a far worse outcome than the failure itself. It covers finish too, which
+# is what starts the drained runners again.
+- name: 'Install the GitHub parts, putting back every drained runner if a step fails'
+  block:
+    - name: 'Install the JIT helpers, the one-job wrapper and the hooks'
+      ansible.builtin.import_tasks: 'helpers.yaml'
+
+    - name: 'Store the answers'
+      ansible.builtin.import_tasks: 'config.yaml'
+
+    - name: 'Install the runner trees'
+      ansible.builtin.import_tasks: 'trees.yaml'
+
+    - name: 'Finish the host'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_host'
+        tasks_from: 'finish'
+
+  rescue:
+    - name: 'Put back the runners drained for a tree replacement'
+      ansible.builtin.command:
+        argv: "{{ [_runner_github_admin, 'undrain'] + (_runner_github_drained | map('string') | list) }}"
+      register: '_runner_github_undrain'
+      changed_when: "_runner_github_undrain.rc == 0"
+      failed_when: false
+      when: "_runner_github_drained | length > 0"
+
+    - name: 'Fail with the step that failed'
+      ansible.builtin.fail:
+        msg: >-
+          {{ ansible_failed_task.name | default('a step') }} failed:
+          {{ ansible_failed_result.msg | default('see the task above') }}
+          {%- if _runner_github_drained | length > 0 %}.
+          Runner(s) {{ _runner_github_drained | join(', ') }} were drained for a tree replacement and
+          {{ 'have been put back' if (_runner_github_undrain.rc | default(1)) == 0
+             else 'could NOT be put back: run ' ~ _runner_github_admin ~ ' undrain ' ~ (_runner_github_drained | join(' ')) }}
+          {%- endif %}
+
+# GitHub needs no de-registration of surplus runners here: a JIT registration
+# dies with its unit, and gha-jitreap deletes it when the unit stops.
+- name: 'Retire the runners above the count'
+  ansible.builtin.include_role:
+    name: 'rios0rios0.runner_hardening.runner_host'
+    tasks_from: 'retire'
+
+# It moved to the root-owned wrapper directory, where a job cannot edit the
+# script that runs its successor. Removed only now: until finish rewrote the
+# unit, ExecStart still named this copy. A runner still in a job started by the
+# old unit keeps reading the file it has open, and comes back after the job on
+# the new unit.
+- name: 'Remove the one-job wrapper from inside each job-writable tree'
+  ansible.builtin.file:
+    path: "{{ runner_base_dir }}/{{ item }}/run-ephemeral.sh"
+    state: 'absent'
+  loop: "{{ runner_instances }}"
+
+- name: 'Summarise where the runners register and how to use them'
+  ansible.builtin.import_tasks: 'summary.yaml'
+
+- name: 'Summarise the host: its runners, their units and the memory policy'
+  ansible.builtin.include_role:
+    name: 'rios0rios0.runner_hardening.runner_host'
+    tasks_from: 'summary'

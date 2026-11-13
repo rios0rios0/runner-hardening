@@ -1,0 +1,12 @@
+---
+# Fixed paths and endpoints, not tunables. The configuration directory and the
+# file names inside it are the installer's, kept exactly: the v0.1.0 installer
+# reads them back when a host is rolled back to it.
+_runner_github_config_dir: '/etc/github-runner'
+_runner_github_env_file: '/etc/github-runner/env'
+_runner_github_pat_file: '/etc/github-runner/pat'
+_runner_github_api: 'https://api.github.com'
+_runner_github_api_version: '2022-11-28'
+_runner_github_download: 'https://github.com/actions/runner/releases/download'
+_runner_github_admin: "/usr/local/sbin/{{ runner_sbin_prefix }}-admin"
+_runner_github_libexec: '/usr/local/libexec/runner-hardening'

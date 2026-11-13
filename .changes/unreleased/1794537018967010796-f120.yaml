@@ -1,0 +1,3 @@
+kind: 'Added'
+body: 'added the `runner_github` role, which converges a host the shell installer set up without renaming its users, units or caches: `/etc/github-runner/env` keeps its exact format, so the shell installer from `0.1.0` stays a working rollback, and a runner tree is replaced, after draining only that runner, when its release changes and never otherwise'
+time: '2026-11-13T02:30:18.966960974Z'

@@ -1,0 +1,22 @@
+---
+# Replace the admin PAT on the GitHub Actions runner hosts: validated against
+# the GitHub API on each host before it touches disk, written atomically, and
+# no runner restarted -- each picks the new token up at its next start, which
+# is after its current job.
+#
+#   ansible-playbook rios0rios0.runner_hardening.rotate_github_pat \
+#     -e @vault/new-pat.yaml --ask-vault-pass
+#
+# runner_github_new_pat holds the new token. Keep it out of the command line:
+# a vault file, or an inventory lookup of an environment variable, never
+# `-e runner_github_new_pat=...`, which every local user can read in the
+# controller's process list. Then revoke the old token in GitHub.
+- name: 'Rotate the admin PAT of the GitHub Actions runner hosts'
+  hosts: 'github_runners'
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 'Validate and store the new admin PAT'
+      ansible.builtin.include_role:
+        name: 'rios0rios0.runner_hardening.runner_github'
+        tasks_from: 'rotate_pat'
