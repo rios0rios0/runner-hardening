@@ -18,6 +18,7 @@
     owner: 'root'
     group: 'root'
     mode: '0600'
+  when: "not ansible_check_mode or (_runner_host_cache_stat.stat.exists | default(false))"
 
 # Outside check mode the download is always there by now; a dry run fetched
 # nothing, so it stops at what it would have downloaded.
