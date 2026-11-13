@@ -10,7 +10,7 @@
   ansible.builtin.stat:
     path: "{{ _runner_azp_helper_dir }}"
     get_checksum: false
-  loop: ["{{ _runner_azp_libexec_dir }}", "{{ _runner_azp_lib_dir }}", "{{ runner_config_dir }}"]
+  loop: ["{{ _runner_azp_libexec_dir }}", "{{ _runner_azp_bin_dir }}", "{{ _runner_azp_lib_dir }}", "{{ runner_config_dir }}"]
   loop_control:
     loop_var: '_runner_azp_helper_dir'
   register: '_runner_azp_helper_dirs'
@@ -56,6 +56,27 @@
     mode: '0755'
   when: "not ansible_check_mode or _runner_azp_libexec_dir in _runner_azp_dir_present"
   notify: 'Restart idle runners'
+
+# First on every agent's PATH (.path), so the agent finds it before the box's
+# own docker: azp-docker.sh says why. 0755 root, outside every tree a job can
+# write, like the wrapper. It takes effect at the next docker call, so it
+# restarts nothing; the .path that puts it first does.
+- name: 'Create the directory of the agents own docker'
+  ansible.builtin.file:
+    path: "{{ _runner_azp_bin_dir }}"
+    state: 'directory'
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+
+- name: 'Install the docker that runs container steps as container root'
+  ansible.builtin.copy:
+    src: 'azp-docker.sh'
+    dest: "{{ _runner_azp_bin_dir }}/docker"
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+  when: "not ansible_check_mode or _runner_azp_bin_dir in _runner_azp_dir_present"
 
 - name: 'Install the Azure DevOps hooks beside lib.sh'
   ansible.builtin.copy:

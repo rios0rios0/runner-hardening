@@ -54,7 +54,7 @@
     _read: >-
       {{ _runner_azp_agents.results | selectattr('_runner_azp_n', 'equalto', _runner_azp_unit._runner_azp_n)
          | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | map(attribute='stdout')
-         | select('match', '^\s*\{') | list }}
+         | map('replace', _runner_azp_bom, '') | select('match', '^\s*\{') | list }}
     _agent: "{{ (_read | first | replace('\ufeff', '') | from_json) if _read | length > 0 else {} }}"
     _adopted: "{{ _runner_azp_pending | selectattr('n', 'equalto', _runner_azp_unit._runner_azp_n | int) | list }}"
 

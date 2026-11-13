@@ -4,6 +4,9 @@
 _runner_azp_sbin_dir: '/usr/local/sbin'
 _runner_azp_lib_dir: '/usr/local/lib/runner-hardening'
 _runner_azp_libexec_dir: '/usr/local/libexec/runner-hardening'
+# First on every agent's PATH: the docker that runs a container job's steps as
+# container root, which rootless Docker makes the agent's own user (azp-docker.sh).
+_runner_azp_bin_dir: '/usr/local/libexec/runner-hardening/azp-bin'
 _runner_azp_env_file: '/etc/azure-pipelines-agent/env'
 # For the length of a converge's registrations only; removed in an always:.
 _runner_azp_pat_file: '/run/azp-register.pat'
@@ -30,8 +33,13 @@ _runner_azp_releases_api: 'https://api.github.com/repos/microsoft/azure-pipeline
 _runner_azp_notes_rx_head: '\[vsts-agent-linux-x64-'
 _runner_azp_notes_rx_tail: '\.tar\.gz\]\((https://[^)\s]+)\)\s*\|\s*([0-9a-fA-F]{64})'
 
-# Ubuntu's own default PATH (/etc/environment). An agent's .path is its user's
-# ~/.local/bin, where jobs install their tools, then this.
+# The byte-order mark the agent writes at the start of .agent and .credentials,
+# which from_json rejects: stripped before every parse or shape check.
+_runner_azp_bom: "\ufeff"
+
+# Ubuntu's own default PATH (/etc/environment). An agent's .path is the agents'
+# own docker (_runner_azp_bin_dir), its user's ~/.local/bin, where jobs install
+# their tools, then this.
 _runner_azp_system_path: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin'
 
 # The agent reads .env at every start and sets each line in its environment
@@ -51,6 +59,10 @@ _runner_azp_env_owned:
   - 'TMPDIR'                    # the unit's: a private /var/tmp
   - 'AGENT_DIAGLOGPATH'         # the backoff counts jobs by the worker logs in _diag
   - 'WORKER_DIAGLOGPATH'
+# ... and every key of runner_heavy_env and runner_instance_env (main.yaml):
+# VSTS_SETUP_DOCKERGROUP and AZP_AGENT_DEFAULT_MAP_DOCKER_SOCKET_TO_FALSE among
+# them, which keep a container job off the root Docker socket a rootless host
+# does not have.
 # What every agent's .env holds when it does not say otherwise. DOCKER_BUILDKIT
 # as on GitHub boxes; LANG because env.sh snapshots it, so every agent has one.
 _runner_azp_env_defaults:

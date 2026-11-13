@@ -35,6 +35,7 @@
         runner_unit_exec_start: '/usr/local/libexec/runner-hardening/gha-run-ephemeral %i'
         runner_unit_exec_stop_post: ['+/usr/local/sbin/gha-jitreap %i']
         runner_heavy_env: {}
+        runner_instance_env: {}
       azure_devops:
         runner_flavor: 'azure_devops'
         runner_user_prefix: 'azp'
@@ -51,6 +52,7 @@
         runner_unit_exec_start: '/usr/local/libexec/runner-hardening/azp-run-once %i'
         runner_unit_exec_stop_post: ['+/usr/local/sbin/azp-cycle post %i']
         runner_heavy_env: {heavy: 'true'}
+        runner_instance_env: {VSTS_SETUP_DOCKERGROUP: 'false', AZP_AGENT_DEFAULT_MAP_DOCKER_SOCKET_TO_FALSE: 'true'}
   tasks:
     - name: 'Load the role constants'
       ansible.builtin.include_vars:

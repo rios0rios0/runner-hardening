@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed the byte-order mark the agent writes at the start of `.agent` breaking the converge summary, the registration record and `azp-admin diagnose`, as it had broken adoption'
+time: '2026-11-13T08:53:20.491302459Z'

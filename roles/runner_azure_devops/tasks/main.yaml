@@ -30,6 +30,18 @@
     # so this is what a pipeline routes its heaviest job by: `demands: heavy`.
     runner_heavy_env:
       heavy: 'true'
+    # A rootless host has no root Docker socket, by design, so a container job
+    # must neither stat it nor mount it. Left on, the agent stats
+    # /var/run/docker.sock in "Initialize containers" to copy its group into
+    # the container (the SetupDockerGroup knob, VSTS_SETUP_DOCKERGROUP), and
+    # that fails the job; newer agents also mount the socket into every job
+    # container unless told not to (AZP_AGENT_DEFAULT_MAP_DOCKER_SOCKET_TO_FALSE;
+    # older ones ignore it). Container jobs then work, their steps run as
+    # container root by the agents' own docker (azp-docker.sh); Docker inside
+    # such a container does not, unless the pipeline maps a socket of its own.
+    runner_instance_env:
+      VSTS_SETUP_DOCKERGROUP: 'false'
+      AZP_AGENT_DEFAULT_MAP_DOCKER_SOCKET_TO_FALSE: 'true'
 
 - name: 'Check every answer before anything touches the box'
   ansible.builtin.import_tasks: 'validate.yaml'

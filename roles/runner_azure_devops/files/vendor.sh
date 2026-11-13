@@ -125,9 +125,10 @@ vendor_diagnose() {
   fi
   d=$(runner_dir "$n")
   if vendor_registered "$n"; then
-    printf '    agent   : %s\n' "$(as_runner "$n" jq -r \
-      '"\(.agentName) (id \(.agentId)) in pool \(.poolName) at \(.serverUrl), work folder \(.workFolder)"' \
-      "${d}/.agent" 2>/dev/null || echo 'unreadable .agent')"
+    # The agent writes .agent with a UTF-8 byte-order mark, which not every jq skips.
+    printf '    agent   : %s\n' "$(as_runner "$n" cat -- "${d}/.agent" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' \
+      | jq -r '"\(.agentName) (id \(.agentId)) in pool \(.poolName) at \(.serverUrl), work folder \(.workFolder)"' \
+      2>/dev/null || echo 'unreadable .agent')"
   else
     printf '    agent   : %s\n' "not registered (${d} holds no .agent and .credentials)"
   fi

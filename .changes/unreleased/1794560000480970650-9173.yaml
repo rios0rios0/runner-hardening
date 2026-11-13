@@ -1,0 +1,3 @@
+kind: 'Fixed'
+body: 'fixed container jobs on Azure Pipelines agents under rootless Docker: the agent runs a step as `docker exec -u <its own uid>`, which rootless Docker maps to a subordinate uid that owns nothing of the agent''s, so a step could read neither its task key, nor the checkout, nor a `Cache@2` restore; the first `docker` on every agent''s `PATH` now runs that one call as container root, the agent''s own user, and every agent''s unit tells it not to stat or mount the root Docker socket a rootless box does not have'
+time: '2026-11-13T08:53:20.480925281Z'

@@ -295,6 +295,7 @@ converges without a single user, home, unit or cache being renamed.
 | workspace between jobs    | wiped (work policy `wipe`)           | kept, evicted under disk pressure (`lru`) |
 | heavy jobs                | label `heavy`                        | capability `heavy`                       |
 | legacy units it replaces  | `actions.runner.*`                   | `vsts.agent.*`                           |
+| container job steps       | as container root (the runner's own) | as container root (the agents' `docker`) |
 
 ## Secrets
 
@@ -765,6 +766,27 @@ Azure Pipelines routes by capabilities rather than labels, and the agent
 reports every variable in its environment as one. Runners 1 to
 `runner_heavy_runners` start with `heavy=true` in theirs, so a pipeline sends a
 job there with `demands: 'heavy'` (see [Using the runners](#using-the-runners)).
+
+### Container jobs
+
+A job with `container:` runs on its agent's own rootless Docker. The agent runs
+each step of such a job as `docker exec -u <its own uid>`, as a user it adds to
+the container, so that with rootful Docker what a step writes is the agent's.
+With rootless Docker that uid maps to one of the agent user's subordinate uids,
+which owns nothing of the agent's: the step could read neither its task key, nor
+the checkout, nor a `Cache@2` restore, and the agent could not clean up what it
+left. So the first `docker` on every agent's `PATH`,
+`/usr/local/libexec/runner-hardening/azp-bin/docker`, runs that one call as
+container root instead, which rootless Docker makes the agent's own user, as a
+GitHub runner runs a container job's steps. It gains nothing: the agent gives its
+container user passwordless sudo anyway. Every other `docker` call, a job's own
+included, goes through unchanged.
+
+There is no root Docker socket on the box, so no agent stats or mounts one
+(`VSTS_SETUP_DOCKERGROUP=false` and `AZP_AGENT_DEFAULT_MAP_DOCKER_SOCKET_TO_FALSE=true`
+in every agent's unit). A job's steps on the host use the agent's own daemon
+(`DOCKER_HOST`); a step inside a container job has no Docker unless the pipeline
+mounts that socket into the container itself.
 
 ### The workspace stays between jobs
 

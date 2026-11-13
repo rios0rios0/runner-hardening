@@ -25,6 +25,8 @@
     runner_unit_exec_stop_post: ['+/usr/local/sbin/gha-jitreap %i']
     # Labels travel in the JIT config, so a heavy runner needs no environment.
     runner_heavy_env: {}
+    # Nothing every runner needs beyond the drop-in's own lines.
+    runner_instance_env: {}
 
 - name: 'Check every answer before anything touches the box'
   ansible.builtin.import_tasks: 'validate.yaml'

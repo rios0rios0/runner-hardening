@@ -3,7 +3,8 @@
 # The Azure DevOps helpers, driven as they ship: azp-cycle (the restart
 # backoff around every agent cycle), azp-register (registration in a pristine
 # copy, removal by the host's own record, the token in no argv), azp-run-once
-# (one job, as a child, never exec), and vendor.sh's verify hook.
+# (one job, as a child, never exec), azp-docker (a container job's steps as
+# container root), and vendor.sh's verify hook.
 #
 # Run from the repository root:  bash test/runtime/azure_devops_test.sh
 #
@@ -15,7 +16,8 @@
 #   - what a box talks to: systemctl and docker (harness.sh's), the account
 #     database (getent), the pool's REST API (curl), and sleep, so a 20-second
 #     backoff takes no time;
-#   - the agent itself: config.sh and run.sh in the scratch agent tree.
+#   - the agent itself: config.sh and run.sh in the scratch agent tree, and its
+#     job worker, a copy of bash named Agent.Worker, as azp-docker tells it.
 #
 # Several names are read only by the scripts driven here, which ShellCheck
 # cannot follow across the source.
@@ -46,9 +48,10 @@ printf 'sleep %s\n' "$*" >> "${STANDIN_STATE:?}/calls.log"
 EOF
   cat > "$BOX/bin/getent" <<EOF
 #!/usr/bin/env bash
-# stand-in getent: the accounts of a box an agent was adopted on
+# stand-in getent: the accounts of a box an agent was adopted on. Root's row is
+# printed rather than written out: a literal one reads as /etc/shadow to Semgrep.
+printf '%s:x:0:0:%s:/root:/bin/bash\n' root root
 cat <<'PASSWD'
-root:x:0:0:root:/root:/bin/bash
 bin:x:2:2:bin:/bin:/usr/sbin/nologin
 agent:x:1000:1000:the account the agent ran as:/home/agent:/bin/bash
 azp1:x:1001:1001::${BOX}/home/azp1:/bin/bash
@@ -227,7 +230,7 @@ printf '%s\n' "\$@" > "${LOGS}/config.argv"
 /usr/bin/env > "${LOGS}/config.env"
 pwd > "${LOGS}/config.pwd"
 command -v uname > "${LOGS}/config.uname"
-printf '{"agentId": 42, "agentName": "build-01-1", "poolId": 10, "poolName": "your-pool", "workFolder": "_work"}' > .agent
+printf '\xef\xbb\xbf{"agentId": 42, "agentName": "build-01-1", "poolId": 10, "poolName": "your-pool", "workFolder": "_work"}' > .agent
 EOF
   chmod 0755 "$AGENTS/.1.new/config.sh"
   cat > "$BOX/etc/azure-pipelines-agent/env" <<'EOF'
@@ -305,7 +308,8 @@ it_records_the_agent_it_registered() {
   # when the agent is registered
   run_register 1
 
-  # then the pool and agent ids are kept root-side, for removal to read
+  # then the pool and agent ids are kept root-side, for removal to read, though the
+  # agent writes its .agent with a byte-order mark
   assert_eq "the record names the agent registered" '{"poolId":10,"agentId":42,"agentName":"build-01-1"}' \
     "$(cat "$RECORDS/1.json" 2>/dev/null)"
   assert_eq "the record is 0600" "600" "$(stat -c '%a' "$RECORDS/1.json" 2>/dev/null)"
@@ -581,5 +585,101 @@ it_flags_an_agent_that_is_not_registered() {
   assert_contains "it says how to register it" "$OUT" "runner_azp_pat"
 }
 it_flags_an_agent_that_is_not_registered
+
+echo
+echo "azp-docker: a container job's steps run as container root"
+
+# shim_box - an Azure DevOps box with the agents' own docker first on PATH,
+# ahead of harness.sh's recording one, and a stand-in for the agent's job
+# worker: a copy of bash named Agent.Worker, so a docker it runs has
+# Agent.Worker for its parent's executable, as on a box
+shim_box() {
+  azp_box
+  mkdir -p "$BOX/azp-bin" "$BOX/agent-bin"
+  cp -- "${AZP_FILES}/azp-docker.sh" "$BOX/azp-bin/docker"
+  cp -- "$BASH" "$BOX/agent-bin/Agent.Worker"
+  chmod 0755 "$BOX/azp-bin/docker" "$BOX/agent-bin/Agent.Worker"
+  export PATH="$BOX/azp-bin:$PATH"
+}
+
+# as_agent <docker args...> - docker, called by the stand-in worker; the exit
+# after it keeps bash from exec'ing docker in its own place
+as_agent() {
+  "$BOX/agent-bin/Agent.Worker" -c 'docker "$@"; exit $?' _ "$@"
+}
+
+last_docker_call() { tail -n 1 "$BOX/state/docker.log" 2>/dev/null; }
+
+it_runs_the_agents_container_step_as_container_root() {
+  # given the call the agent makes to run a container job's step, as its own uid
+  shim_box
+
+  # when its job worker makes it
+  as_agent exec -i -u "$EUID" -w /home/azp1_azpcontainer c1 /__a/externals/node20/bin/node /__w/_temp/containerHandlerInvoker.js
+
+  # then the step runs as container root -- the agent's own user under rootless
+  # Docker -- and the rest of the call is as it came
+  assert_eq "the step runs as container root" \
+    "docker exec -i -u 0 -w /home/azp1_azpcontainer c1 /__a/externals/node20/bin/node /__w/_temp/containerHandlerInvoker.js" \
+    "$(last_docker_call)"
+}
+it_runs_the_agents_container_step_as_container_root
+
+it_leaves_a_jobs_own_docker_exec_alone() {
+  # given a job's own docker exec as the agent's uid, through the same PATH
+  shim_box
+
+  # when the job makes it: its parent is not the agent's worker
+  docker exec -u "$EUID" c1 id -u
+
+  # then it reaches docker as it came
+  assert_eq "a job's exec is untouched" "docker exec -u $EUID c1 id -u" "$(last_docker_call)"
+}
+it_leaves_a_jobs_own_docker_exec_alone
+
+it_leaves_the_agents_other_calls_alone() {
+  # given the agent's worker making calls that are not its step exec as itself
+  shim_box
+
+  # when it runs an exec as another user, an exec whose command names the uid
+  # after the container, and a docker run as itself
+  as_agent exec -u 4242 c1 id
+  as_agent exec -i c1 sh -c "id -u" -u "$EUID"
+  as_agent run --rm -u "$EUID" busybox true
+
+  # then each reaches docker as it came
+  local log; log=$(tail -n 3 "$BOX/state/docker.log")
+  assert_contains "another user is kept" "$log" "docker exec -u 4242 c1 id"
+  assert_contains "nothing after the container is rewritten" "$log" "docker exec -i c1 sh -c id -u -u $EUID"
+  assert_contains "only exec is rewritten" "$log" "docker run --rm -u $EUID busybox true"
+}
+it_leaves_the_agents_other_calls_alone
+
+it_skips_itself_wherever_it_is_on_path() {
+  # given the agents' own docker on PATH twice, once through a link to its directory
+  shim_box
+  ln -s "$BOX/azp-bin" "$BOX/azp-bin-link"
+
+  # when a call goes through it
+  PATH="$BOX/azp-bin-link:$PATH" docker ps
+
+  # then the call reaches the box's docker, once
+  assert_eq "the call reaches docker" "docker ps" "$(last_docker_call)"
+  assert_eq "exactly once" "1" "$(grep -c '' "$BOX/state/docker.log")"
+}
+it_skips_itself_wherever_it_is_on_path
+
+it_fails_as_a_missing_command_without_a_docker_behind_it() {
+  # given a PATH on which the agents' own docker is the only one
+  shim_box
+
+  # when anything calls it
+  OUT=$(PATH="$BOX/azp-bin" "$BASH" "$BOX/azp-bin/docker" ps 2>&1); RC=$?
+
+  # then it fails the way a missing command does, and says why
+  assert_eq "it exits 127" "127" "$RC"
+  assert_contains "it says why" "$OUT" "no docker on PATH after $BOX/azp-bin"
+}
+it_fails_as_a_missing_command_without_a_docker_behind_it
 
 finish
