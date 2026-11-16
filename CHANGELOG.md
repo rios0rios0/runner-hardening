@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-16
+
+### Added
+
+- added `runner_extra_packages`, `runner_extra_apt_repositories` and `runner_extra_binaries`, so the tools a project expects its jobs to find are installed system-wide and root-owned, from a signed apt repository or a release download checked against its SHA-256, instead of by hand into a home every job can write
+- added Azure Pipelines support with the `runner_azure_devops` role: one job per agent process (`run.sh --once`) under the same disk guard, restart backoff, slice and rootless Docker as GitHub runners; adoption of agents that are already registered, which needs no PAT; fresh registration with the PAT passed as `VSTS_AGENT_INPUT_TOKEN`, never as an argument; and an `lru` work policy that keeps each pipeline working directory between jobs and evicts the stale ones
+- added the `converge` workflow, which converges both playbooks twice on a disposable GitHub-hosted VM and fails unless the second run changes nothing
+- added the `runner_github` role, which converges a host the shell installer set up without renaming its users, units or caches: `/etc/github-runner/env` keeps its exact format, so the shell installer from `0.1.0` stays a working rollback, and a runner tree is replaced, after draining only that runner, when its release changes and never otherwise
+- added the `slice_ceiling` key (`GHA_SLICE_CEILING`): `heavy` lifts the memory ceiling of runners 1..`heavy_runners` from 85% of what the box has left after its reserve to the whole `gha.slice` budget, and `all` lifts every runner, so a job too large for the usual ceiling (one compile of a very large package) is no longer OOM-killed with the slice's last gigabytes unused. `none`, the default, keeps every ceiling as it was, and the slice still caps all runners together
+- added the Ansible collection `rios0rios0.runner_hardening`, which replaces the shell installer: a vendor-neutral `runner_host` role (per-runner users, rootless Docker, the hardened unit, slice and resource policy, disk guard, janitor, reboot guard and the retirement of surplus instances) called by one role per CI vendor, plus playbooks to converge, verify, diagnose, drain and uninstall
+
+### Changed
+
+- changed every runtime script from a heredoc inside the installer into a static file that sources `/usr/local/lib/runner-hardening/lib.sh`, so ShellCheck lints it and a test suite drives it against scratch trees; the restart backoff is one shared definition instead of functions spliced in with `declare -f`
+- changed the busy check to look only inside the runner unit own cgroup, so a process a job leaves behind can no longer hold off a reboot or a drain, and made a converge that lowers a runner memory limit drain that runner first, so a policy change never OOM-kills a job in flight
+- changed the reboot guard to judge whether a runner is busy from its own worker process instead of the GitHub API, so it needs no PAT and serves Azure Pipelines agents too; its journal tag is now `<prefix>-reboot-if-idle`
+- made `--check --diff` complete on a host that has no runner users yet, changing nothing, so a dry run is the first step of every migration
+
+### Fixed
+
+- fixed `--check` failing on a first converge that installs `runner_extra_binaries`: a dry run creates no download cache, so the download into it is now skipped until a real run has created it
+- fixed a converge failing on a host where an apt source for a repository in `runner_extra_apt_repositories` was already added by hand: apt refused every source over the two `Signed-By` values, so any other file naming a repository this role writes is now moved aside to `/var/lib/runner-hardening/apt-sources-moved-aside` first
+- fixed container jobs on Azure Pipelines agents under rootless Docker: the agent runs a step as `docker exec -u <its own uid>`, which rootless Docker maps to a subordinate uid that owns nothing of the agent's, so a step could read neither its task key, nor the checkout, nor a `Cache@2` restore; the first `docker` on every agent's `PATH` now runs that one call as container root, the agent's own user, and every agent's unit tells it not to stat or mount the root Docker socket a rootless box does not have
+- fixed Docker CE failing to install over the distribution own Docker packages (`docker-compose-v2` ships the same `docker-compose` plugin file): on a dedicated host the packages Docker install guide lists as conflicting are now removed first
+- fixed the adoption of a real Azure Pipelines agent stopping at discovery: the agent writes `.agent` and `.credentials` as UTF-8 with a byte-order mark, which Python JSON parsing (`from_json`) rejects, so every task that parses them now strips it first
+- fixed the byte-order mark the agent writes at the start of `.agent` breaking the converge summary, the registration record and `azp-admin diagnose`, as it had broken adoption
+- fixed the old rootful daemon socket file surviving the dismantle: a stopped socket unit leaves `/run/docker.sock` behind, `root:docker` though nothing answers on it, so it is now removed with the rest of the rootful stack
+
+### Removed
+
+- **BREAKING CHANGE:** removed `harden-gha-runners.sh`, `fleet.sh` and `fleet.conf.example`: hosts are converged by the collection playbooks, a fleet is an Ansible inventory instead of `fleet.conf`, and `git checkout 0.1.0` keeps the shell installer available as a rollback
+
+### Security
+
+- kept a job from leaving code behind for the jobs after it: with `runner_trust: untrusted` the disk guard restores a root-owned copy of the runner rootless Docker unit before every job, and the single-use JIT configuration now reaches the runner in `ACTIONS_RUNNER_INPUT_JITCONFIG` instead of on its command line
+- kept every credential away from what a job can write: a fresh Azure Pipelines registration runs only in a pristine, root-owned unpack of the verified agent package, an agent is removed by the ids recorded when it was registered instead of by its job-writable `.agent`, root never reads a file under a runner home or tree through a link a job could have planted, `--diff` never shows such a file, and a PAT is written through `stdin` so no temporary copy of it is left on the host
+- moved the per-job wrapper out of the runner tree a job can write into a root-owned `/usr/local/libexec/runner-hardening`, so a job can no longer rewrite the wrapper the next job runs, and made every trust value other than exactly `internal` get the full reset between jobs
+
 ## [0.1.0] - 2026-11-04
 
 ### Added
