@@ -1,3 +1,0 @@
-kind: 'Added'
-body: 'added opt-in DNS resilience for self-hosted CI runner hosts to the `runner_host` role: `runner_dns_servers` gives systemd-resolved upstream resolvers that it asks in parallel with the ones the network gives the host, which stay in place, `runner_dns_fallback_servers` sets `FallbackDNS=`, `runner_dns_stale_retention_sec` keeps names already resolved answering from the cache while no upstream answers (systemd 254 or later; an older host is warned and gets the rest), and `runner_dns_cache` sets `Cache=`. With none of them set the role writes nothing, and it restarts systemd-resolved only when its drop-in changes'
-time: '2026-11-17T17:59:18.070189828Z'
