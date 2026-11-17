@@ -42,9 +42,9 @@ Makefile targets load the shared config that every repository standardises on.
   `tasks_from: prepare` (preflight, legacy units, de-privilege, one-time wipe,
   prerequisites, users and rootless Docker), then its own helpers and trees,
   then `tasks_from: finish` (`host.env`, scripts, policy, unit, slice,
-  drop-ins, enable, timers, `verify`), then surplus de-registration, then
-  `tasks_from: retire`. The order encodes dependencies. Do not reorder without
-  tracing what each step assumes exists.
+  drop-ins, enable, the resolver drop-in, timers, `verify`), then surplus
+  de-registration, then `tasks_from: retire`. The order encodes dependencies.
+  Do not reorder without tracing what each step assumes exists.
 
 - **The flavour is data.** `runner_user_prefix`, `runner_base_dir`,
   `runner_unit`, `runner_slice`, `runner_sbin_prefix`, `runner_config_dir`,
@@ -157,6 +157,12 @@ Makefile targets load the shared config that every repository standardises on.
   a stop of the whole runner ("The runner has received a shutdown signal"), and
   systemd-oomd is absent from a server install. Heavy jobs are kept apart by the
   `heavy` label or capability and sized by the `CODEQL_RAM` each runner exports.
+- **The resolver settings only add, and never start anything.** The
+  `runner_dns_*` drop-in adds servers beside the ones the host's network gives
+  it (never an empty `DNS=` reset), and is applied by restarting a
+  systemd-resolved that already runs, only when the drop-in changed; a host
+  without it running is warned about and left alone. `dns.yaml` flushes its
+  own handler, so it stays after the units' flush in `finish.yaml`.
 - **`TMPDIR=/var/tmp` in the unit is deliberate.** Ubuntu `26.04`'s `/tmp` is a
   tmpfs of half the RAM that `PrivateTmp=` shares between every runner on the
   box; concurrent test suites filled it. The private `/var/tmp` is on disk and
@@ -188,7 +194,9 @@ each `test/runtime/*_test.sh` in its own process and totals the result;
 `test/ansible/policy.yaml` (the memory policy, the count, the surplus and the
 legacy units, pinned to numbers the shell installer's arithmetic produced);
 `test/ansible/templates.yaml` (the unit, slice, drop-ins, timers and `host.env`
-of both flavours, rendered and checked for their invariants); and
+of both flavours, rendered and checked for their invariants);
+`test/ansible/dns.yaml` (the resolver drop-in the `runner_dns_*` variables
+write, for each answer and systemd version); and
 `ansible-playbook --syntax-check` on every playbook.
 
 The runtime tests source `test/runtime/harness.sh`, which builds a scratch box
@@ -200,7 +208,8 @@ BDD (`# given / # when / # then`), each an `it_*` function defined and invoked
 on the next line; the final tally picks up new ones automatically.
 
 `.github/workflows/converge.yaml` converges both playbooks twice on a disposable
-`ubuntu-24.04` VM and fails unless the second run reports `changed=0`, then runs
+`ubuntu-24.04` VM and fails unless the second run reports `changed=0`, then
+checks the resolver drop-in against `resolvectl status` and runs
 `systemd-analyze verify` on the installed units. It never starts a runner or
 registers one. **Anything beyond that is untestable here** — a registration, a
 job, a reboot have to be run on a disposable Ubuntu VM. Say so rather than

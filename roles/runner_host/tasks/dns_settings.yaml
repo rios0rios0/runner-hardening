@@ -1,0 +1,40 @@
+---
+# Pure: set_fact only, no host access (test/ansible/dns.yaml drives it).
+# Inputs: runner_dns_servers, runner_dns_fallback_servers,
+# runner_dns_stale_retention_sec, runner_dns_cache, and
+# _runner_host_systemd_version (0 when it could not be read).
+#
+# _runner_host_dns_lines is the [Resolve] section of the drop-in, in the order
+# it is written, and empty when nothing is asked for: then no drop-in is
+# written at all. _runner_host_dns_warnings says what this host cannot honour.
+#
+# StaleRetentionSec= arrived in systemd 254. An older systemd-resolved logs an
+# unknown key and carries on, so writing it anyway would look configured and
+# do nothing; it is left out, and said so, instead.
+#
+# Each scope keeps its own cache: the link's, holding what the network's
+# resolvers answered, and the global one, holding what runner_dns_servers
+# answered. Until systemd 261, moving from one global server to the next, which
+# is what a failing server makes systemd-resolved do, empties the global cache
+# even with StaleRetentionSec= set; a link's switch keeps its cache, and with
+# one global server there is nothing to switch to. Measured on 255: with two
+# servers here a cut-off upstream left a name unresolved for the full two
+# minutes; with one it was answered stale after five seconds.
+- name: 'Work out the resolver settings'
+  ansible.builtin.set_fact:
+    _runner_host_dns_lines: >-
+      {{ (['DNS=' ~ (runner_dns_servers | join(' '))] if runner_dns_servers | length > 0 else [])
+         + (['FallbackDNS=' ~ (runner_dns_fallback_servers | join(' '))] if runner_dns_fallback_servers | length > 0 else [])
+         + (['Cache=' ~ runner_dns_cache] if runner_dns_cache | length > 0 else [])
+         + (['StaleRetentionSec=' ~ _stale] if _stale | int > 0 and _version | int >= 254 else []) }}
+    _runner_host_dns_warnings: >-
+      {{ (['StaleRetentionSec=' ~ _stale ~ ' is left out: it needs systemd 254 or later, and this host runs '
+           ~ (('systemd ' ~ _version) if _version | int > 0 else 'one whose version could not be read')]
+          if _stale | int > 0 and _version | int < 254 else [])
+         + (['systemd ' ~ _version ~ ' empties the cache of runner_dns_servers whenever it moves from one to the next'
+             ~ ' (261 keeps it), so with ' ~ (runner_dns_servers | length) ~ ' of them a stale answer survives an outage'
+             ~ " only through the network's own resolvers; list one to keep it"]
+            if _stale | int > 0 and 254 <= _version | int < 261 and runner_dns_servers | length > 1 else []) }}
+  vars:
+    _stale: "{{ runner_dns_stale_retention_sec | int }}"
+    _version: "{{ _runner_host_systemd_version | default(0) | int }}"

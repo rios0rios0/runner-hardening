@@ -194,6 +194,10 @@ shows each one in place.
 | `runner_dismantle_rootful_docker` | `true`                       | disable the rootful Docker and containerd daemons and delete their image store, once |
 | `runner_unattended_upgrades`      | `true`                       | security-only unattended upgrades, with automatic reboots off; `false` leaves whatever the box already has configured alone |
 | `runner_reboot_guard`             | `true`                       | a timer that applies a pending reboot between 02:00 and 05:00, and only when no runner is busy; `false` removes the timer and its script |
+| `runner_dns_servers`              | `[]`                         | upstream resolvers for systemd-resolved (`DNS=`), asked in parallel with the ones the host's network gives it, which stay in place; the first good answer wins — see [DNS](#dns) |
+| `runner_dns_fallback_servers`     | `[]`                         | `FallbackDNS=`: resolvers systemd-resolved uses only while it knows no other at all, never because one stops answering |
+| `runner_dns_stale_retention_sec`  | `0`                          | seconds a cached answer may still be served past its TTL while no upstream answers (`StaleRetentionSec=`, systemd `254` or later; an older host is told and gets the rest); `0` for off |
+| `runner_dns_cache`                | `''`                         | `Cache=`: empty keeps systemd-resolved's own setting, or `'yes'`, `'no'` or `'no-negative'`, quoted. Stale answers come from the cache, so never `'no'` beside them |
 | `runner_start_units`              | `true`                       | `false` installs and enables the units without starting them |
 | `runner_mem_mb`                   | `{{ ansible_facts['memtotal_mb'] }}` | the RAM, in MB, the resource policy is computed from |
 | `runner_vcpus`                    | `{{ ansible_facts['processor_vcpus'] }}` | the vCPUs `runner_count: auto` sizes from |
@@ -231,6 +235,61 @@ runner_extra_binaries:
 
 An installed file is compared by checksum on every converge; a tool tree is
 replaced only when its pinned `sha256` changes.
+
+#### DNS
+
+A job resolves hundreds of names, so a host with one upstream resolver fails
+every job that runs while that resolver is slow or gone, with `Temporary
+failure in name resolution`. The `runner_dns_*` variables make name
+resolution survive that, through the systemd-resolved an Ubuntu server already
+runs. They are all off by default: with none set, the role writes nothing and
+never restarts systemd-resolved.
+
+```yaml
+runner_dns_servers: ['192.0.2.53']           # a resolver you trust, beside the network's own
+runner_dns_fallback_servers: ['198.51.100.53']
+runner_dns_stale_retention_sec: 86400
+runner_dns_cache: 'yes'
+```
+
+They land in one drop-in, `/etc/systemd/resolved.conf.d/90-runner-hardening.conf`:
+
+- **The network's resolvers stay.** Whatever the host's network configuration
+  gives it is left alone. systemd-resolved asks `runner_dns_servers` in
+  parallel with those, and the first good answer wins. A positive answer beats
+  a negative one, so a name only the network's own resolver knows still
+  resolves; a name two resolvers answer differently can get either answer.
+- **`FallbackDNS=` is not a fallback for a resolver that stops answering.**
+  systemd-resolved uses `runner_dns_fallback_servers` only while it knows no
+  other resolver at all, for a network that hands out none. The resolver you
+  want to take over when the usual one goes quiet belongs in
+  `runner_dns_servers`.
+- **Names already resolved keep answering.** With
+  `runner_dns_stale_retention_sec`, systemd-resolved keeps a record that long
+  past its TTL. It still asks upstream first, and serves the stale record when
+  that attempt fails, within one retry timeout (about five seconds). The
+  setting needs systemd `254` (Ubuntu `24.04` has `255`); an older host gets
+  the rest of the drop-in, and the converge says what it left out.
+- **Before systemd `261`, list one server for stale answers.** Each scope
+  keeps its own cache: the link's for the network's resolvers, the global one
+  for `runner_dns_servers`. Up to systemd `260`, moving from one global server
+  to the next, which is what a failing server makes systemd-resolved do,
+  empties the global cache, stale records included; a link's switch keeps its
+  own. With a single server in `runner_dns_servers` there is nothing to switch
+  to, so every cached name survives; with more, the converge warns that only
+  the names the network's resolvers answered do.
+- **A change restarts systemd-resolved, once.** From systemd `256` it is
+  reloaded instead. A restart takes the local stub away for a fraction of a
+  second, and a lookup a job makes in that instant fails: change these while
+  the runners are idle. A converge that changes nothing leaves it alone.
+- **A host without systemd-resolved running is left alone**, with a warning:
+  starting it would change how every program on the box resolves names.
+- After the drop-in, the converge shows the global section of `resolvectl
+  status`, and warns when a server is missing from it, or when
+  `/etc/resolv.conf` sends programs around the stub.
+
+Clearing the variables removes the drop-in and puts the host back on its
+network's resolvers alone; so does `playbooks/uninstall.yaml`.
 
 ### GitHub Actions (`runner_github`)
 
@@ -276,7 +335,9 @@ them:
 `runner_dismantle_rootful_docker` stays `true` there, because the VM is thrown
 away afterwards. The workflow also runs two runners, a heavy one and a regular
 one, and turns `runner_reboot_guard` off: every runner there is idle, so
-between 02:00 and 05:00 the guard would reboot the VM under the job.
+between 02:00 and 05:00 the guard would reboot the VM under the job. It sets
+every `runner_dns_*` variable, then fails unless the drop-in holds them,
+`resolvectl status` lists each server and names still resolve.
 
 ### What each flavour installs
 

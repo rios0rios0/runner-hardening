@@ -1,0 +1,156 @@
+---
+# Proves the resolver drop-in: what dns_settings.yaml writes for each answer
+# and systemd version, and what it warns about, which addresses the answer check lets through, and the
+# file the template renders. Runs as non-root, offline, on the controller:
+#
+#   ansible-playbook test/ansible/dns.yaml
+- name: 'Prove the resolver settings and the drop-in they write'
+  hosts: 'localhost'
+  connection: 'local'
+  gather_facts: false
+  vars:
+    # Hermetic whatever the configured inventory says about localhost.
+    ansible_connection: 'local'
+    ansible_become: false
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    runner_host_dir: "{{ playbook_dir }}/../../roles/runner_host"
+    # A key left out is a value never answered: the role's default.
+    dns_cases:
+      - {name: 'nothing asked for writes no drop-in', lines: [], warnings: []}
+      - {name: 'nothing asked for on an old systemd writes none either', version: 249, lines: [], warnings: []}
+      - {name: 'upstream resolvers become DNS=, in the order given', servers: ['192.0.2.53', '198.51.100.53'], lines: ['DNS=192.0.2.53 198.51.100.53'], warnings: []}
+      - {name: 'fallback resolvers alone become FallbackDNS=', fallback: ['203.0.113.53'], lines: ['FallbackDNS=203.0.113.53'], warnings: []}
+      - {name: 'ports, interfaces, server names and IPv6 pass through as written', servers: ['[2001:db8::53]:853#dns.example.com', '192.0.2.53%eth0'], lines: ['DNS=[2001:db8::53]:853#dns.example.com 192.0.2.53%eth0'], warnings: []}
+      - {name: 'every setting on systemd 255, in a fixed order', servers: ['192.0.2.53'], fallback: ['203.0.113.53'], cache: 'yes', stale: 86400, version: 255, lines: ['DNS=192.0.2.53', 'FallbackDNS=203.0.113.53', 'Cache=yes', 'StaleRetentionSec=86400'], warnings: []}
+      - {name: 'two servers with stale answers on systemd 255 are written, with the caveat', servers: ['192.0.2.53', '198.51.100.53'], stale: 3600, version: 255, lines: ['DNS=192.0.2.53 198.51.100.53', 'StaleRetentionSec=3600'], warnings: ["systemd 255 empties the cache of runner_dns_servers whenever it moves from one to the next (261 keeps it), so with 2 of them a stale answer survives an outage only through the network's own resolvers; list one to keep it"]}
+      - {name: 'two servers with stale answers on systemd 261 need no caveat', servers: ['192.0.2.53', '198.51.100.53'], stale: 3600, version: 261, lines: ['DNS=192.0.2.53 198.51.100.53', 'StaleRetentionSec=3600'], warnings: []}
+      - {name: 'two servers without stale answers need no caveat', servers: ['192.0.2.53', '198.51.100.53'], version: 255, lines: ['DNS=192.0.2.53 198.51.100.53'], warnings: []}
+      - {name: 'stale answers on systemd 254, the first that has them', stale: 3600, version: 254, lines: ['StaleRetentionSec=3600'], warnings: []}
+      - {name: 'stale answers left out on systemd 253, and said so', servers: ['192.0.2.53'], stale: 3600, version: 253, lines: ['DNS=192.0.2.53'], warnings: ['StaleRetentionSec=3600 is left out: it needs systemd 254 or later, and this host runs systemd 253']}
+      - {name: 'stale answers alone on an old systemd write no drop-in', stale: 3600, version: 249, lines: [], warnings: ['StaleRetentionSec=3600 is left out: it needs systemd 254 or later, and this host runs systemd 249']}
+      - {name: 'stale answers left out when the version could not be read', stale: 3600, version: 0, lines: [], warnings: ['StaleRetentionSec=3600 is left out: it needs systemd 254 or later, and this host runs one whose version could not be read']}
+      - {name: 'stale seconds given as a string are a number', stale: '600', version: 255, lines: ['StaleRetentionSec=600'], warnings: []}
+      - {name: 'zero stale seconds is off, whatever the version', stale: 0, version: 249, lines: [], warnings: []}
+      - {name: 'the cache alone becomes Cache=', cache: 'no-negative', lines: ['Cache=no-negative'], warnings: []}
+    # The forms resolved.conf documents for one server.
+    good_servers:
+      - '192.0.2.53'
+      - '192.0.2.53:5353'
+      - '192.0.2.53%eth0'
+      - '192.0.2.53%2'
+      - '192.0.2.53#dns.example.com'
+      - '198.51.100.53:53%ens3#dns.example.net'
+      - '2001:db8::53'
+      - '2001:db8::192.0.2.53'
+      - '::1'
+      - '2001:db8::53%eth0#dns.example.com'
+      - '[2001:db8::53]:853'
+      - '[2001:db8::53]:853#dns.example.com'
+    # Anything that would put more than one address on the line, or a line of
+    # its own into the drop-in.
+    bad_servers:
+      - ''
+      - 'dns.example.com'
+      - '192.0.2.53 198.51.100.53'
+      - "192.0.2.53\nCache=no"
+      - "192.0.2.53\n"
+      - ' 192.0.2.53'
+      - 'DNS=192.0.2.53'
+      - '192.0.2.53;'
+      - '192.0.2.53:'
+      - '192.0.2.53#'
+      - '192.0.2.53#dns example'
+      - '192.0.2'
+      - '[2001:db8::53'
+      - '1:2'
+  tasks:
+    - name: 'Load the role constants'
+      ansible.builtin.include_vars:
+        file: "{{ runner_host_dir }}/vars/main.yaml"
+
+    - name: 'Load the role defaults'
+      ansible.builtin.include_vars:
+        file: "{{ runner_host_dir }}/defaults/main.yaml"
+        name: 'test_defaults'
+
+    - name: 'Start with no results'
+      ansible.builtin.set_fact:
+        test_results: []
+
+    - name: 'Check each resolver case'
+      ansible.builtin.include_tasks: 'dns_case.yaml'
+      loop: "{{ dns_cases }}"
+      loop_control:
+        loop_var: 'dns_case'
+        label: "{{ dns_case.name }}"
+
+    - name: 'Check which addresses the answer check lets through'
+      ansible.builtin.set_fact:
+        test_results: >-
+          {{ test_results
+             + [('  ok  ' if _refused | length == 0 else 'FAIL  ')
+                ~ 'every form of one server resolved.conf takes passes the answer check'
+                ~ ('' if _refused | length == 0 else ': refused ' ~ (_refused | string))]
+             + [('  ok  ' if _taken | length == 0 else 'FAIL  ')
+                ~ 'a name, two servers, a second setting or a stray newline does not'
+                ~ ('' if _taken | length == 0 else ': took ' ~ (_taken | string))] }}
+      vars:
+        _refused: "{{ good_servers | reject('match', _runner_host_dns_server_re) | list }}"
+        _taken: "{{ bad_servers | select('match', _runner_host_dns_server_re) | list }}"
+
+    - name: 'Work out every setting at once for the drop-in'
+      ansible.builtin.include_tasks: "{{ runner_host_dir }}/tasks/dns_settings.yaml"
+      vars:
+        runner_dns_servers: ['192.0.2.53', '198.51.100.53']
+        runner_dns_fallback_servers: ['203.0.113.53']
+        runner_dns_stale_retention_sec: 86400
+        runner_dns_cache: 'yes'
+        _runner_host_systemd_version: 255
+
+    - name: 'Make a scratch directory'
+      ansible.builtin.tempfile:
+        state: 'directory'
+        suffix: '-runner-host-dns'
+      register: 'test_scratch'
+
+    - name: 'Render the resolver drop-in'
+      ansible.builtin.template:
+        src: "{{ runner_host_dir }}/templates/resolved.conf.j2"
+        dest: "{{ test_scratch.path }}/resolved.conf"
+        mode: '0600'
+
+    - name: 'Read back the drop-in'
+      ansible.builtin.slurp:
+        src: "{{ test_scratch.path }}/resolved.conf"
+      register: 'test_dropin'
+
+    - name: 'Remove the scratch directory'
+      ansible.builtin.file:
+        path: "{{ test_scratch.path }}"
+        state: 'absent'
+
+    - name: 'Check the drop-in'
+      ansible.builtin.set_fact:
+        test_results: >-
+          {% set out = [] %}{% for check in _checks %}{% set _ = out.append(('  ok  ' if check[1] is sameas true else 'FAIL  ')
+          ~ 'drop-in: ' ~ check[0]) %}{% endfor %}{{ test_results + out }}
+      vars:
+        _text: "{{ test_dropin.content | b64decode }}"
+        _lines: "{{ _text.splitlines() }}"
+        _settings: "{{ _lines | reject('match', '^(#|$)') | list }}"
+        _checks:
+          - ['it names who manages it, first', "{{ _lines[:1] == ['# ' ~ _runner_host_managed] }}"]
+          - ['it is one [Resolve] section of exactly the lines worked out, in order', "{{ _settings == ['[Resolve]'] + _runner_host_dns_lines }}"]
+          - ['the lines are the ones resolved.conf reads', "{{ _runner_host_dns_lines == ['DNS=192.0.2.53 198.51.100.53', 'FallbackDNS=203.0.113.53', 'Cache=yes', 'StaleRetentionSec=86400'] }}"]
+          - ['nothing is left unrendered', "{{ _text is not search('[{][{%#]|[%#}][}]') }}"]
+          - ['it ends with a newline', "{{ _text is match('(?s).*\\n$') }}"]
+
+    - name: 'Report every check'
+      ansible.builtin.debug:
+        msg: "{{ test_results + [(test_results | select('match', '^  ok') | list | length | string) ~ ' passed, ' ~ (test_results | select('match', '^FAIL') | list | length | string) ~ ' failed'] }}"
+
+    - name: 'Fail when any check failed'
+      ansible.builtin.assert:
+        that: "test_results | select('match', '^FAIL') | list | length == 0"
+        fail_msg: "{{ test_results | select('match', '^FAIL') | list }}"
+        quiet: true

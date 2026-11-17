@@ -134,6 +134,15 @@ jobs:
           # The guard reboots an idle box between 02:00 and 05:00, and every
           # runner here is idle: it would reboot the VM under the job.
           runner_reboot_guard: false
+          # Every resolver setting, so the converge writes the drop-in,
+          # restarts systemd-resolved once, and the second run must leave it
+          # alone. Public resolvers, beside the VM's own: the rest of the job
+          # resolves through both. Two of them, so the list is joined and the
+          # caveat about switching between them is printed too.
+          runner_dns_servers: ['1.1.1.1', '9.9.9.9']
+          runner_dns_fallback_servers: ['8.8.8.8']
+          runner_dns_stale_retention_sec: 3600
+          runner_dns_cache: 'yes'
           EOF
           # Only the file of the group the host is in applies.
           cat > "$inv/group_vars/github_runners.yaml" <<'EOF'
@@ -184,6 +193,24 @@ jobs:
             exit 1
           fi
 
+      # The role only warns about a resolver systemd-resolved did not take, so
+      # a converge that wrote a drop-in it ignores would still pass: this
+      # fails the job instead, and checks that names still resolve.
+      - name: 'Verify the resolver settings'
+        shell: 'bash'
+        run: |
+          dropin=/etc/systemd/resolved.conf.d/90-runner-hardening.conf
+          cat "$dropin"
+          global=$(resolvectl status | sed '/^Link /,$d')
+          printf '%s\n' "$global"
+          for want in 'DNS=1.1.1.1 9.9.9.9' 'FallbackDNS=8.8.8.8' 'Cache=yes' 'StaleRetentionSec=3600'; do
+            grep -qxF "$want" "$dropin" || { echo "::error::the drop-in lacks ${want}"; exit 1; }
+          done
+          for server in 1.1.1.1 9.9.9.9 8.8.8.8; do
+            grep -qw -- "$server" <<<"$global" || { echo "::error::systemd-resolved does not list ${server}"; exit 1; }
+          done
+          getent ahosts github.com >/dev/null || { echo "::error::names no longer resolve"; exit 1; }
+
       - name: 'Verify the installed units'
         shell: 'bash'
         env:
@@ -233,7 +260,8 @@ jobs:
           # Unit files and host.env hold no secret. The vendor configuration
           # directories are left out on purpose: they are where a PAT would live.
           sudo cp -r /etc/systemd/system/"${UNIT}"@* /etc/systemd/system/"${PREFIX}".slice \
-            /etc/runner-hardening "$logs/etc/" 2>/dev/null || true
+            /etc/runner-hardening /etc/systemd/resolved.conf.d "$logs/etc/" 2>/dev/null || true
+          resolvectl status > "$logs/resolvectl-status.txt" 2>&1 || true
           sudo chown -R "$(id -u):$(id -g)" "$logs"
 
       - name: 'Upload the logs'

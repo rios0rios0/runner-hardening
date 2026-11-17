@@ -1,0 +1,8 @@
+# {{ _runner_host_managed }}
+# systemd-resolved asks the servers in DNS= in parallel with the ones the
+# network gives this host, which stay in place, and takes the first good
+# answer. FallbackDNS= is used only while it knows no other server at all.
+[Resolve]
+{% for _runner_host_dns_line in _runner_host_dns_lines %}
+{{ _runner_host_dns_line }}
+{% endfor %}

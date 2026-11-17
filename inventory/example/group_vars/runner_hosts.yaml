@@ -49,6 +49,17 @@ runner_trust: 'internal'
 # runner_reboot_guard: true          # reboots 02:00-05:00, only when every runner is
 #                                    # idle; false removes the timer and its script
 
+# Name resolution that survives a resolver going quiet, through systemd-resolved
+# (the README's DNS section). All off by default; the resolvers the host's
+# network gives it stay in place either way.
+# runner_dns_servers: []             # e.g. ['192.0.2.53']: asked in parallel with the
+#                                    # network's own, first good answer wins. Before
+#                                    # systemd 261, one server keeps stale answers whole
+# runner_dns_fallback_servers: []    # used only while no other resolver is known at all
+# runner_dns_stale_retention_sec: 0  # e.g. 86400: answer names already resolved this long
+#                                    # past their TTL while no upstream answers (systemd >= 254)
+# runner_dns_cache: ''               # 'yes', 'no' or 'no-negative'; '' keeps the host's own
+
 # What your jobs need on the box beyond the base packages, and where apt finds
 # it. key_url must be https and serve an ASCII-armored key, which goes to
 # /etc/apt/keyrings/<name>.asc; `repo`, the whole source line, goes to
