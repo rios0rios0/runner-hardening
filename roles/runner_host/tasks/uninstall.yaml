@@ -139,6 +139,16 @@
   ansible.builtin.systemd_service:
     daemon_reload: true
 
+# The converge's own path for a host that no longer asks for any: the drop-in
+# goes, and a running systemd-resolved is put back on the network's resolvers.
+- name: 'Remove the upstream resolvers'
+  ansible.builtin.include_tasks: 'dns.yaml'
+  vars:
+    runner_dns_servers: []
+    runner_dns_fallback_servers: []
+    runner_dns_stale_retention_sec: 0
+    runner_dns_cache: ''
+
 - name: 'Look for a swapfile'
   ansible.builtin.stat:
     path: '/swapfile'

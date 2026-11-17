@@ -31,6 +31,12 @@
 - name: 'Write the unit, the slice and the drop-ins, and bring every runner up'
   ansible.builtin.import_tasks: 'units.yaml'
 
+# After the units, never before: this flushes its own handler, and a flush
+# ahead of the units' would restart the idle runners before their new
+# definitions are in place.
+- name: 'Configure the upstream resolvers'
+  ansible.builtin.import_tasks: 'dns.yaml'
+
 - name: 'Install the janitor timer'
   ansible.builtin.import_tasks: 'janitor.yaml'
 

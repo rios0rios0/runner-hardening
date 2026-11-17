@@ -24,3 +24,15 @@
   when:
     - "runner_start_units | bool"
     - "_runner_host_restart_idle is not defined"
+
+# systemd-resolved reads its drop-ins when it starts, or on a reload where it
+# can do one: from systemd 256 it reloads on SIGHUP, and its unit says so with
+# CanReload. Before that it is restarted, which takes its stub listener away
+# for a fraction of a second: a lookup a job makes in that instant fails. So
+# this runs only when the drop-in changed, and only on a systemd-resolved that
+# is already running, which it never starts.
+- name: 'Apply the resolver settings'
+  ansible.builtin.systemd_service:
+    name: 'systemd-resolved.service'
+    state: "{{ 'reloaded' if (_runner_host_resolved.status.CanReload | default('no')) == 'yes' else 'restarted' }}"
+  when: "_runner_host_resolved_active | default(false) | bool"

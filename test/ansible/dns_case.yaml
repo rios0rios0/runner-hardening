@@ -1,0 +1,18 @@
+---
+- name: "Work out the resolver settings: {{ dns_case.name }}"
+  ansible.builtin.include_tasks: "{{ runner_host_dir }}/tasks/dns_settings.yaml"
+  vars:
+    runner_dns_servers: "{{ dns_case.servers | default(test_defaults.runner_dns_servers) }}"
+    runner_dns_fallback_servers: "{{ dns_case.fallback | default(test_defaults.runner_dns_fallback_servers) }}"
+    runner_dns_stale_retention_sec: "{{ dns_case.stale | default(test_defaults.runner_dns_stale_retention_sec) }}"
+    runner_dns_cache: "{{ dns_case.cache | default(test_defaults.runner_dns_cache) }}"
+    _runner_host_systemd_version: "{{ dns_case.version | default(0) }}"
+
+- name: "Compare it with what resolved.conf must say: {{ dns_case.name }}"
+  ansible.builtin.set_fact:
+    test_results: "{{ test_results + [('  ok  ' if _passed else 'FAIL  ') ~ dns_case.name ~ ('' if _passed else ': ' ~ _why)] }}"
+  vars:
+    _passed: "{{ _runner_host_dns_lines == dns_case.lines and _runner_host_dns_warnings == dns_case.warnings }}"
+    _why: >-
+      expected lines {{ dns_case.lines }} and warnings {{ dns_case.warnings }},
+      got {{ _runner_host_dns_lines }} and {{ _runner_host_dns_warnings }}

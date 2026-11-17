@@ -60,7 +60,8 @@ runner_github | runner_azure_devops  tasks/main.yaml
        host.env and the diskguard/janitor/reboot-if-idle scripts → policy facts
        → unit, slice, protect drop-in, instance drop-ins, user-slice drop-ins → remove stale drop-ins
        → daemon-reload, enable every instance (start it when runner_start_units)
-       → notify "Restart idle runners" on any change → janitor, updates, reboot guard, stale artefacts
+       → notify "Restart idle runners" on any change → the resolver drop-in (runner_dns_*), applied by its own flush
+       → janitor, updates, reboot guard, stale artefacts
        → <sbin>-admin verify: output shown, failures warn and never fail the play
   6. vendor: de-register runner_surplus_instances (Azure DevOps, when a PAT is given)
   7. include_role runner_host, tasks_from: retire
@@ -122,6 +123,7 @@ those read. The table names each script by its installed path; `<sbin>` is
 | `/etc/systemd/system/<slice>`, `system.slice.d/10-<sbin>-protect.conf`, `user-<uid>.slice.d/10-<sbin>-limits.conf` | `roles/runner_host/templates/runner.slice.j2`, `protect.conf.j2`, `user-slice.conf.j2` | the aggregate boundary, the OS floor, the rootless containers' limits |
 | `/etc/systemd/system/<unit>@<n>.service.d/10-instance.conf` | `roles/runner_host/templates/instance.conf.j2` | the runner's paths, memory floor and ceiling, `CODEQL_RAM`, `AGENT_TOOLSDIRECTORY` (`trust=internal`), `runner_instance_env`, `runner_heavy_env` (heavy instances) |
 | `/etc/runner-hardening/host.env`                         | `roles/runner_host/templates/host.env.j2`      | what the scripts read: the flavour, the count, trust, the thresholds, the keep list |
+| `/etc/systemd/resolved.conf.d/90-runner-hardening.conf`  | `roles/runner_host/templates/resolved.conf.j2` | systemd-resolved's extra upstream resolvers, fallback resolvers, stale answers and cache, as the `runner_dns_*` variables ask; written only when one is set, removed when none is |
 
 ### The ephemeral loop is the core invariant
 
@@ -365,6 +367,16 @@ run-helper sets to 0 even on a terminated error.
   `exec -u <its uid>`, and do not answer a container job's permission error
   with ACLs: a file made `0700` masks every named entry out, and what such a
   uid leaves in `_work` neither the agent nor the disk guard can delete.
+- **The resolver settings only ever add, and never start anything.** The
+  `runner_dns_*` drop-in adds servers to what the host's network configuration
+  gives it, which may be the only resolvers that know the local names: never
+  reset `DNS=` with an empty assignment to make the list exclusive. It is
+  applied by restarting (systemd `256` and later: reloading) a
+  systemd-resolved that is already running, and only when the drop-in changed,
+  because a restart drops lookups for a fraction of a second; a host where it
+  is not running is warned about and left alone. `dns.yaml` flushes its own
+  handler, so it must stay after the units' flush in `finish.yaml`, or the
+  idle runners would restart before their new definitions are written.
 - **Anything that changes system state is untestable here.** `make test`
   renders and parses; only the converge workflow, or a disposable Ubuntu VM,
   exercises a real box. Say so rather than claiming a change is verified when
@@ -418,7 +430,11 @@ These sets live in more than one file and drift silently:
    asserts the invariants — the guard's line before the vendor pre lines,
    `RestartSec=1`, no `RestartSteps`, `OOMPolicy=continue`,
    `TMPDIR=/var/tmp`, no `ManagedOOM`;
-5. `ansible-playbook --syntax-check` on every `playbooks/*.yaml`.
+5. `test/ansible/dns.yaml`: what `dns_settings.yaml` writes into the resolver
+   drop-in for each answer and systemd version (`StaleRetentionSec=` only from
+   `254`), which server addresses the answer check lets through, and the
+   rendered drop-in;
+6. `ansible-playbook --syntax-check` on every `playbooks/*.yaml`.
 
 `test/runtime/harness.sh` is what every runtime test file sources. It lays out
 a scratch box shaped like a real one (`new_box`), and drives the real scripts
@@ -445,7 +461,9 @@ box has and a test run does not:
   `systemd-analyze verify` on the installed units. It sets
   `runner_start_units: false`, `runner_github_validate_pat: false` and
   `runner_azp_skip_registration: true`, so it proves the install, never a
-  registration or a job.
+  registration or a job. It also sets every `runner_dns_*` variable and fails
+  unless the drop-in holds them, `resolvectl status` lists each server and
+  names still resolve.
 
 ## Anonymity
 

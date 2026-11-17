@@ -70,6 +70,24 @@ runner_dismantle_rootful_docker: true
 runner_unattended_upgrades: true
 runner_reboot_guard: true
 
+# Resolver resilience, through systemd-resolved. All off by default: with none
+# of these set the role writes no resolver configuration and never restarts
+# systemd-resolved. The resolvers the host's network gives it stay in place
+# either way.
+#
+# Upstream resolvers (DNS=), asked in parallel with the network's own: the
+# first good answer wins, so a lookup survives one of them going quiet. Before
+# systemd 261, one server here keeps stale answers whole (README, DNS).
+runner_dns_servers: []
+# FallbackDNS=: used only while systemd-resolved knows no other resolver at
+# all, never because one stops answering.
+runner_dns_fallback_servers: []
+# Seconds a cached answer may still be served past its TTL while no upstream
+# answers (StaleRetentionSec=, systemd 254 or later). 0 for off.
+runner_dns_stale_retention_sec: 0
+# Cache=: '' keeps systemd-resolved's own (yes), or 'yes', 'no', 'no-negative'.
+runner_dns_cache: ''
+
 # CI sets false: install and enable the units, but never start them.
 runner_start_units: true
 

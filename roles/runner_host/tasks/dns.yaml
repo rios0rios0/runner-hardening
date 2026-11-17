@@ -1,0 +1,161 @@
+---
+# Resolver resilience for a CI host, opt-in. A box with one upstream resolver
+# fails every job that looks a name up while that resolver is slow or gone,
+# with "Temporary failure in name resolution", and a job resolves hundreds of
+# names. The runner_dns_* variables give systemd-resolved, which an Ubuntu
+# server already runs, more upstream resolvers, and stale answers for names
+# already resolved, in one drop-in. With all of them at their defaults this
+# writes nothing and never touches systemd-resolved; a drop-in it wrote before
+# is removed.
+#
+# It only adds to what the host's network gives it: the network's own
+# resolvers stay in place, because they may be the only ones that know the
+# local names. That is also why DNS= is never reset with an empty assignment.
+
+# Only StaleRetentionSec= depends on the version, so nothing else asks for it.
+- name: 'Read the systemd version'
+  ansible.builtin.command:
+    argv: ['systemctl', '--version']
+  register: '_runner_host_systemctl_version'
+  changed_when: false
+  # It only reads, so a dry run decides as a real one would.
+  check_mode: false
+  when: "runner_dns_stale_retention_sec | int > 0"
+
+- name: 'Work out the resolver settings'
+  ansible.builtin.import_tasks: 'dns_settings.yaml'
+  vars:
+    _runner_host_systemd_version: >-
+      {{ ((_runner_host_systemctl_version.stdout | default('') | regex_search('^systemd [0-9]+') | default('', true))
+          | regex_replace('^systemd ', '') or '0') | int }}
+
+- name: 'Look for the resolver drop-in'
+  ansible.builtin.stat:
+    path: "{{ _runner_host_resolved_dropin }}"
+  register: '_runner_host_dns_dropin_file'
+
+- name: 'Read the systemd-resolved service'
+  ansible.builtin.systemd_service:
+    name: 'systemd-resolved.service'
+  register: '_runner_host_resolved'
+  when: "_runner_host_dns_lines | length > 0 or _runner_host_dns_dropin_file.stat.exists"
+
+- name: 'Note whether systemd-resolved runs here'
+  ansible.builtin.set_fact:
+    _runner_host_resolved_active: "{{ (_runner_host_resolved.status.ActiveState | default('')) == 'active' }}"
+
+# Starting systemd-resolved on a host that does without it would change how
+# every program there resolves names, which is not this role's call.
+- name: 'Warn that systemd-resolved is not running'
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: runner_dns_* are set, but systemd-resolved {{ _state }} on this host,
+      so the resolver settings are not applied.
+  vars:
+    _state: >-
+      {{ 'is not installed' if (_runner_host_resolved.status.LoadState | default('not-found')) == 'not-found'
+         else 'is ' ~ (_runner_host_resolved.status.ActiveState | default('inactive')) }}
+  when:
+    - "_runner_host_dns_lines | length > 0"
+    - "not (_runner_host_resolved_active | bool)"
+
+- name: 'Warn about the resolver settings this host cannot honour'
+  ansible.builtin.debug:
+    msg: "WARNING: {{ _runner_host_dns_warning }}."
+  loop: "{{ _runner_host_dns_warnings }}"
+  loop_control:
+    loop_var: '_runner_host_dns_warning'
+
+- name: 'Write the resolver drop-in'
+  when:
+    - "_runner_host_dns_lines | length > 0"
+    - "_runner_host_resolved_active | bool"
+  block:
+    - name: 'Create the resolver drop-in directory'
+      ansible.builtin.file:
+        path: "{{ _runner_host_resolved_dropin | dirname }}"
+        state: 'directory'
+        owner: 'root'
+        group: 'root'
+        mode: '0755'
+
+    - name: 'Write the resolver settings'
+      ansible.builtin.template:
+        src: 'resolved.conf.j2'
+        dest: "{{ _runner_host_resolved_dropin }}"
+        owner: 'root'
+        group: 'root'
+        mode: '0644'
+      notify: 'Apply the resolver settings'
+
+# The host is back on its network's resolvers alone.
+- name: 'Remove the resolver drop-in nothing asks for any more'
+  ansible.builtin.file:
+    path: "{{ _runner_host_resolved_dropin }}"
+    state: 'absent'
+  when:
+    - "_runner_host_dns_lines | length == 0"
+    - "_runner_host_dns_dropin_file.stat.exists"
+  notify: 'Apply the resolver settings'
+
+# Now rather than at the end of the play, so the check below reads what
+# systemd-resolved runs with. Its caller runs this after the units' own flush,
+# so nothing else is still waiting here.
+- name: 'Apply the resolver settings'
+  ansible.builtin.meta: 'flush_handlers'
+
+- name: 'Check what systemd-resolved runs with'
+  when:
+    - "_runner_host_dns_lines | length > 0"
+    - "_runner_host_resolved_active | bool"
+  block:
+    - name: 'Read the resolver status'
+      ansible.builtin.command:
+        argv: ['resolvectl', 'status']
+      register: '_runner_host_resolvectl'
+      changed_when: false
+      failed_when: false
+      # It only reads, so a dry run shows the host as it stands.
+      check_mode: false
+
+    - name: 'Show the global resolver settings'
+      ansible.builtin.debug:
+        msg: "{{ _runner_host_resolvectl_global.splitlines() }}"
+      vars:
+        _runner_host_resolvectl_global: "{{ (_runner_host_resolvectl.stdout | default('')).split('\nLink ')[0] }}"
+      when: "_runner_host_resolvectl.rc | default(1) == 0"
+
+    - name: 'Warn that the resolver status could not be read'
+      ansible.builtin.debug:
+        msg: "WARNING: resolvectl status failed: {{ _runner_host_resolvectl.stderr | default(_runner_host_resolvectl.msg | default('')) }}"
+      when: "_runner_host_resolvectl.rc | default(1) != 0"
+
+    # resolvectl prints each server as resolved.conf spells it. One missing
+    # from the global section was refused: journalctl -u systemd-resolved says
+    # why. A dry run has not applied the drop-in yet, so it has nothing to compare.
+    - name: 'Warn about resolvers systemd-resolved does not list'
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: systemd-resolved does not list {{ _missing | join(', ') }};
+          see journalctl -u systemd-resolved.
+      vars:
+        _words: "{{ (_runner_host_resolvectl.stdout | default('')).split('\nLink ')[0] | lower | split }}"
+        _missing: "{{ (runner_dns_servers + runner_dns_fallback_servers) | map('lower') | reject('in', _words) | list }}"
+      when:
+        - "not ansible_check_mode"
+        - "_runner_host_resolvectl.rc | default(1) == 0"
+        - "_missing | length > 0"
+
+    # Only programs that ask systemd-resolved get any of this. With
+    # /etc/resolv.conf naming the upstream servers itself (uplink), or managed
+    # by something else (foreign), glibc goes around the stub and its cache.
+    - name: 'Warn that programs here may go around systemd-resolved'
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: resolvectl reports resolv.conf mode {{ _mode }}: programs that read /etc/resolv.conf
+          do not ask systemd-resolved's stub, so its cache and stale answers do not reach them.
+      vars:
+        _mode: "{{ ((_runner_host_resolvectl.stdout | default('') | regex_findall('resolv[.]conf mode: *([a-z-]+)')) + ['']) | first }}"
+      when:
+        - "_runner_host_resolvectl.rc | default(1) == 0"
+        - "_mode in ['uplink', 'foreign', 'missing']"

@@ -190,6 +190,28 @@
       {{ (runner_extra_binaries | rejectattr('links', 'defined') | map(attribute='name') | map('string') | list)
          + (_links | map('dict2items') | flatten | map(attribute='key') | map('string') | list) }}
 
+# Each value becomes part of a line of the resolver drop-in, so each must be
+# one address and nothing more. A stale answer comes out of the cache, so it
+# cannot be asked for with the cache off. Cache takes the words resolved.conf
+# uses, quoted: YAML reads a bare yes as true.
+- name: 'Check the resolver settings'
+  ansible.builtin.assert:
+    that:
+      - "runner_dns_servers is sequence and runner_dns_servers is not string"
+      - "runner_dns_fallback_servers is sequence and runner_dns_fallback_servers is not string"
+      - "(runner_dns_servers + runner_dns_fallback_servers) | map('string') | reject('match', _runner_host_dns_server_re) | list | length == 0"
+      - "(runner_dns_stale_retention_sec | string | trim) is match('^(0|[1-9][0-9]*)$')"
+      - "runner_dns_cache is string and runner_dns_cache in ['', 'yes', 'no', 'no-negative']"
+      - "not (runner_dns_cache == 'no' and runner_dns_stale_retention_sec | int > 0)"
+    fail_msg: >-
+      runner_dns_servers and runner_dns_fallback_servers are lists of resolver
+      addresses as resolved.conf writes them (an IPv4 or IPv6 address with an
+      optional :port, %interface and #server-name);
+      runner_dns_stale_retention_sec is a whole number of seconds, 0 for off;
+      runner_dns_cache is a quoted '', 'yes', 'no' or 'no-negative', and not
+      'no' while runner_dns_stale_retention_sec is set.
+    quiet: true
+
 # Environment= values are unquoted in the drop-in, and systemd reads a % as a
 # specifier there.
 - name: 'Check the environment the heavy runners get'
