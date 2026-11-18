@@ -6,7 +6,7 @@
 namespace: 'rios0rios0'
 name: 'runner_hardening'
 # Bumped together with CHANGELOG.md in every bump/x.y.z pull request.
-version: '1.1.0'
+version: '1.1.1'
 readme: 'README.md'
 authors:
   - 'rios0rios0'
