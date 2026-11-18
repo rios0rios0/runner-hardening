@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-18
+
+### Fixed
+
+- fixed a fresh pipeline agent failing to register: the agent package's `./` entry gave the existing 0700 staging directory its own mode (0775), and `azp-register` refused it as not a fresh unpack; both vendor roles now unpack with `--no-overwrite-dir`, which also keeps the GitHub runner's staging copy root-only while it fills, and `test/ansible/unpack.yaml` runs each role's own unpack options against a package shaped like the real ones
+
 ## [1.1.0] - 2026-11-17
 
 ### Added
