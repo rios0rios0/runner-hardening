@@ -27,12 +27,16 @@
 # --no-same-owner: as root, tar would otherwise give every file the owner the
 # archive records, 1000:1000 for the agent package -- on a cloud image, the
 # admin account -- and azp-register refuses a tree that is not all root's.
+# --no-overwrite-dir: the package's first entry is `./`, mode 0775, and tar
+# gives a directory that already exists the metadata of its entry, so the
+# staging directory came out 0775 and azp-register refused it as not a fresh
+# unpack: no new agent could register. test/ansible/unpack.yaml pins both.
 - name: "Unpack the agent package for instance {{ _runner_azp_n }}"
   ansible.builtin.unarchive:
     src: "{{ _runner_azp_download.dest }}"
     dest: "{{ _runner_azp_staging }}"
     remote_src: true
-    extra_opts: ['--no-same-owner']
+    extra_opts: ['--no-same-owner', '--no-overwrite-dir']
 
 # As the installer does for the GitHub runner: the agent's own script for the
 # libraries its .NET runtime needs. Run here, while the tree is still root's

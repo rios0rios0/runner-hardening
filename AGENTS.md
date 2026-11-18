@@ -434,7 +434,12 @@ These sets live in more than one file and drift silently:
    drop-in for each answer and systemd version (`StaleRetentionSec=` only from
    `254`), which server addresses the answer check lets through, and the
    rendered drop-in;
-6. `ansible-playbook --syntax-check` on every `playbooks/*.yaml`.
+6. `test/ansible/agent_json.yaml`: that stripping the byte-order mark is what
+   makes an agent's `.agent` parse;
+7. `test/ansible/unpack.yaml`: that each vendor role's unpack options keep its
+   0700 staging directory root-only against a package whose `./` entry is
+   0775, and that an unpack without `--no-overwrite-dir` does not;
+8. `ansible-playbook --syntax-check` on every `playbooks/*.yaml`.
 
 `test/runtime/harness.sh` is what every runtime test file sources. It lays out
 a scratch box shaped like a real one (`new_box`), and drives the real scripts
