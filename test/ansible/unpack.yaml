@@ -1,0 +1,114 @@
+---
+# Both vendor roles unpack a package into a staging directory they have just
+# created root-only (0700), and the packages' first entry is `./`, with a
+# looser mode (0775 for the pipeline agent). GNU tar gives a directory that
+# already exists the metadata of its entry, so without --no-overwrite-dir the
+# staging directory came out 0775 (0755 here, through a non-root umask):
+# azp-register refused it as not a fresh unpack, and no new agent registered.
+#
+# Each role's own options, read from its task file so this cannot pass while a
+# role drifts, unpack a package shaped like the real ones; one unpack without
+# --no-overwrite-dir shows the check can fail. Runs as non-root, offline:
+#
+#   ansible-playbook test/ansible/unpack.yaml
+- name: 'Unpack a package into a root-only staging directory without opening it'
+  hosts: 'localhost'
+  connection: 'local'
+  gather_facts: false
+  vars:
+    ansible_connection: 'local'
+    ansible_become: false
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    test_roles_dir: "{{ playbook_dir }}/../../roles"
+    test_unpacks:
+      - role: 'runner_azure_devops'
+        file: 'unpack_agent.yaml'
+        task: 'Unpack the agent package'
+      - role: 'runner_github'
+        file: 'tree_extract.yaml'
+        task: 'Extract the runner release into the staging copy'
+  tasks:
+    - name: 'Read the options each role unpacks with'
+      ansible.builtin.set_fact:
+        test_opts: >-
+          {{ test_opts | default({}) | combine({item.role:
+             (lookup('ansible.builtin.file', test_roles_dir ~ '/' ~ item.role ~ '/tasks/' ~ item.file)
+              | from_yaml | selectattr('name', 'defined') | selectattr('name', 'search', item.task)
+              | first)['ansible.builtin.unarchive']['extra_opts']}) }}
+      loop: "{{ test_unpacks }}"
+      loop_control:
+        label: "{{ item.role }}"
+
+    - name: 'Create the scratch directory'
+      ansible.builtin.tempfile:
+        state: 'directory'
+        suffix: '.unpack'
+      register: 'test_scratch'
+
+    - name: 'Unpack, and remove the scratch directory whatever happens'
+      block:
+        # given a package whose root entry is a group-writable directory, as the agent's is
+        - name: 'Lay out the package'
+          ansible.builtin.file:
+            path: "{{ test_scratch.path }}/package"
+            state: 'directory'
+            mode: '0775'
+
+        - name: 'Add a file to the package'
+          ansible.builtin.copy:
+            dest: "{{ test_scratch.path }}/package/run.sh"
+            content: "#!/bin/sh\n"
+            mode: '0775'
+
+        - name: 'Pack it with its root entry first, as the packages are'
+          ansible.builtin.command:
+            argv: ['tar', '-C', "{{ test_scratch.path }}/package", '-czf', "{{ test_scratch.path }}/package.tar.gz", '.']
+            creates: "{{ test_scratch.path }}/package.tar.gz"
+
+        # and a root-only staging directory per role, plus one for the control
+        - name: 'Create the staging directories, as the roles do'
+          ansible.builtin.file:
+            path: "{{ test_scratch.path }}/{{ item }}"
+            state: 'directory'
+            mode: '0700'
+          loop: "{{ (test_unpacks | map(attribute='role') | list) + ['control'] }}"
+
+        # when each role's options unpack the package
+        - name: 'Unpack with each role''s options'
+          ansible.builtin.unarchive:
+            src: "{{ test_scratch.path }}/package.tar.gz"
+            dest: "{{ test_scratch.path }}/{{ item }}"
+            remote_src: true
+            extra_opts: "{{ test_opts[item] }}"
+          loop: "{{ test_unpacks | map(attribute='role') | list }}"
+
+        # and the control unpacks without --no-overwrite-dir
+        - name: 'Unpack without --no-overwrite-dir'
+          ansible.builtin.unarchive:
+            src: "{{ test_scratch.path }}/package.tar.gz"
+            dest: "{{ test_scratch.path }}/control"
+            remote_src: true
+            extra_opts: ['--no-same-owner']
+
+        - name: 'Read the staging directories back'
+          ansible.builtin.stat:
+            path: "{{ test_scratch.path }}/{{ item }}"
+          loop: "{{ (test_unpacks | map(attribute='role') | list) + ['control'] }}"
+          register: 'test_staging'
+
+        # then every role's staging directory is still root-only, and the control is not
+        - name: 'Check each staging directory is still 0700'
+          ansible.builtin.assert:
+            that:
+              - "test_staging.results | selectattr('item', 'ne', 'control') | map(attribute='stat.mode') | unique | list == ['0700']"
+              - "(test_staging.results | selectattr('item', 'eq', 'control') | first).stat.mode != '0700'"
+            fail_msg: >-
+              staging modes after the unpack:
+              {{ test_staging.results | map(attribute='item') | zip(test_staging.results | map(attribute='stat.mode')) | list }}
+              (every role must keep 0700; the control, unpacked without --no-overwrite-dir, must not)
+            quiet: true
+      always:
+        - name: 'Remove the scratch directory'
+          ansible.builtin.file:
+            path: "{{ test_scratch.path }}"
+            state: 'absent'

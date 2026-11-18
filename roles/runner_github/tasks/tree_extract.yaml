@@ -31,8 +31,11 @@
     dest: "{{ _runner_github_staging }}"
     remote_src: true
     # As root, tar restores the archive's owner: a uid that may well be
-    # another runner user's on this box.
-    extra_opts: ['--no-same-owner']
+    # another runner user's on this box. And it gives the staging copy, which
+    # already exists, the mode of the archive's `./` entry, opening it to
+    # everyone while it fills: --no-overwrite-dir keeps it root-only
+    # (test/ansible/unpack.yaml).
+    extra_opts: ['--no-same-owner', '--no-overwrite-dir']
 
 # From the root-owned copy, before it is handed over: run as root from a tree
 # its runner user already owns, the script would be that user's to edit first.
